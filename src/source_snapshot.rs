@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, Read},
     os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -32,47 +32,69 @@ impl SourceInfo {
         Self::read_with_operation(pdf, &Operation::default())
     }
 
+    pub fn read_in(pdf: &Path, build_directory: Option<&Path>) -> io::Result<Self> {
+        Self::read_with_operation_in(pdf, &Operation::default(), build_directory)
+    }
+
     pub fn read_with_operation(pdf: &Path, operation: &Operation) -> io::Result<Self> {
+        Self::read_with_operation_in(pdf, operation, None)
+    }
+
+    pub fn read_with_operation_in(
+        pdf: &Path,
+        operation: &Operation,
+        build_directory: Option<&Path>,
+    ) -> io::Result<Self> {
         operation.check()?;
         let pdf = fs::canonicalize(pdf)?;
         let file = open_regular(&pdf, false)?;
         drop(file);
-        let revision = DocumentRevision::read(&pdf)?;
+        let revision = DocumentRevision::read_in(&pdf, build_directory)?;
         let cwd = fs::canonicalize(std::env::current_dir()?)?;
-        let reader: Box<dyn Read> = match open_regular(&pdf.with_extension("synctex.gz"), false) {
-            Ok(file) => Box::new(flate2::read::GzDecoder::new(BufReader::with_capacity(
-                64 * 1024,
-                file,
-            ))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match open_regular(&pdf.with_extension("synctex"), false) {
-                    Ok(file) => Box::new(file),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        revision.check(&pdf)?;
-                        operation.check()?;
-                        return Ok(Self {
-                            pdf,
-                            revision,
-                            cwd,
-                            main: None,
-                            inputs: Vec::new(),
-                            warning: Some(
-                                "compiled source list unavailable: no SyncTeX sidecar".into(),
-                            ),
-                        });
-                    }
-                    Err(error) => return Err(error),
+        let mut opened = None;
+        for (candidate, _) in synctex::synctex_candidates(&pdf, build_directory) {
+            match open_regular(&candidate, false) {
+                Ok(file) => {
+                    opened = Some((file, candidate));
+                    break;
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+        }
+        let Some((file, sidecar_path)) = opened else {
+            revision.check_in(&pdf, build_directory)?;
+            operation.check()?;
+            return Ok(Self {
+                pdf,
+                revision,
+                cwd,
+                main: None,
+                inputs: Vec::new(),
+                warning: Some(
+                    "compiled source list unavailable: no SyncTeX sidecar".into(),
+                ),
+            });
         };
-        let (main, inputs, unavailable) = read_inputs(
-            BufReader::with_capacity(64 * 1024, reader.take(MAX_SOURCE_MAP_BYTES + 1)),
+        let pdf_dir = pdf.parent().unwrap_or(Path::new("."));
+        let sidecar_dir = sidecar_path
+            .parent()
+            .and_then(|dir| fs::canonicalize(dir).ok());
+        let mut fallback_dirs = Vec::new();
+        if let Some(ref sdir) = sidecar_dir
+            && sdir.as_path() != pdf_dir
+        {
+            fallback_dirs.push(pdf_dir);
+            fallback_dirs.push(sdir.as_path());
+        }
+        let (main, inputs, unavailable) = read_inputs_with_fallbacks(
+            synctex::decode_synctex_file(file, MAX_SOURCE_MAP_BYTES + 1)?,
             &cwd,
+            &fallback_dirs,
             operation,
         )?;
         operation.check()?;
-        revision.check(&pdf)?;
+        revision.check_in(&pdf, build_directory)?;
         let warning = if inputs.is_empty() {
             Some("compiled source list unavailable: SyncTeX has no inputs".into())
         } else if unavailable > 0 {
@@ -120,9 +142,19 @@ pub(crate) fn is_compiler_sidecar_input(path: &Path) -> bool {
             .is_some_and(|name| name.ends_with(".synctex.gz"))
 }
 
+#[cfg(test)]
 fn read_inputs(
+    reader: impl BufRead,
+    cwd: &Path,
+    operation: &Operation,
+) -> io::Result<(Option<PathBuf>, Vec<PathBuf>, usize)> {
+    read_inputs_with_fallbacks(reader, cwd, &[], operation)
+}
+
+fn read_inputs_with_fallbacks(
     mut reader: impl BufRead,
     cwd: &Path,
+    fallback_dirs: &[&Path],
     operation: &Operation,
 ) -> io::Result<(Option<PathBuf>, Vec<PathBuf>, usize)> {
     let mut inputs = BTreeMap::new();
@@ -171,7 +203,8 @@ fn read_inputs(
                     "invalid SyncTeX input path",
                 ));
             }
-            let absolute = normalize_absolute(Path::new(path), cwd)?;
+            let raw_path = Path::new(path);
+            let absolute = normalize_absolute(raw_path, cwd)?;
             let ignored = tag != 1
                 && first.is_some()
                 && (is_compiler_sidecar_input(&absolute)
@@ -185,8 +218,19 @@ fn read_inputs(
                 match fs::canonicalize(&absolute) {
                     Ok(path) => path,
                     Err(_) => {
-                        unavailable += 1;
-                        absolute
+                        let fallback = (!raw_path.is_absolute()).then(|| {
+                            fallback_dirs.iter().find_map(|dir| {
+                                normalize_absolute(raw_path, dir)
+                                    .ok()
+                                    .and_then(|cand| fs::canonicalize(cand).ok())
+                            })
+                        }).flatten();
+                        if let Some(found) = fallback {
+                            found
+                        } else {
+                            unavailable += 1;
+                            absolute
+                        }
                     }
                 }
             };
@@ -233,6 +277,7 @@ fn read_inputs(
             Some(path) == main.as_ref()
                 || !is_compiler_sidecar_input(path)
                     && (path.starts_with(cwd)
+                        || fallback_dirs.iter().any(|dir| path.starts_with(dir))
                         || !path.components().any(|component| {
                             component.as_os_str().as_bytes().starts_with(b"texmf")
                         }))
@@ -282,6 +327,10 @@ pub(crate) fn required_cache_error(error: &io::Error) -> bool {
 
 impl SourceSnapshot {
     pub fn load(path: &Path, pdf: &Path) -> io::Result<Self> {
+        Self::load_in(path, pdf, None)
+    }
+
+    pub fn load_in(path: &Path, pdf: &Path, build_directory: Option<&Path>) -> io::Result<Self> {
         if !valid_absolute_path(path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -367,7 +416,7 @@ impl SourceSnapshot {
                 ));
             }
         }
-        manifest.revision.check(&pdf)?;
+        manifest.revision.check_in(&pdf, build_directory)?;
         let filename = path.file_name().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

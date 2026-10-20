@@ -2173,3 +2173,197 @@ fn synctex_cache_reuses_parsed_pages_and_invalidates_on_companion_change() {
     assert_eq!(r1_updated.location.line, 5);
     assert!(r1_updated.location.precise);
 }
+
+#[test]
+fn gzip_magic_columns_and_forward_page_hint_work_across_apis() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &tex,
+        "\\documentclass{article}\n\\begin{document}\nalpha beta gamma\n\\end{document}\n",
+    )
+    .unwrap();
+
+    let synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3,7:0,0:30000000,40000000,0\n(1,3,7:655360,6553600:6553600,655360,0\nx1,3,7:1310720,6553600\n)\n]\n}}1\n{{2\n[1,3,12:0,0:30000000,40000000,0\n(1,3,12:655360,13107200:6553600,655360,0\nx1,3,12:1310720,13107200\n)\n]\n}}2\nPostamble:\nCount:8\n",
+        tex.display()
+    );
+
+    // 1. Gzip-compressed content stored in a `.synctex` file (without `.gz` suffix)
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(synctex.as_bytes()).unwrap();
+    let gz_bytes = encoder.finish().unwrap();
+    fs::write(pdf.with_extension("synctex"), &gz_bytes).unwrap();
+
+    let info = crate::source_snapshot::SourceInfo::read(&pdf).unwrap();
+    assert_eq!(info.main.as_deref(), Some(tex.as_path()));
+
+    // 2. Compiler-recorded columns preserved in raw candidates, `parse_synctex_edit`, and `resolve_inverse`
+    let pt1 = InversePoint {
+        page: 1,
+        x: 20.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let raw = inverse_candidates(&pdf, pt1).unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].line, 3);
+    assert_eq!(raw[0].byte_column, 6);
+    assert_eq!(raw[0].column, 7);
+    assert_eq!(raw[0].column_char, 7);
+    assert!(!raw[0].precise);
+
+    let coarse = resolve_inverse(&pdf, pt1, None, 2, &Operation::default(), None, false).unwrap();
+    assert_eq!(coarse.location.line, 3);
+    assert_eq!(coarse.location.byte_column, 6);
+    assert_eq!(coarse.location.column, 7);
+    assert_eq!(coarse.location.column_char, 7);
+    assert!(!coarse.location.precise);
+
+    let parsed_edit = parse_synctex_edit(&format!(
+        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:7\nSyncTeX result end\n",
+        tex.display()
+    ));
+    assert_eq!(parsed_edit.len(), 1);
+    assert_eq!(parsed_edit[0].column, 7);
+    assert_eq!(parsed_edit[0].byte_column, 6);
+
+    // 3. Forward `page_hint` selects page 2 when hinted, and page 1 by default
+    let default_forward = resolve_forward(&pdf, &tex, 3, 1).unwrap();
+    assert_eq!(default_forward.page, 1);
+
+    let hinted_forward = resolve_forward_with_selector(
+        &pdf,
+        &tex,
+        3,
+        1,
+        ForwardSource {
+            page_hint: Some(2),
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap();
+    assert_eq!(hinted_forward.page, 2);
+
+    // Plain-text content stored in `.synctex.gz` also decodes cleanly
+    fs::remove_file(pdf.with_extension("synctex")).unwrap();
+    fs::write(pdf.with_extension("synctex.gz"), synctex.as_bytes()).unwrap();
+    let plain_gz_forward = resolve_forward_with_selector(
+        &pdf,
+        &tex,
+        3,
+        1,
+        ForwardSource {
+            page_hint: Some(2),
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap();
+    assert_eq!(plain_gz_forward.page, 2);
+}
+
+#[test]
+fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let out_dir = root.join("out");
+    let build_dir = root.join("build");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+
+    let pdf = out_dir.join("separate_build_dir_doc.pdf");
+    let tex = build_dir.join("main.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &tex,
+        "\\documentclass{article}\n\\begin{document}\nseparate build word\n\\end{document}\n",
+    )
+    .unwrap();
+
+    // Relative Input path inside the separate build directory
+    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3,5:0,0:30000000,40000000,0\n(1,3,5:655360,6553600:6553600,655360,0\nx1,3,5:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    let sidecar = build_dir.join("separate_build_dir_doc.synctex");
+    fs::write(&sidecar, synctex).unwrap();
+
+    assert_eq!(locate_synctex(&pdf), None);
+    assert_eq!(
+        locate_synctex_in(&pdf, Some(&build_dir)).as_deref(),
+        Some(sidecar.as_path())
+    );
+    // Relative build_directory resolved against pdf.parent()
+    assert_eq!(
+        locate_synctex_in(&pdf, Some(Path::new("../build")))
+            .and_then(|p| fs::canonicalize(p).ok())
+            .as_deref(),
+        Some(sidecar.as_path())
+    );
+
+    let info = crate::source_snapshot::SourceInfo::read_in(&pdf, Some(&build_dir)).unwrap();
+    assert_eq!(info.main.as_deref(), Some(tex.as_path()));
+    assert_eq!(info.inputs, vec![tex.clone()]);
+
+    let forward = resolve_forward_with_selector(
+        &pdf,
+        &tex,
+        3,
+        1,
+        ForwardSource {
+            build_directory: Some(&build_dir),
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap();
+    assert_eq!(forward.page, 1);
+
+    let pt = InversePoint {
+        page: 1,
+        x: 20.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let mut cache = SyncTeXCache::default();
+    let inverse = resolve_inverse_with_cache_in(
+        &pdf,
+        pt,
+        Some(("separate build word", 9)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+        Some(&mut cache),
+        Some(&build_dir),
+    )
+    .unwrap();
+    assert_eq!(Path::new(&inverse.location.file), tex.as_path());
+    assert_eq!(inverse.location.line, 3);
+    assert_eq!(inverse.location.column_char, 10);
+    assert!(inverse.location.precise);
+
+    // Configured default build directory via set_build_directory
+    set_build_directory(Some(build_dir.clone()));
+    let forward_global = resolve_forward(&pdf, &tex, 3, 1).unwrap();
+    assert_eq!(forward_global.page, 1);
+    let inverse_global = resolve_inverse(
+        &pdf,
+        pt,
+        None,
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    set_build_directory(None);
+    assert_eq!(Path::new(&inverse_global.location.file), tex.as_path());
+    assert_eq!(inverse_global.location.line, 3);
+    assert_eq!(inverse_global.location.column, 5);
+}

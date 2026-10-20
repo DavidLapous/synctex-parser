@@ -6,7 +6,9 @@ mod tests;
 
 pub use parser::{
     forward_candidates, forward_candidates_from_reader, forward_candidates_from_reader_with_options,
-    inverse_candidates, inverse_candidates_from_reader, inverse_candidates_from_reader_with_options,
+    forward_candidates_from_reader_with_page_hint, forward_candidates_in,
+    forward_candidates_with_page_hint, inverse_candidates, inverse_candidates_from_reader,
+    inverse_candidates_from_reader_with_options, inverse_candidates_in,
 };
 use parser::*;
 use crate::source_snapshot::{SourceSnapshot, valid_absolute_path, valid_warning};
@@ -139,6 +141,64 @@ impl PdfRevision {
     }
 }
 
+static BUILD_DIRECTORY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+pub fn set_build_directory(path: Option<PathBuf>) {
+    *BUILD_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+pub fn build_directory() -> Option<PathBuf> {
+    BUILD_DIRECTORY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .or_else(|| {
+            std::env::var_os("SYNCTEX_BUILD_DIRECTORY")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+pub(crate) fn synctex_candidates(
+    pdf: &Path,
+    build_directory: Option<&Path>,
+) -> Vec<(PathBuf, bool)> {
+    let mut candidates = Vec::new();
+    let mut push_pair = |base: &Path| {
+        for (extension, compressed) in [("synctex.gz", true), ("synctex", false)] {
+            let candidate = base.with_extension(extension);
+            if !candidates.iter().any(|(existing, _)| existing == &candidate) {
+                candidates.push((candidate, compressed));
+            }
+        }
+    };
+    let effective = build_directory
+        .map(Path::to_path_buf)
+        .or_else(crate::build_directory);
+    if let Some(dir) = effective.as_deref()
+        && let Some(name) = pdf.file_name()
+    {
+        push_pair(&dir.join(name));
+        if dir.is_relative()
+            && let Some(parent) = pdf.parent().filter(|p| !p.as_os_str().is_empty())
+        {
+            push_pair(&parent.join(dir).join(name));
+        }
+    }
+    push_pair(pdf);
+    candidates
+}
+
+pub fn locate_synctex_in(pdf: &Path, build_directory: Option<&Path>) -> Option<PathBuf> {
+    synctex_candidates(pdf, build_directory)
+        .into_iter()
+        .find_map(|(candidate, _)| PdfRevision::read(&candidate).ok().map(|_| candidate))
+}
+
+pub fn locate_synctex(pdf: &Path) -> Option<PathBuf> {
+    locate_synctex_in(pdf, None)
+}
+
 /// Metadata identity of both files observed when PDFium opens a document.
 /// Stability does not prove a common build; producers must publish a completed
 /// PDF/SyncTeX pair before requesting navigation.
@@ -148,9 +208,12 @@ pub struct DocumentRevision {
     pub pdf: PdfRevision,
     companion: Option<(bool, PdfRevision)>,
 }
-fn companion_revision(path: &Path) -> io::Result<Option<(bool, PdfRevision)>> {
-    for (extension, compressed) in [("synctex.gz", true), ("synctex", false)] {
-        match PdfRevision::read(&path.with_extension(extension)) {
+pub(crate) fn companion_revision_in(
+    path: &Path,
+    build_directory: Option<&Path>,
+) -> io::Result<Option<(bool, PdfRevision)>> {
+    for (candidate, compressed) in synctex_candidates(path, build_directory) {
+        match PdfRevision::read(&candidate) {
             Ok(revision) => return Ok(Some((compressed, revision))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -161,12 +224,18 @@ fn companion_revision(path: &Path) -> io::Result<Option<(bool, PdfRevision)>> {
 
 impl DocumentRevision {
     pub fn read(path: &Path) -> io::Result<Self> {
+        Self::read_in(path, None)
+    }
+    pub fn read_in(path: &Path, build_directory: Option<&Path>) -> io::Result<Self> {
         let pdf = PdfRevision::read(path)?;
-        let companion = companion_revision(path)?;
+        let companion = companion_revision_in(path, build_directory)?;
         Ok(Self { pdf, companion })
     }
     pub fn check(self, path: &Path) -> io::Result<()> {
-        if Self::read(path)? != self {
+        self.check_in(path, None)
+    }
+    pub fn check_in(self, path: &Path, build_directory: Option<&Path>) -> io::Result<()> {
+        if Self::read_in(path, build_directory)? != self {
             return Err(io::Error::other(
                 "displayed PDF/SyncTeX revision changed; wait for reload and click again",
             ));
@@ -366,6 +435,8 @@ pub struct ForwardSource<'a> {
     pub snapshot: Option<&'a Path>,
     pub best_guess: bool,
     pub anchor_only: bool,
+    pub page_hint: Option<u32>,
+    pub build_directory: Option<&'a Path>,
 }
 
 /// No usable compiler geometry exists for this otherwise valid request.
@@ -422,14 +493,14 @@ pub fn resolve_forward_with_selector(
     let pdf = fs::canonicalize(pdf)?;
     let snapshot = context
         .snapshot
-        .map(|path| SourceSnapshot::load(path, &pdf))
+        .map(|path| SourceSnapshot::load_in(path, &pdf, context.build_directory))
         .transpose()?;
     let allow_anchor = context.best_guess || context.anchor_only;
     let mut document_revision = match &snapshot {
         Some(snapshot) => Some(snapshot.revision),
         None if allow_anchor => {
             drop(crate::source_snapshot::open_regular(&pdf, false)?);
-            Some(DocumentRevision::read(&pdf)?)
+            Some(DocumentRevision::read_in(&pdf, context.build_directory)?)
         }
         None => None,
     };
@@ -471,7 +542,8 @@ pub fn resolve_forward_with_selector(
             (root_source, root_source.then_some(root))
         }
         None => {
-            let inputs = crate::source_snapshot::SourceInfo::read(&pdf)?;
+            let inputs =
+                crate::source_snapshot::SourceInfo::read_in(&pdf, context.build_directory)?;
             let main = inputs
                 .main
                 .as_ref()
@@ -561,7 +633,14 @@ pub fn resolve_forward_with_selector(
                 .or_else(|| original_line.and_then(|_| caption_closing_line(source, line, column)))
         })
         .unwrap_or(line);
-    let candidates = forward_candidates(&pdf, &file, snapshot.as_ref(), view_line)?;
+    let candidates = forward_candidates_in(
+        &pdf,
+        &file,
+        snapshot.as_ref(),
+        view_line,
+        context.page_hint,
+        context.build_directory,
+    )?;
     let line_candidate = |hint: Option<&ForwardWord>| {
         let anchor = best_guess_forward_candidate(&candidates)?;
         match hint {
@@ -601,7 +680,7 @@ pub fn resolve_forward_with_selector(
     };
     result.validate()?;
     if let Some(revision) = document_revision {
-        revision.check(&result.pdf)?;
+        revision.check_in(&result.pdf, context.build_directory)?;
     } else {
         revision.check(&result.pdf)?;
     }
@@ -641,6 +720,29 @@ pub fn resolve_inverse(
     source_snapshot: Option<&Path>,
     best_guess: bool,
 ) -> io::Result<InverseResolution> {
+    resolve_inverse_in(
+        pdf,
+        point,
+        word,
+        radius,
+        operation,
+        source_snapshot,
+        best_guess,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_inverse_in(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    source_snapshot: Option<&Path>,
+    best_guess: bool,
+    build_directory: Option<&Path>,
+) -> io::Result<InverseResolution> {
     operation.check()?;
     if point.page == 0
         || point.page_height_pt <= 0.0
@@ -655,9 +757,9 @@ pub fn resolve_inverse(
     }
     let pdf = std::path::absolute(pdf)?;
     let snapshot = source_snapshot
-        .map(|path| SourceSnapshot::load(path, &pdf))
+        .map(|path| SourceSnapshot::load_in(path, &pdf, build_directory))
         .transpose()?;
-    resolve_inverse_with_snapshot(
+    resolve_inverse_with_snapshot_in(
         &pdf,
         point,
         word,
@@ -665,6 +767,7 @@ pub fn resolve_inverse(
         operation,
         snapshot.as_ref(),
         best_guess,
+        build_directory,
     )
 }
 
@@ -689,12 +792,15 @@ impl SyncTeXCache {
         pdf: &Path,
         point: InversePoint,
         operation: &Operation,
+        build_directory: Option<&Path>,
     ) -> io::Result<(Vec<SourceLocation>, (bool, PdfRevision), &mut CachedSyncTeX)> {
         operation.check()?;
-        let Some(companion) = companion_revision(pdf)? else {
-            return Err(open_synctex(pdf).err().unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
-            }));
+        let Some(companion) = companion_revision_in(pdf, build_directory)? else {
+            return Err(
+                open_synctex_in(pdf, build_directory).err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
+                }),
+            );
         };
         if self
             .entry
@@ -702,9 +808,9 @@ impl SyncTeXCache {
             .is_none_or(|entry| entry.pdf != pdf || entry.companion != companion)
         {
             let mut raw = Vec::new();
-            open_synctex(pdf)?.read_to_end(&mut raw)?;
+            open_synctex_in(pdf, build_directory)?.read_to_end(&mut raw)?;
             operation.check()?;
-            if companion_revision(pdf)? != Some(companion) {
+            if companion_revision_in(pdf, build_directory)? != Some(companion) {
                 return Err(io::Error::other(
                     "displayed PDF/SyncTeX revision changed; wait for reload and click again",
                 ));
@@ -747,6 +853,30 @@ pub fn resolve_inverse_with_snapshot(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn resolve_inverse_with_snapshot_in(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    snapshot: Option<&SourceSnapshot>,
+    best_guess: bool,
+    build_directory: Option<&Path>,
+) -> io::Result<InverseResolution> {
+    resolve_inverse_with_cache_in(
+        pdf,
+        point,
+        word,
+        radius,
+        operation,
+        snapshot,
+        best_guess,
+        None,
+        build_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_inverse_with_cache(
     pdf: &Path,
     point: InversePoint,
@@ -755,7 +885,24 @@ pub fn resolve_inverse_with_cache(
     operation: &Operation,
     snapshot: Option<&SourceSnapshot>,
     best_guess: bool,
+    cache: Option<&mut SyncTeXCache>,
+) -> io::Result<InverseResolution> {
+    resolve_inverse_with_cache_in(
+        pdf, point, word, radius, operation, snapshot, best_guess, cache, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_inverse_with_cache_in(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    snapshot: Option<&SourceSnapshot>,
+    best_guess: bool,
     mut cache: Option<&mut SyncTeXCache>,
+    build_directory: Option<&Path>,
 ) -> io::Result<InverseResolution> {
     operation.check()?;
     if point.page == 0
@@ -771,21 +918,22 @@ pub fn resolve_inverse_with_cache(
     }
     let pdf = std::path::absolute(pdf)?;
     if let Some(snapshot) = snapshot {
-        snapshot.revision.check(&pdf)?;
+        snapshot.revision.check_in(&pdf, build_directory)?;
     }
     let raw_revision = if best_guess && snapshot.is_none() {
         drop(crate::source_snapshot::open_regular(&pdf, false)?);
-        Some(DocumentRevision::read(&pdf)?)
+        Some(DocumentRevision::read_in(&pdf, build_directory)?)
     } else {
         None
     };
     operation.check()?;
     let (targets, cached_companion, cache_entry) = match cache.as_deref_mut() {
         Some(cache) => {
-            let (targets, companion, entry) = cache.candidates_and_entry(&pdf, point, operation)?;
+            let (targets, companion, entry) =
+                cache.candidates_and_entry(&pdf, point, operation, build_directory)?;
             (targets, Some(companion), Some(entry))
         }
-        None => (inverse_candidates(&pdf, point)?, None, None),
+        None => (inverse_candidates_in(&pdf, point, build_directory)?, None, None),
     };
     let sources = QuerySources {
         snapshot,
@@ -801,15 +949,16 @@ pub fn resolve_inverse_with_cache(
         targets,
         sources,
         cache_entry,
+        build_directory,
     )?;
     if let Some(snapshot) = snapshot {
-        snapshot.revision.check(&pdf)?;
+        snapshot.revision.check_in(&pdf, build_directory)?;
     }
     if let Some(revision) = raw_revision {
-        revision.check(&pdf)?;
+        revision.check_in(&pdf, build_directory)?;
     }
     if let Some(companion) = cached_companion
-        && companion_revision(&pdf)? != Some(companion)
+        && companion_revision_in(&pdf, build_directory)? != Some(companion)
     {
         if let Some(cache) = cache {
             cache.entry = None;
@@ -837,7 +986,7 @@ fn resolve_inverse_output(
     sources: QuerySources<'_>,
 ) -> io::Result<InverseResolution> {
     let targets = parse_synctex_edit(stdout);
-    resolve_inverse_targets(pdf, point, word, radius, operation, targets, sources, None)
+    resolve_inverse_targets(pdf, point, word, radius, operation, targets, sources, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -850,6 +999,7 @@ fn resolve_inverse_targets(
     targets: Vec<SourceLocation>,
     sources: QuerySources<'_>,
     synctex_cache: Option<&mut CachedSyncTeX>,
+    build_directory: Option<&Path>,
 ) -> io::Result<InverseResolution> {
     if targets.is_empty() {
         return Err(io::Error::new(
@@ -867,6 +1017,7 @@ fn resolve_inverse_targets(
         operation,
         sources,
         synctex_cache,
+        build_directory,
         structural_map: None,
         geometry_map: None,
         metadata: None,
@@ -1030,6 +1181,7 @@ struct InverseQuery<'a> {
     operation: &'a Operation,
     sources: QuerySources<'a>,
     synctex_cache: Option<&'a mut CachedSyncTeX>,
+    build_directory: Option<&'a Path>,
     structural_map: Option<(PathBuf, Result<Rc<SourceMap>, String>)>,
     geometry_map: Option<Result<Rc<SourceMap>, String>>,
     metadata: Option<Option<MetadataLocation>>,
@@ -1085,13 +1237,14 @@ impl InverseQuery<'_> {
                     .as_ref()
                     .is_none_or(|(cached, _)| cached != generated)
                 {
-                    let loaded = read_source_map(
+                    let loaded = read_source_map_in(
                         self.pdf,
                         self.point,
                         generated_path,
                         false,
                         self.operation,
                         input_cwd,
+                        self.build_directory,
                     )
                     .map(Rc::new)
                     .map_err(|error| error.to_string());
@@ -1120,6 +1273,7 @@ impl InverseQuery<'_> {
             let pdf = self.pdf;
             let point = self.point;
             let operation = self.operation;
+            let build_directory = self.build_directory;
             let raw = self.synctex_cache.as_deref().map(|cache| cache.raw.as_slice());
             self.geometry_map
                 .get_or_insert_with(|| {
@@ -1133,7 +1287,15 @@ impl InverseQuery<'_> {
                             operation,
                             input_cwd,
                         ),
-                        None => read_source_map(pdf, point, generated_path, true, operation, input_cwd),
+                        None => read_source_map_in(
+                            pdf,
+                            point,
+                            generated_path,
+                            true,
+                            operation,
+                            input_cwd,
+                            build_directory,
+                        ),
                     };
                     loaded.map(Rc::new).map_err(|error| error.to_string())
                 })
@@ -1162,6 +1324,7 @@ impl InverseQuery<'_> {
 
     fn normalize_anchor(&mut self, mut target: SourceLocation) -> io::Result<InverseAnchor> {
         let path = Path::new(&target.file);
+        let pdf_dir = self.pdf.parent().unwrap_or(Path::new("."));
         let absolute = if let Some(snapshot) = self.sources.snapshot {
             snapshot.normalize(path)?
         } else if self.sources.best_guess {
@@ -1169,7 +1332,7 @@ impl InverseQuery<'_> {
         } else if path.is_absolute() {
             path.to_owned()
         } else {
-            self.pdf.parent().unwrap_or(Path::new(".")).join(path)
+            pdf_dir.join(path)
         };
         let mut warning = None;
         let resolved = if self.sources.snapshot.is_some() || self.sources.best_guess {
@@ -1178,10 +1341,28 @@ impl InverseQuery<'_> {
             match fs::canonicalize(&absolute) {
                 Ok(path) => path,
                 Err(error) => {
-                    warning = Some(format!(
-                        "line-only navigation: source path unavailable: {error}"
-                    ));
-                    absolute
+                    let fallback = (!path.is_absolute())
+                        .then(|| {
+                            locate_synctex_in(self.pdf, self.build_directory)
+                                .and_then(|sidecar| sidecar.parent().map(Path::to_owned))
+                        })
+                        .flatten()
+                        .filter(|sidecar_dir| sidecar_dir != pdf_dir)
+                        .and_then(|sidecar_dir| {
+                            fs::canonicalize(sidecar_dir.join(path)).ok().or_else(|| {
+                                std::env::current_dir()
+                                    .ok()
+                                    .and_then(|cwd| fs::canonicalize(cwd.join(path)).ok())
+                            })
+                        });
+                    if let Some(found) = fallback {
+                        found
+                    } else {
+                        warning = Some(format!(
+                            "line-only navigation: source path unavailable: {error}"
+                        ));
+                        absolute
+                    }
                 }
             }
         };
@@ -1214,6 +1395,10 @@ impl InverseQuery<'_> {
         let generated = anchor.generated;
         let source_map = &anchor.source_map;
         let warning = &mut anchor.warning;
+        let raw_column = (!generated).then_some(target.column).filter(|&col| col > 1);
+        target.byte_column = 0;
+        target.column = 1;
+        target.column_char = 1;
         if !generated
             && let Some(reason) = self
                 .sources
@@ -1251,20 +1436,35 @@ impl InverseQuery<'_> {
                 }
             }
         };
-        if let Err(error) =
-            validate_inverse_source_line(&source, target.line, Path::new(&target.file))
+        let text = match validate_inverse_source_line(&source, target.line, Path::new(&target.file))
         {
-            if !self.sources.best_guess {
-                return Err(error);
+            Ok(text) => text,
+            Err(error) => {
+                if !self.sources.best_guess {
+                    return Err(error);
+                }
+                *warning = Some(format!(
+                    "best-guess navigation: {error}; preserving the original compiler anchor for editor mapping"
+                ));
+                return Ok(None);
             }
-            *warning = Some(format!(
-                "best-guess navigation: {error}; preserving the original compiler anchor for editor mapping"
-            ));
-            return Ok(None);
-        }
+        };
         if let Some(reason) = self.sources.warning(Path::new(&target.file)) {
             *warning = Some(reason.to_owned());
             return Ok(None);
+        }
+        if let Some(column) = raw_column
+            && let Some(prefix) = text.get(..column - 1).or_else(|| {
+                let end = text
+                    .char_indices()
+                    .nth(column - 1)
+                    .map_or(text.len(), |(idx, _)| idx);
+                (column - 1 <= text.chars().count()).then_some(&text[..end])
+            })
+        {
+            target.byte_column = prefix.len();
+            target.column = prefix.encode_utf16().count() + 1;
+            target.column_char = prefix.chars().count() + 1;
         }
         Ok(Some(source))
     }
@@ -1755,18 +1955,39 @@ fn source_map_dimension(value: &str) -> io::Result<f64> {
     source_map_number(value)
 }
 
-fn open_synctex(pdf: &Path) -> io::Result<Box<dyn BufRead>> {
-    let reader: Box<dyn Read> = match fs::File::open(pdf.with_extension("synctex.gz")) {
-        Ok(file) => Box::new(
-            flate2::read::GzDecoder::new(BufReader::with_capacity(64 * 1024, file))
-                .take(128 * 1024 * 1024),
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Box::new(fs::File::open(pdf.with_extension("synctex"))?.take(128 * 1024 * 1024))
+pub(crate) fn decode_synctex_file(file: fs::File, limit: u64) -> io::Result<Box<dyn BufRead>> {
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    if reader.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
+        Ok(Box::new(BufReader::with_capacity(
+            64 * 1024,
+            flate2::read::GzDecoder::new(reader).take(limit),
+        )))
+    } else {
+        Ok(Box::new(reader.take(limit)))
+    }
+}
+
+pub(crate) fn open_synctex_with_path_in(
+    pdf: &Path,
+    build_directory: Option<&Path>,
+) -> io::Result<(Box<dyn BufRead>, PathBuf)> {
+    let mut last_not_found = None;
+    for (candidate, _) in synctex_candidates(pdf, build_directory) {
+        match fs::File::open(&candidate) {
+            Ok(file) => return Ok((decode_synctex_file(file, 128 * 1024 * 1024)?, candidate)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
-    };
-    Ok(Box::new(BufReader::with_capacity(64 * 1024, reader)))
+    }
+    Err(last_not_found
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")))
+}
+
+pub(crate) fn open_synctex_in(
+    pdf: &Path,
+    build_directory: Option<&Path>,
+) -> io::Result<Box<dyn BufRead>> {
+    open_synctex_with_path_in(pdf, build_directory).map(|(reader, _)| reader)
 }
 
 fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
@@ -1778,16 +1999,17 @@ fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
     ))
 }
 
-fn read_source_map(
+fn read_source_map_in(
     pdf: &Path,
     point: InversePoint,
     generated: &Path,
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
+    build_directory: Option<&Path>,
 ) -> io::Result<SourceMap> {
     source_map_from_reader(
-        open_synctex(pdf)?,
+        open_synctex_in(pdf, build_directory)?,
         pdf,
         point,
         generated,
@@ -2386,26 +2608,43 @@ fn document_metadata_word_location(
 
 pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
     let mut input = None;
+    let mut active = false;
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for row in stdout.lines() {
         if let Some(value) = row.strip_prefix("Input:") {
             input = Some(value.trim());
-        } else if let Some(value) = row.strip_prefix("Line:")
-            && let Some(file) = input.take()
-            && !file.is_empty()
-            && let Ok(line) = value.trim().parse::<u32>()
-            && line > 0
-            && seen.insert((file, line))
+            active = false;
+        } else if let Some(value) = row.strip_prefix("Line:") {
+            active = false;
+            if let Some(file) = input.take()
+                && !file.is_empty()
+                && let Ok(line) = value.trim().parse::<u32>()
+                && line > 0
+                && seen.insert((file, line))
+            {
+                results.push(SourceLocation {
+                    file: file.to_owned(),
+                    line,
+                    byte_column: 0,
+                    column: 1,
+                    column_char: 1,
+                    precise: false,
+                });
+                active = true;
+            }
+        } else if active
+            && let Some(value) = row.strip_prefix("Column:")
         {
-            results.push(SourceLocation {
-                file: file.to_owned(),
-                line,
-                byte_column: 0,
-                column: 1,
-                column_char: 1,
-                precise: false,
-            });
+            active = false;
+            if let Ok(column) = value.trim().parse::<usize>()
+                && column > 0
+                && let Some(last) = results.last_mut()
+            {
+                last.byte_column = column - 1;
+                last.column = column;
+                last.column_char = column;
+            }
         }
     }
     results

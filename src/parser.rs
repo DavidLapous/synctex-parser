@@ -1011,7 +1011,38 @@ pub fn forward_candidates(
     snapshot: Option<&SourceSnapshot>,
     view_line: u32,
 ) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_from_reader(open_synctex(pdf)?, pdf, file, snapshot, view_line)
+    forward_candidates_with_page_hint(pdf, file, snapshot, view_line, None)
+}
+
+pub fn forward_candidates_with_page_hint(
+    pdf: &Path,
+    file: &Path,
+    snapshot: Option<&SourceSnapshot>,
+    view_line: u32,
+    page_hint: Option<u32>,
+) -> io::Result<Vec<ForwardCandidate>> {
+    forward_candidates_in(pdf, file, snapshot, view_line, page_hint, None)
+}
+
+pub fn forward_candidates_in(
+    pdf: &Path,
+    file: &Path,
+    snapshot: Option<&SourceSnapshot>,
+    view_line: u32,
+    page_hint: Option<u32>,
+    build_directory: Option<&Path>,
+) -> io::Result<Vec<ForwardCandidate>> {
+    let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory)?;
+    forward_candidates_from_reader_with_page_hint_in(
+        reader,
+        pdf,
+        file,
+        snapshot,
+        view_line,
+        true,
+        page_hint,
+        sidecar_path.parent(),
+    )
 }
 
 pub fn forward_candidates_from_reader(
@@ -1032,6 +1063,49 @@ pub fn forward_candidates_from_reader_with_options(
     view_line: u32,
     fix_readahead: bool,
 ) -> io::Result<Vec<ForwardCandidate>> {
+    forward_candidates_from_reader_with_page_hint(
+        reader,
+        pdf,
+        file,
+        snapshot,
+        view_line,
+        fix_readahead,
+        None,
+    )
+}
+
+pub fn forward_candidates_from_reader_with_page_hint(
+    reader: impl BufRead,
+    pdf: &Path,
+    file: &Path,
+    snapshot: Option<&SourceSnapshot>,
+    view_line: u32,
+    fix_readahead: bool,
+    page_hint: Option<u32>,
+) -> io::Result<Vec<ForwardCandidate>> {
+    forward_candidates_from_reader_with_page_hint_in(
+        reader,
+        pdf,
+        file,
+        snapshot,
+        view_line,
+        fix_readahead,
+        page_hint,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_candidates_from_reader_with_page_hint_in(
+    reader: impl BufRead,
+    pdf: &Path,
+    file: &Path,
+    snapshot: Option<&SourceSnapshot>,
+    view_line: u32,
+    fix_readahead: bool,
+    page_hint: Option<u32>,
+    sidecar_dir: Option<&Path>,
+) -> io::Result<Vec<ForwardCandidate>> {
     let base = snapshot
         .map(|snapshot| snapshot.cwd.as_path())
         .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")));
@@ -1051,12 +1125,32 @@ pub fn forward_candidates_from_reader_with_options(
     let mut matching_tags = std::collections::HashSet::new();
     let mut input_tag = None::<u32>;
     for (tag, raw_path) in inputs.iter().rev() {
-        let normalized = match snapshot {
+        let mut normalized = match snapshot {
             Some(snapshot) => snapshot.normalize(Path::new(raw_path)).ok(),
             None => crate::source_snapshot::normalize_absolute(Path::new(raw_path), base)
                 .ok()
                 .map(|path| fs::canonicalize(&path).unwrap_or(path)),
         };
+        if normalized.as_deref() != Some(file)
+            && snapshot.is_none()
+            && !Path::new(raw_path).is_absolute()
+            && let Some(sdir) = sidecar_dir.filter(|&sdir| sdir != base)
+        {
+            for alt_base in [Some(sdir), std::env::current_dir().ok().as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(cand) =
+                    crate::source_snapshot::normalize_absolute(Path::new(raw_path), alt_base)
+                {
+                    let resolved = fs::canonicalize(&cand).unwrap_or(cand);
+                    if resolved == file {
+                        normalized = Some(resolved);
+                        break;
+                    }
+                }
+            }
+        }
         if normalized.as_deref() == Some(file) {
             matching_tags.insert(*tag);
             if input_tag.is_none() {
@@ -1234,10 +1328,11 @@ pub fn forward_candidates_from_reader_with_options(
                                 res_list.into_iter().map(|(_, n)| n).collect::<Vec<_>>(),
                             ));
                         }
+                        let hint = page_hint.unwrap_or(0);
                         let mut ordered = vec![sorted_pages[0].clone()];
                         let mut best_match = ordered[0].0;
                         for sib in sorted_pages.into_iter().skip(1) {
-                            if sib.0 < best_match {
+                            if sib.0.abs_diff(hint) < best_match.abs_diff(hint) {
                                 best_match = sib.0;
                                 ordered.insert(0, sib);
                             } else {
@@ -1471,7 +1566,19 @@ pub(crate) fn forward_geometry_valid(page: u32, h: f32, v: f32, width: f32, heig
 }
 
 pub fn inverse_candidates(pdf: &Path, point: InversePoint) -> io::Result<Vec<SourceLocation>> {
-    inverse_candidates_from_reader_with_options(open_synctex(pdf)?, point, true)
+    inverse_candidates_in(pdf, point, None)
+}
+
+pub fn inverse_candidates_in(
+    pdf: &Path,
+    point: InversePoint,
+    build_directory: Option<&Path>,
+) -> io::Result<Vec<SourceLocation>> {
+    inverse_candidates_from_reader_with_options(
+        crate::open_synctex_in(pdf, build_directory)?,
+        point,
+        true,
+    )
 }
 
 pub fn inverse_candidates_from_reader(
@@ -1970,12 +2077,16 @@ pub(crate) fn inverse_candidates_in_doc(
             continue;
         }
         if seen.insert((file, line)) {
+            let column = usize::try_from(nodes[idx].column)
+                .ok()
+                .filter(|&col| col > 0)
+                .unwrap_or(1);
             results.push(SourceLocation {
                 file: file.to_owned(),
                 line,
-                byte_column: 0,
-                column: 1,
-                column_char: 1,
+                byte_column: column - 1,
+                column,
+                column_char: column,
                 precise: false,
             });
         }
