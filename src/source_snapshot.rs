@@ -76,15 +76,24 @@ impl SourceInfo {
                 ),
             });
         };
-        let pdf_dir = pdf.parent().unwrap_or(Path::new("."));
+        let pdf_dir = pdf
+            .parent()
+            .and_then(|dir| fs::canonicalize(dir).ok())
+            .or_else(|| pdf.parent().map(Path::to_owned));
         let sidecar_dir = sidecar_path
             .parent()
-            .and_then(|dir| fs::canonicalize(dir).ok());
+            .and_then(|dir| fs::canonicalize(dir).ok())
+            .or_else(|| sidecar_path.parent().map(Path::to_owned));
         let mut fallback_dirs = Vec::new();
-        if let Some(ref sdir) = sidecar_dir
-            && sdir.as_path() != pdf_dir
+        if let Some(ref pdir) = pdf_dir
+            && pdir.as_path() != cwd.as_path()
         {
-            fallback_dirs.push(pdf_dir);
+            fallback_dirs.push(pdir.as_path());
+        }
+        if let Some(ref sdir) = sidecar_dir
+            && sdir.as_path() != cwd.as_path()
+            && pdf_dir.as_deref() != Some(sdir.as_path())
+        {
             fallback_dirs.push(sdir.as_path());
         }
         let (main, inputs, unavailable) = read_inputs_with_fallbacks(
@@ -309,6 +318,7 @@ pub struct SourceSnapshot {
     pub revision: DocumentRevision,
     pub cwd: PathBuf,
     pub main: PathBuf,
+    fallback_dirs: Vec<PathBuf>,
     directory: PathBuf,
     files: BTreeMap<PathBuf, String>,
     digests: BTreeMap<PathBuf, [u8; 32]>,
@@ -417,6 +427,20 @@ impl SourceSnapshot {
             }
         }
         manifest.revision.check_in(&pdf, build_directory)?;
+        let sidecar_dir = sidecar_dir_for(&pdf, build_directory);
+        let mut fallback_dirs = Vec::new();
+        for dir in [
+            pdf.parent().map(Path::to_owned),
+            sidecar_dir,
+            manifest.main.parent().map(Path::to_owned),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if dir != manifest.cwd && !fallback_dirs.contains(&dir) {
+                fallback_dirs.push(dir);
+            }
+        }
         let filename = path.file_name().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -429,6 +453,7 @@ impl SourceSnapshot {
             revision: manifest.revision,
             cwd: manifest.cwd,
             main: manifest.main,
+            fallback_dirs,
             directory,
             files: manifest.files,
             digests,
@@ -436,17 +461,47 @@ impl SourceSnapshot {
         })
     }
 
+    fn is_recorded(&self, path: &Path) -> bool {
+        self.files.contains_key(path)
+            || self.warnings.contains_key(path)
+            || path == self.main
+    }
+
     pub fn normalize(&self, original: &Path) -> io::Result<PathBuf> {
         let absolute = normalize_absolute(original, &self.cwd)?;
         // Do not consult the live filesystem before checking old compiler
         // identities: a deleted file or changed symlink is still this input.
-        if self.files.contains_key(&absolute)
-            || self.warnings.contains_key(&absolute)
-            || absolute == self.main
-        {
+        if self.is_recorded(&absolute) {
             return Ok(absolute);
         }
-        Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
+        let rel = original.strip_prefix(&self.cwd).unwrap_or(original);
+        if !rel.is_absolute() {
+            for base in &self.fallback_dirs {
+                if let Ok(cand) = normalize_absolute(rel, base) {
+                    if self.is_recorded(&cand) {
+                        return Ok(cand);
+                    }
+                    if let Ok(canon) = fs::canonicalize(&cand)
+                        && self.is_recorded(&canon)
+                    {
+                        return Ok(canon);
+                    }
+                }
+            }
+        }
+        if let Ok(canon) = fs::canonicalize(&absolute) {
+            return Ok(canon);
+        }
+        if !rel.is_absolute() {
+            for base in &self.fallback_dirs {
+                if let Ok(cand) = normalize_absolute(rel, base)
+                    && let Ok(canon) = fs::canonicalize(&cand)
+                {
+                    return Ok(canon);
+                }
+            }
+        }
+        Ok(absolute)
     }
 
     pub fn read(&self, original: &Path) -> io::Result<String> {
@@ -550,6 +605,34 @@ pub(crate) fn normalize_absolute(path: &Path, cwd: &Path) -> io::Result<PathBuf>
     // Components remove redundant separators and `.` without collapsing
     // symlink-sensitive `..` components against an unavailable original file.
     Ok(absolute)
+}
+
+pub(crate) fn sidecar_dir_for(pdf: &Path, build_directory: Option<&Path>) -> Option<PathBuf> {
+    synctex::locate_synctex_in(pdf, build_directory).and_then(|sidecar| {
+        sidecar
+            .parent()
+            .and_then(|dir| fs::canonicalize(dir).ok())
+            .or_else(|| sidecar.parent().map(Path::to_owned))
+    })
+}
+
+pub(crate) fn resolve_relative_input(
+    raw_path: &Path,
+    cwd: Option<&Path>,
+    pdf_dir: Option<&Path>,
+    sidecar_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if raw_path.is_absolute() {
+        return None;
+    }
+    for base in [cwd, pdf_dir, sidecar_dir].into_iter().flatten() {
+        if let Ok(cand) = normalize_absolute(raw_path, base)
+            && let Ok(resolved) = fs::canonicalize(cand)
+        {
+            return Some(resolved);
+        }
+    }
+    None
 }
 
 pub(crate) fn open_regular(path: &Path, no_follow: bool) -> io::Result<fs::File> {

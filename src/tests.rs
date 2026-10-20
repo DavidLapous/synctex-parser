@@ -2326,7 +2326,7 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
 
     let pt = InversePoint {
         page: 1,
-        x: 20.0,
+        x: 19.0,
         y_from_top: 98.0,
         page_height_pt: 792.0,
     };
@@ -2366,4 +2366,191 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
     assert_eq!(Path::new(&inverse_global.location.file), tex.as_path());
     assert_eq!(inverse_global.location.line, 3);
     assert_eq!(inverse_global.location.column, 5);
+}
+
+#[test]
+fn snapshot_preserves_fallback_source_identity_and_required_cache_validation() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let client_dir = root.join("client");
+    let build_dir = root.join("build");
+    let cache_dir = root.join("cache");
+    fs::create_dir_all(&client_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let pdf = build_dir.join("main.pdf");
+    let tex = build_dir.join("main.tex");
+    let source_text = "\\documentclass{article}\n\\begin{document}\nsnapshot fallback line\n\\end{document}\n";
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, source_text).unwrap();
+
+    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3,10:0,0:30000000,40000000,0\n(1,3,10:655360,6553600:6553600,655360,0\nx1,3,10:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    fs::write(build_dir.join("main.synctex"), synctex).unwrap();
+
+    fs::write(cache_dir.join("1.txt"), source_text).unwrap();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(source_text.as_bytes()).iter() {
+        write!(digest, "{byte:02x}").unwrap();
+    }
+    let manifest_path = cache_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&serde_json::json!({
+            "pdf": pdf,
+            "revision": DocumentRevision::read(&pdf).unwrap(),
+            "cwd": client_dir,
+            "main": tex,
+            "files": BTreeMap::from([(tex.clone(), "1.txt")]),
+            "digests": BTreeMap::from([(tex.clone(), digest)]),
+            "warnings": {},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Forward navigation with snapshot resolves ./main.tex to captured build/main.tex
+    let forward = resolve_forward_with_selector(
+        &pdf,
+        &tex,
+        3,
+        1,
+        ForwardSource {
+            snapshot: Some(&manifest_path),
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap();
+    assert_eq!(forward.page, 1);
+
+    // Inverse navigation with snapshot returns captured build/main.tex (not client/main.tex)
+    let pt = InversePoint {
+        page: 1,
+        x: 19.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let inverse = resolve_inverse(
+        &pdf,
+        pt,
+        Some(("snapshot fallback line", 9)),
+        2,
+        &Operation::default(),
+        Some(&manifest_path),
+        false,
+    )
+    .unwrap();
+    assert_eq!(Path::new(&inverse.location.file), tex.as_path());
+    assert_eq!(inverse.location.line, 3);
+    assert!(inverse.location.precise);
+
+    // Deleting the required cached source file must fail with a required-cache error
+    fs::remove_file(cache_dir.join("1.txt")).unwrap();
+    let err = resolve_inverse(
+        &pdf,
+        pt,
+        None,
+        2,
+        &Operation::default(),
+        Some(&manifest_path),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("required compiled source cache"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    // Line 3 starts with two 2-byte UTF-8 characters ('é' = 2 bytes each):
+    // byte 0..2 = 'é' (char 1), byte 2..4 = 'é' (char 2), byte 4 = ' ', byte 5..10 = "alpha", byte 11..16 = "omega"
+    fs::write(
+        &tex,
+        "\\documentclass{article}\n\\begin{document}\néé alpha omega\n\\end{document}\n",
+    )
+    .unwrap();
+
+    // 1. Unicode coordinate units for compiler column 3 (byte offset 2, which is after 1 char 'é'):
+    // byte_column must be 2, and UTF-16 `column` / scalar `column_char` must be 2 (not 3).
+    let unicode_synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3,3:0,0:30000000,40000000,0\n(1,3,3:655360,6553600:6553600,655360,0\nx1,3,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        tex.display()
+    );
+    fs::write(pdf.with_extension("synctex"), &unicode_synctex).unwrap();
+
+    let pt = InversePoint {
+        page: 1,
+        x: 19.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let raw_unicode = inverse_candidates(&pdf, pt).unwrap();
+    assert_eq!(raw_unicode.len(), 1);
+    assert_eq!(
+        (
+            raw_unicode[0].byte_column,
+            raw_unicode[0].column,
+            raw_unicode[0].column_char
+        ),
+        (2, 2, 2)
+    );
+
+    let edit_unicode = parse_synctex_edit(&format!(
+        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:3\nSyncTeX result end\n",
+        tex.display()
+    ));
+    assert_eq!(edit_unicode.len(), 1);
+    assert_eq!(
+        (
+            edit_unicode[0].byte_column,
+            edit_unicode[0].column,
+            edit_unicode[0].column_char
+        ),
+        (2, 2, 2)
+    );
+
+    // 2. Two distinct compiler columns (12 and 7) on the same line straddling the click point:
+    // Both raw APIs must retain both candidates, and strict resolve_inverse must report ambiguity.
+    let two_col_synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\ng1,3,12:983040,6553600\ng1,3,7:1966080,6553600\n)\n]\n}}1\nPostamble:\nCount:5\n",
+        tex.display()
+    );
+    fs::write(pdf.with_extension("synctex"), &two_col_synctex).unwrap();
+
+    let raw_two = inverse_candidates(&pdf, pt).unwrap();
+    assert_eq!(raw_two.len(), 2);
+    assert_eq!((raw_two[0].byte_column, raw_two[0].column, raw_two[0].column_char), (11, 10, 10));
+    assert_eq!((raw_two[1].byte_column, raw_two[1].column, raw_two[1].column_char), (6, 5, 5));
+
+    let edit_two = parse_synctex_edit(&format!(
+        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:12\nInput:{}\nLine:3\nColumn:7\nSyncTeX result end\n",
+        tex.display(),
+        tex.display()
+    ));
+    assert_eq!(edit_two.len(), 2);
+    assert_eq!((edit_two[0].byte_column, edit_two[0].column, edit_two[0].column_char), (11, 10, 10));
+    assert_eq!((edit_two[1].byte_column, edit_two[1].column, edit_two[1].column_char), (6, 5, 5));
+
+    let strict_err = resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap_err();
+    assert!(
+        strict_err.to_string().contains("multiple coarse source anchors"),
+        "expected ambiguity error, got: {strict_err}"
+    );
+    let guessed = resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, true).unwrap();
+    assert_eq!((guessed.location.byte_column, guessed.location.column, guessed.location.column_char), (11, 10, 10));
+    assert!(guessed.warning.unwrap().contains("multiple coarse source anchors"));
 }

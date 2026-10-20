@@ -1106,9 +1106,10 @@ fn forward_candidates_from_reader_with_page_hint_in(
     page_hint: Option<u32>,
     sidecar_dir: Option<&Path>,
 ) -> io::Result<Vec<ForwardCandidate>> {
-    let base = snapshot
-        .map(|snapshot| snapshot.cwd.as_path())
-        .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")));
+    let pdf_dir = pdf.parent().unwrap_or(Path::new("."));
+    let current_dir = std::env::current_dir()
+        .ok()
+        .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
     let ParsedSynctex {
         inputs,
         max_lines,
@@ -1125,32 +1126,24 @@ fn forward_candidates_from_reader_with_page_hint_in(
     let mut matching_tags = std::collections::HashSet::new();
     let mut input_tag = None::<u32>;
     for (tag, raw_path) in inputs.iter().rev() {
-        let mut normalized = match snapshot {
-            Some(snapshot) => snapshot.normalize(Path::new(raw_path)).ok(),
-            None => crate::source_snapshot::normalize_absolute(Path::new(raw_path), base)
-                .ok()
-                .map(|path| fs::canonicalize(&path).unwrap_or(path)),
-        };
-        if normalized.as_deref() != Some(file)
-            && snapshot.is_none()
-            && !Path::new(raw_path).is_absolute()
-            && let Some(sdir) = sidecar_dir.filter(|&sdir| sdir != base)
-        {
-            for alt_base in [Some(sdir), std::env::current_dir().ok().as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                if let Ok(cand) =
-                    crate::source_snapshot::normalize_absolute(Path::new(raw_path), alt_base)
-                {
-                    let resolved = fs::canonicalize(&cand).unwrap_or(cand);
-                    if resolved == file {
-                        normalized = Some(resolved);
-                        break;
-                    }
-                }
+        let raw = Path::new(raw_path);
+        let normalized = match snapshot {
+            Some(snapshot) => snapshot.normalize(raw).ok(),
+            None if raw.is_absolute() => {
+                Some(fs::canonicalize(raw).unwrap_or_else(|_| raw.to_owned()))
             }
-        }
+            None => crate::source_snapshot::resolve_relative_input(
+                raw,
+                current_dir.as_deref(),
+                Some(pdf_dir),
+                sidecar_dir,
+            )
+            .or_else(|| {
+                crate::source_snapshot::normalize_absolute(raw, pdf_dir)
+                    .ok()
+                    .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            }),
+        };
         if normalized.as_deref() == Some(file) {
             matching_tags.insert(*tag);
             if input_tag.is_none() {
@@ -1164,7 +1157,16 @@ fn forward_candidates_from_reader_with_page_hint_in(
     {
         let mut matched_path = None::<&str>;
         for (tag, raw_path) in inputs.iter().rev() {
-            if Path::new(raw_path).file_name() == Some(name) {
+            let raw = Path::new(raw_path);
+            if raw.file_name() == Some(name)
+                && crate::source_snapshot::resolve_relative_input(
+                    raw,
+                    current_dir.as_deref(),
+                    Some(pdf_dir),
+                    sidecar_dir,
+                )
+                .is_none()
+            {
                 match matched_path {
                     None => {
                         matched_path = Some(raw_path.as_str());
@@ -1574,11 +1576,24 @@ pub fn inverse_candidates_in(
     point: InversePoint,
     build_directory: Option<&Path>,
 ) -> io::Result<Vec<SourceLocation>> {
-    inverse_candidates_from_reader_with_options(
-        crate::open_synctex_in(pdf, build_directory)?,
-        point,
-        true,
-    )
+    let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory)?;
+    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page))?;
+    let raw = inverse_candidates_in_doc(&parsed, point)?;
+    Ok(crate::materialize_raw_candidates(
+        raw,
+        Some(pdf),
+        sidecar_path.parent(),
+    ))
+}
+
+pub(crate) fn inverse_raw_candidates_in(
+    pdf: &Path,
+    point: InversePoint,
+    build_directory: Option<&Path>,
+) -> io::Result<Vec<RawInverseCandidate>> {
+    let reader = crate::open_synctex_in(pdf, build_directory)?;
+    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page))?;
+    inverse_candidates_in_doc(&parsed, point)
 }
 
 pub fn inverse_candidates_from_reader(
@@ -1594,13 +1609,14 @@ pub fn inverse_candidates_from_reader_with_options(
     fix_cross_file_tags: bool,
 ) -> io::Result<Vec<SourceLocation>> {
     let parsed = parse_synctex_document_with_options(reader, fix_cross_file_tags, Some(point.page))?;
-    inverse_candidates_in_doc(&parsed, point)
+    let raw = inverse_candidates_in_doc(&parsed, point)?;
+    Ok(crate::materialize_raw_candidates(raw, None, None))
 }
 
 pub(crate) fn inverse_candidates_in_doc(
     parsed: &ParsedSynctex,
     point: InversePoint,
-) -> io::Result<Vec<SourceLocation>> {
+) -> io::Result<Vec<RawInverseCandidate>> {
     let Some(sheet) = parsed.sheet_list.iter().find(|s| s.page == point.page) else {
         return Ok(Vec::new());
     };
@@ -2076,18 +2092,14 @@ pub(crate) fn inverse_candidates_in_doc(
         if line == 0 {
             continue;
         }
-        if seen.insert((file, line)) {
-            let column = usize::try_from(nodes[idx].column)
-                .ok()
-                .filter(|&col| col > 0)
-                .unwrap_or(1);
-            results.push(SourceLocation {
+        let compiler_column = usize::try_from(nodes[idx].column)
+            .ok()
+            .filter(|&col| col > 1);
+        if seen.insert((file, line, compiler_column)) {
+            results.push(RawInverseCandidate {
                 file: file.to_owned(),
                 line,
-                byte_column: column - 1,
-                column,
-                column_char: column,
-                precise: false,
+                compiler_column,
             });
         }
     }

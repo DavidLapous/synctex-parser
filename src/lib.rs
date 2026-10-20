@@ -244,6 +244,7 @@ impl DocumentRevision {
     }
 }
 
+#[derive(Debug)]
 pub struct InverseResolution {
     pub location: SourceLocation,
     pub warning: Option<String>,
@@ -793,7 +794,11 @@ impl SyncTeXCache {
         point: InversePoint,
         operation: &Operation,
         build_directory: Option<&Path>,
-    ) -> io::Result<(Vec<SourceLocation>, (bool, PdfRevision), &mut CachedSyncTeX)> {
+    ) -> io::Result<(
+        Vec<RawInverseCandidate>,
+        (bool, PdfRevision),
+        &mut CachedSyncTeX,
+    )> {
         operation.check()?;
         let Some(companion) = companion_revision_in(pdf, build_directory)? else {
             return Err(
@@ -933,7 +938,11 @@ pub fn resolve_inverse_with_cache_in(
                 cache.candidates_and_entry(&pdf, point, operation, build_directory)?;
             (targets, Some(companion), Some(entry))
         }
-        None => (inverse_candidates_in(&pdf, point, build_directory)?, None, None),
+        None => (
+            parser::inverse_raw_candidates_in(&pdf, point, build_directory)?,
+            None,
+            None,
+        ),
     };
     let sources = QuerySources {
         snapshot,
@@ -985,19 +994,19 @@ fn resolve_inverse_output(
     stdout: &str,
     sources: QuerySources<'_>,
 ) -> io::Result<InverseResolution> {
-    let targets = parse_synctex_edit(stdout);
+    let targets = parse_synctex_edit_candidates(stdout);
     resolve_inverse_targets(pdf, point, word, radius, operation, targets, sources, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_inverse_targets(
-    pdf: &Path,
+fn resolve_inverse_targets<'a>(
+    pdf: &'a Path,
     point: InversePoint,
     word: Option<(&str, usize)>,
     radius: u32,
     operation: &Operation,
-    targets: Vec<SourceLocation>,
-    sources: QuerySources<'_>,
+    targets: Vec<RawInverseCandidate>,
+    mut sources: QuerySources<'a>,
     synctex_cache: Option<&mut CachedSyncTeX>,
     build_directory: Option<&Path>,
 ) -> io::Result<InverseResolution> {
@@ -1007,6 +1016,8 @@ fn resolve_inverse_targets(
             InverseFailure::NoMatch,
         ));
     }
+    sources.pdf_dir = pdf.parent();
+    sources.sidecar_dir = crate::source_snapshot::sidecar_dir_for(pdf, build_directory);
     let best_guess = sources.best_guess;
     let assume_unchanged = best_guess && sources.snapshot.is_none();
     let mut query = InverseQuery {
@@ -1101,6 +1112,8 @@ fn resolve_inverse_targets(
 struct QuerySources<'a> {
     snapshot: Option<&'a SourceSnapshot>,
     best_guess: bool,
+    pdf_dir: Option<&'a Path>,
+    sidecar_dir: Option<PathBuf>,
     files: std::collections::HashMap<PathBuf, Result<Rc<String>, (String, bool)>>,
 }
 
@@ -1108,7 +1121,28 @@ impl QuerySources<'_> {
     fn normalize(&self, path: &Path) -> io::Result<PathBuf> {
         match self.snapshot {
             Some(snapshot) => snapshot.normalize(path),
-            None => fs::canonicalize(path),
+            None => fs::canonicalize(path).or_else(|err| {
+                let rel = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| {
+                        path.strip_prefix(&cwd)
+                            .ok()
+                            .map(Path::to_owned)
+                            .or_else(|| {
+                                fs::canonicalize(&cwd)
+                                    .ok()
+                                    .and_then(|canon| path.strip_prefix(canon).ok().map(Path::to_owned))
+                            })
+                    })
+                    .unwrap_or_else(|| path.to_owned());
+                crate::source_snapshot::resolve_relative_input(
+                    &rel,
+                    None,
+                    self.pdf_dir,
+                    self.sidecar_dir.as_deref(),
+                )
+                .ok_or(err)
+            }),
         }
     }
 
@@ -1164,6 +1198,7 @@ enum InverseFailure {
 
 struct InverseAnchor {
     target: SourceLocation,
+    compiler_column: Option<usize>,
     generated: bool,
     warning: Option<String>,
     source_map: Option<io::Result<Rc<SourceMap>>>,
@@ -1200,6 +1235,7 @@ impl InverseQuery<'_> {
             .snapshot
             .map(|snapshot| snapshot.cwd.as_path())
             .or(current_dir.as_deref());
+        let sidecar_dir = self.sources.sidecar_dir.as_deref();
         let default_vrb = self.pdf.with_extension("vrb");
         let generated_path = generated.unwrap_or(&default_vrb);
         let result = if let Some(generated) = generated {
@@ -1216,7 +1252,7 @@ impl InverseQuery<'_> {
                 if let Some(existing) = cache.structural_maps.get(&key) {
                     existing.clone()
                 } else {
-                    let loaded = source_map_from_reader(
+                    let loaded = source_map_from_reader_in(
                         std::io::Cursor::new(&cache.raw),
                         self.pdf,
                         self.point,
@@ -1224,6 +1260,7 @@ impl InverseQuery<'_> {
                         false,
                         self.operation,
                         input_cwd,
+                        sidecar_dir,
                     )
                     .map(Rc::new)
                     .map_err(|error| error.to_string());
@@ -1278,7 +1315,7 @@ impl InverseQuery<'_> {
             self.geometry_map
                 .get_or_insert_with(|| {
                     let loaded = match raw {
-                        Some(bytes) => source_map_from_reader(
+                        Some(bytes) => source_map_from_reader_in(
                             std::io::Cursor::new(bytes),
                             pdf,
                             point,
@@ -1286,6 +1323,7 @@ impl InverseQuery<'_> {
                             true,
                             operation,
                             input_cwd,
+                            sidecar_dir,
                         ),
                         None => read_source_map_in(
                             pdf,
@@ -1307,7 +1345,7 @@ impl InverseQuery<'_> {
 
     fn resolve_target(
         &mut self,
-        target: SourceLocation,
+        target: RawInverseCandidate,
     ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
         let mut anchor = self.normalize_anchor(target)?;
         let Some(source) = self.qualify_source(&mut anchor)? else {
@@ -1322,42 +1360,48 @@ impl InverseQuery<'_> {
         self.refine_target(anchor, source)
     }
 
-    fn normalize_anchor(&mut self, mut target: SourceLocation) -> io::Result<InverseAnchor> {
-        let path = Path::new(&target.file);
+    fn normalize_anchor(&mut self, raw: RawInverseCandidate) -> io::Result<InverseAnchor> {
+        let path = Path::new(&raw.file);
         let pdf_dir = self.pdf.parent().unwrap_or(Path::new("."));
-        let absolute = if let Some(snapshot) = self.sources.snapshot {
-            snapshot.normalize(path)?
-        } else if self.sources.best_guess {
-            std::path::absolute(path)?
-        } else if path.is_absolute() {
-            path.to_owned()
-        } else {
-            pdf_dir.join(path)
-        };
+        let sidecar_dir = self.sources.sidecar_dir.as_deref();
         let mut warning = None;
-        let resolved = if self.sources.snapshot.is_some() || self.sources.best_guess {
-            absolute.components().collect()
+        let resolved = if let Some(snapshot) = self.sources.snapshot {
+            snapshot.normalize(path)?.components().collect()
+        } else if self.sources.best_guess {
+            let absolute: PathBuf = std::path::absolute(path)?.components().collect();
+            if !path.is_absolute() && fs::symlink_metadata(&absolute).is_err() {
+                crate::source_snapshot::resolve_relative_input(
+                    path,
+                    None,
+                    Some(pdf_dir),
+                    sidecar_dir,
+                )
+                .unwrap_or(absolute)
+            } else {
+                absolute
+            }
         } else {
-            match fs::canonicalize(&absolute) {
-                Ok(path) => path,
-                Err(error) => {
-                    let fallback = (!path.is_absolute())
-                        .then(|| {
-                            locate_synctex_in(self.pdf, self.build_directory)
-                                .and_then(|sidecar| sidecar.parent().map(Path::to_owned))
-                        })
-                        .flatten()
-                        .filter(|sidecar_dir| sidecar_dir != pdf_dir)
-                        .and_then(|sidecar_dir| {
-                            fs::canonicalize(sidecar_dir.join(path)).ok().or_else(|| {
-                                std::env::current_dir()
-                                    .ok()
-                                    .and_then(|cwd| fs::canonicalize(cwd.join(path)).ok())
-                            })
-                        });
-                    if let Some(found) = fallback {
-                        found
-                    } else {
+            let current_dir = std::env::current_dir()
+                .ok()
+                .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
+            if !path.is_absolute()
+                && let Some(found) = crate::source_snapshot::resolve_relative_input(
+                    path,
+                    current_dir.as_deref(),
+                    Some(pdf_dir),
+                    sidecar_dir,
+                )
+            {
+                found
+            } else {
+                let absolute = if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    pdf_dir.join(path)
+                };
+                match fs::canonicalize(&absolute) {
+                    Ok(path) => path,
+                    Err(error) => {
                         warning = Some(format!(
                             "line-only navigation: source path unavailable: {error}"
                         ));
@@ -1366,14 +1410,14 @@ impl InverseQuery<'_> {
                 }
             }
         };
-        target.file = resolved
+        let file = resolved
             .into_os_string()
             .into_string()
             .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-        let generated = is_generated_sidecar(Path::new(&target.file), self.pdf);
+        let generated = is_generated_sidecar(Path::new(&file), self.pdf);
         // Known generated hits use structural sheet provenance before any
         // source bounds, and never read the final reused .vrb / sidecar file.
-        let source_map = generated.then(|| self.source_map(Some(Path::new(&target.file))));
+        let source_map = generated.then(|| self.source_map(Some(Path::new(&file))));
         if self.sources.best_guess
             && let Some(Err(error)) = &source_map
         {
@@ -1381,7 +1425,15 @@ impl InverseQuery<'_> {
             return Err(io::Error::other(error.to_string()));
         }
         Ok(InverseAnchor {
-            target,
+            target: SourceLocation {
+                file,
+                line: raw.line,
+                byte_column: 0,
+                column: 1,
+                column_char: 1,
+                precise: false,
+            },
+            compiler_column: (!generated).then_some(raw.compiler_column).flatten(),
             generated,
             warning,
             source_map,
@@ -1395,7 +1447,7 @@ impl InverseQuery<'_> {
         let generated = anchor.generated;
         let source_map = &anchor.source_map;
         let warning = &mut anchor.warning;
-        let raw_column = (!generated).then_some(target.column).filter(|&col| col > 1);
+        let raw_column = anchor.compiler_column;
         target.byte_column = 0;
         target.column = 1;
         target.column_char = 1;
@@ -1453,18 +1505,8 @@ impl InverseQuery<'_> {
             *warning = Some(reason.to_owned());
             return Ok(None);
         }
-        if let Some(column) = raw_column
-            && let Some(prefix) = text.get(..column - 1).or_else(|| {
-                let end = text
-                    .char_indices()
-                    .nth(column - 1)
-                    .map_or(text.len(), |(idx, _)| idx);
-                (column - 1 <= text.chars().count()).then_some(&text[..end])
-            })
-        {
-            target.byte_column = prefix.len();
-            target.column = prefix.encode_utf16().count() + 1;
-            target.column_char = prefix.chars().count() + 1;
+        if let Some(column) = raw_column {
+            apply_compiler_column(target, text, column);
         }
         Ok(Some(source))
     }
@@ -1557,6 +1599,7 @@ impl InverseQuery<'_> {
             generated,
             mut warning,
             mut source_map,
+            ..
         } = anchor;
         let anchor = (self.sources.best_guess && self.word.is_some()).then(|| target.clone());
         if let Some((context, offset)) = self.word {
@@ -2008,18 +2051,43 @@ fn read_source_map_in(
     input_cwd: Option<&Path>,
     build_directory: Option<&Path>,
 ) -> io::Result<SourceMap> {
-    source_map_from_reader(
-        open_synctex_in(pdf, build_directory)?,
+    let (reader, sidecar_path) = open_synctex_with_path_in(pdf, build_directory)?;
+    source_map_from_reader_in(
+        reader,
         pdf,
         point,
         generated,
         geometry_required,
         operation,
         input_cwd,
+        sidecar_path.parent(),
     )
 }
 
+#[cfg(test)]
 fn source_map_from_reader(
+    reader: impl BufRead,
+    pdf: &Path,
+    point: InversePoint,
+    generated: &Path,
+    geometry_required: bool,
+    operation: &Operation,
+    input_cwd: Option<&Path>,
+) -> io::Result<SourceMap> {
+    source_map_from_reader_in(
+        reader,
+        pdf,
+        point,
+        generated,
+        geometry_required,
+        operation,
+        input_cwd,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_map_from_reader_in(
     mut reader: impl BufRead,
     pdf: &Path,
     point: InversePoint,
@@ -2027,6 +2095,7 @@ fn source_map_from_reader(
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
+    sidecar_dir: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let mut inputs = std::collections::HashMap::new();
     let mut generated_tags = std::collections::HashSet::new();
@@ -2142,10 +2211,19 @@ fn source_map_from_reader(
                 }
                 let path = if path.is_absolute() {
                     path.to_owned()
+                } else if let Some(cwd) = input_cwd {
+                    cwd.join(path)
                 } else {
-                    input_cwd
-                        .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")))
-                        .join(path)
+                    let current_dir = std::env::current_dir()
+                        .ok()
+                        .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
+                    crate::source_snapshot::resolve_relative_input(
+                        path,
+                        current_dir.as_deref(),
+                        pdf.parent(),
+                        sidecar_dir,
+                    )
+                    .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")).join(path))
                 };
                 if input_cwd.is_some() && !valid_absolute_path(&path) {
                     return Err(io::Error::new(
@@ -2606,11 +2684,93 @@ fn document_metadata_word_location(
     Ok(Some((file.to_owned(), source, line, byte, score)))
 }
 
-pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RawInverseCandidate {
+    pub file: String,
+    pub line: u32,
+    pub compiler_column: Option<usize>,
+}
+
+pub(crate) fn apply_compiler_column(
+    target: &mut SourceLocation,
+    text: &str,
+    compiler_column: usize,
+) {
+    if compiler_column > 1
+        && let Some(prefix) = text.get(..compiler_column - 1).or_else(|| {
+            let end = text
+                .char_indices()
+                .nth(compiler_column - 1)
+                .map_or(text.len(), |(idx, _)| idx);
+            (compiler_column - 1 <= text.chars().count()).then_some(&text[..end])
+        })
+    {
+        target.byte_column = prefix.len();
+        target.column = prefix.encode_utf16().count() + 1;
+        target.column_char = prefix.chars().count() + 1;
+    }
+}
+
+pub(crate) fn materialize_raw_candidates(
+    candidates: Vec<RawInverseCandidate>,
+    pdf: Option<&Path>,
+    sidecar_dir: Option<&Path>,
+) -> Vec<SourceLocation> {
+    let current_dir = std::env::current_dir()
+        .ok()
+        .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
+    let pdf_dir = pdf.and_then(Path::parent);
+    let mut loaded_sources = std::collections::HashMap::<PathBuf, Option<String>>::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        let mut loc = SourceLocation {
+            file: cand.file,
+            line: cand.line,
+            byte_column: 0,
+            column: 1,
+            column_char: 1,
+            precise: false,
+        };
+        if let Some(column) = cand.compiler_column.filter(|&col| col > 1) {
+            let raw_path = Path::new(&loc.file);
+            let resolved = if raw_path.is_absolute() {
+                raw_path.to_owned()
+            } else {
+                crate::source_snapshot::resolve_relative_input(
+                    raw_path,
+                    current_dir.as_deref(),
+                    pdf_dir,
+                    sidecar_dir,
+                )
+                .unwrap_or_else(|| raw_path.to_owned())
+            };
+            if !crate::source_snapshot::is_compiler_sidecar_input(&resolved) {
+                let source = loaded_sources
+                    .entry(resolved.clone())
+                    .or_insert_with(|| read_source(&resolved).ok());
+                if let Some(source) = source.as_deref() {
+                    if let Ok(text) = validate_inverse_source_line(source, loc.line, &resolved) {
+                        apply_compiler_column(&mut loc, text, column);
+                    }
+                } else {
+                    loc.byte_column = column - 1;
+                    loc.column = column;
+                    loc.column_char = column;
+                }
+            }
+        }
+        if seen.insert((loc.file.clone(), loc.line, loc.byte_column)) {
+            results.push(loc);
+        }
+    }
+    results
+}
+
+pub(crate) fn parse_synctex_edit_candidates(stdout: &str) -> Vec<RawInverseCandidate> {
     let mut input = None;
     let mut active = false;
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
+    let mut raw = Vec::<RawInverseCandidate>::new();
     for row in stdout.lines() {
         if let Some(value) = row.strip_prefix("Input:") {
             input = Some(value.trim());
@@ -2621,15 +2781,11 @@ pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
                 && !file.is_empty()
                 && let Ok(line) = value.trim().parse::<u32>()
                 && line > 0
-                && seen.insert((file, line))
             {
-                results.push(SourceLocation {
+                raw.push(RawInverseCandidate {
                     file: file.to_owned(),
                     line,
-                    byte_column: 0,
-                    column: 1,
-                    column_char: 1,
-                    precise: false,
+                    compiler_column: None,
                 });
                 active = true;
             }
@@ -2638,16 +2794,21 @@ pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
         {
             active = false;
             if let Ok(column) = value.trim().parse::<usize>()
-                && column > 0
-                && let Some(last) = results.last_mut()
+                && column > 1
+                && let Some(last) = raw.last_mut()
             {
-                last.byte_column = column - 1;
-                last.column = column;
-                last.column_char = column;
+                last.compiler_column = Some(column);
             }
         }
     }
-    results
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .filter(|cand| seen.insert((cand.file.clone(), cand.line, cand.compiler_column)))
+        .collect()
+}
+
+pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
+    materialize_raw_candidates(parse_synctex_edit_candidates(stdout), None, None)
 }
 /// TeX comments start at an unescaped percent sign.
 fn source_line_text(text: &str) -> &str {

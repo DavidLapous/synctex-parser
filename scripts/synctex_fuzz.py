@@ -918,7 +918,20 @@ def inverse(
                 ):
                     expected_anchor, bounds, remapped, generated = origin[1], original_bounds, True, True
             if not remapped:
-                raw_text = source_info(raw_file)[0]
+                page_files_for_line = {
+                    path
+                    for tag, line in source_map["page_lines"].get(page, set())
+                    if line == raw[0]
+                    and (path := source_map["inputs"].get(tag)) is not None
+                    and path.is_file()
+                    and not (
+                        path.suffix in {".vrb", ".toc", ".nav", ".out", ".aux", ".snm"}
+                        and path.stem == pdf.stem
+                    )
+                }
+                if expected_file not in page_files_for_line and len(page_files_for_line) == 1:
+                    expected_file = next(iter(page_files_for_line))
+                raw_text = source_info(expected_file)[0]
                 bounds = caption_bounds(raw_text, raw[0]) or collected_env_bounds(raw_text, raw[0])
         return raw, expected_file, expected_anchor, bounds, remapped, generated
 
