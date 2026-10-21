@@ -299,7 +299,7 @@ impl ForwardWord {
                     && word.chars().next().is_some_and(char::is_alphanumeric)
                     && word
                         .chars()
-                        .all(|ch| ch.is_alphanumeric() || is_combining_mark(ch))
+                        .all(|ch| ch.is_alphanumeric() || is_combining_mark(ch) || is_spacing_diacritic(ch))
             })
     }
 }
@@ -772,7 +772,7 @@ pub fn resolve_inverse_in(
     )
 }
 
-type StructuralMapKey = (u32, PathBuf, Option<PathBuf>);
+type StructuralMapKey = (u32, PathBuf, Option<PathBuf>, Option<PathBuf>);
 
 #[derive(Default)]
 pub struct SyncTeXCache {
@@ -1122,21 +1122,8 @@ impl QuerySources<'_> {
         match self.snapshot {
             Some(snapshot) => snapshot.normalize(path),
             None => fs::canonicalize(path).or_else(|err| {
-                let rel = std::env::current_dir()
-                    .ok()
-                    .and_then(|cwd| {
-                        path.strip_prefix(&cwd)
-                            .ok()
-                            .map(Path::to_owned)
-                            .or_else(|| {
-                                fs::canonicalize(&cwd)
-                                    .ok()
-                                    .and_then(|canon| path.strip_prefix(canon).ok().map(Path::to_owned))
-                            })
-                    })
-                    .unwrap_or_else(|| path.to_owned());
                 crate::source_snapshot::resolve_relative_input(
-                    &rel,
+                    path,
                     None,
                     self.pdf_dir,
                     self.sidecar_dir.as_deref(),
@@ -1225,14 +1212,13 @@ struct InverseQuery<'a> {
 impl InverseQuery<'_> {
     fn source_map(&mut self, generated: Option<&Path>) -> io::Result<Rc<SourceMap>> {
         self.operation.check()?;
-        let current_dir = if self.sources.best_guess && self.sources.snapshot.is_none() {
+        let snapshot = self.sources.snapshot;
+        let current_dir = if self.sources.best_guess && snapshot.is_none() {
             Some(std::env::current_dir()?)
         } else {
             None
         };
-        let input_cwd = self
-            .sources
-            .snapshot
+        let input_cwd = snapshot
             .map(|snapshot| snapshot.cwd.as_path())
             .or(current_dir.as_deref());
         let sidecar_dir = self.sources.sidecar_dir.as_deref();
@@ -1248,6 +1234,7 @@ impl InverseQuery<'_> {
                     self.point.page,
                     generated.to_owned(),
                     input_cwd.map(Path::to_owned),
+                    snapshot.map(|s| s.path.clone()),
                 );
                 if let Some(existing) = cache.structural_maps.get(&key) {
                     existing.clone()
@@ -1260,6 +1247,7 @@ impl InverseQuery<'_> {
                         false,
                         self.operation,
                         input_cwd,
+                        snapshot,
                         sidecar_dir,
                     )
                     .map(Rc::new)
@@ -1281,6 +1269,7 @@ impl InverseQuery<'_> {
                         false,
                         self.operation,
                         input_cwd,
+                        snapshot,
                         self.build_directory,
                     )
                     .map(Rc::new)
@@ -1301,6 +1290,7 @@ impl InverseQuery<'_> {
                         self.point.page,
                         default_vrb.clone(),
                         input_cwd.map(Path::to_owned),
+                        snapshot.map(|s| s.path.clone()),
                     ))
                     && map.page_source.is_none()
                 {
@@ -1323,6 +1313,7 @@ impl InverseQuery<'_> {
                             true,
                             operation,
                             input_cwd,
+                            snapshot,
                             sidecar_dir,
                         ),
                         None => read_source_map_in(
@@ -1332,6 +1323,7 @@ impl InverseQuery<'_> {
                             true,
                             operation,
                             input_cwd,
+                            snapshot,
                             build_directory,
                         ),
                     };
@@ -1995,7 +1987,10 @@ fn source_map_dimension(value: &str) -> io::Result<f64> {
             return source_map_number(number).map(|number| number * scale);
         }
     }
-    source_map_number(value)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "SyncTeX post dimension has an invalid unit",
+    ))
 }
 
 pub(crate) fn decode_synctex_file(file: fs::File, limit: u64) -> io::Result<Box<dyn BufRead>> {
@@ -2016,7 +2011,7 @@ pub(crate) fn open_synctex_with_path_in(
 ) -> io::Result<(Box<dyn BufRead>, PathBuf)> {
     let mut last_not_found = None;
     for (candidate, _) in synctex_candidates(pdf, build_directory) {
-        match fs::File::open(&candidate) {
+        match crate::source_snapshot::open_regular(&candidate, false) {
             Ok(file) => return Ok((decode_synctex_file(file, 128 * 1024 * 1024)?, candidate)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
             Err(error) => return Err(error),
@@ -2042,6 +2037,7 @@ fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_source_map_in(
     pdf: &Path,
     point: InversePoint,
@@ -2049,6 +2045,7 @@ fn read_source_map_in(
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
+    snapshot: Option<&SourceSnapshot>,
     build_directory: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let (reader, sidecar_path) = open_synctex_with_path_in(pdf, build_directory)?;
@@ -2060,6 +2057,7 @@ fn read_source_map_in(
         geometry_required,
         operation,
         input_cwd,
+        snapshot,
         sidecar_path.parent(),
     )
 }
@@ -2083,6 +2081,7 @@ fn source_map_from_reader(
         operation,
         input_cwd,
         None,
+        None,
     )
 }
 
@@ -2095,6 +2094,7 @@ fn source_map_from_reader_in(
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
+    snapshot: Option<&SourceSnapshot>,
     sidecar_dir: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let mut inputs = std::collections::HashMap::new();
@@ -2210,9 +2210,34 @@ fn source_map_from_reader_in(
                     ));
                 }
                 let path = if path.is_absolute() {
+                    if input_cwd.is_some() && !valid_absolute_path(path) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid SyncTeX input path",
+                        ));
+                    }
                     path.to_owned()
                 } else if let Some(cwd) = input_cwd {
-                    cwd.join(path)
+                    let joined = cwd.join(path);
+                    if !valid_absolute_path(&joined) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid SyncTeX input path",
+                        ));
+                    }
+                    if let Some(snapshot) = snapshot {
+                        snapshot.normalize(path)?
+                    } else if fs::symlink_metadata(&joined).is_err() {
+                        crate::source_snapshot::resolve_relative_input(
+                            path,
+                            None,
+                            pdf.parent(),
+                            sidecar_dir,
+                        )
+                        .unwrap_or(joined)
+                    } else {
+                        joined
+                    }
                 } else {
                     let current_dir = std::env::current_dir()
                         .ok()
@@ -2225,12 +2250,6 @@ fn source_map_from_reader_in(
                     )
                     .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")).join(path))
                 };
-                if input_cwd.is_some() && !valid_absolute_path(&path) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid SyncTeX input path",
-                    ));
-                }
                 // TeX can emit .vrb in the build cwd while the PDF is in a
                 // separate output directory. Jobname is the map identity;
                 // the final generated file is neither read nor trusted.
@@ -2956,6 +2975,13 @@ fn source_tabularx_range(source: &str, line: u32) -> Option<std::ops::Range<usiz
         .map(|(start, end)| start..end + 1)
 }
 
+pub fn is_spacing_diacritic(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00a8}' | '\u{00af}' | '\u{00b4}' | '\u{00b8}' | '\u{02c6}' | '\u{02c7}' | '\u{02d8}'..='\u{02dd}'
+    )
+}
+
 pub fn words(text: &str) -> Vec<(usize, &str)> {
     let mut result = Vec::new();
     let mut start = None;
@@ -2963,7 +2989,13 @@ pub fn words(text: &str) -> Vec<(usize, &str)> {
         .char_indices()
         .chain(std::iter::once((text.len(), ' ')))
     {
-        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) {
+        let attached_spacing = is_spacing_diacritic(ch)
+            && (start.is_some()
+                || text
+                    .get(index + ch.len_utf8()..)
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(char::is_alphanumeric));
+        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) || attached_spacing {
             start.get_or_insert(index);
         } else if let Some(start) = start.take() {
             result.push((start, &text[start..index]));
@@ -3078,7 +3110,13 @@ fn source_words(text: &str) -> Vec<(usize, usize, String)> {
             continue;
         }
         let ch = text[index..].chars().next().unwrap();
-        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) {
+        let attached_spacing = is_spacing_diacritic(ch)
+            && (start.is_some()
+                || text
+                    .get(index + ch.len_utf8()..)
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(char::is_alphanumeric));
+        if ch.is_alphanumeric() || start.is_some() && is_combining_mark(ch) || attached_spacing {
             start.get_or_insert(index);
             word.push(ch);
         } else if let Some(start) = start.take() {
@@ -3097,7 +3135,9 @@ fn normalized_word(word: &str) -> String {
     if word.is_ascii() {
         return word.to_ascii_lowercase();
     }
-    word.nfkd()
+    word.chars()
+        .filter(|ch| !is_spacing_diacritic(*ch))
+        .nfkd()
         .filter(|ch| !is_combining_mark(*ch))
         .flat_map(char::to_lowercase)
         .collect()

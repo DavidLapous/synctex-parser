@@ -382,6 +382,16 @@ pub(crate) fn parse_synctex_document_with_options(
         };
         Some((tag, line, col, x, y, rem))
     }
+    let check_geom = |vals: &[i64]| -> io::Result<()> {
+        if vals.contains(&i64::MIN) {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported SyncTeX geometry value",
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let parse_whd = |rem: &str| -> Option<(i64, i64, i64)> {
         let mut parts = rem.splitn(3, ',');
         let w = parts.next()?.parse::<i64>().ok()?;
@@ -390,10 +400,15 @@ pub(crate) fn parse_synctex_document_with_options(
         Some((w, h, d))
     };
     let parse_post_dim = |val: &str| -> Option<f64> {
-        let s = val.trim_start();
-        let unit_pos = s.find(|c: char| c.is_ascii_alphabetic())?;
-        let num = s[..unit_pos].trim().parse::<f64>().ok()?;
-        let scale = match &s[unit_pos..unit_pos.saturating_add(2).min(s.len())] {
+        let s = val.trim();
+        let unit_start = s.len().checked_sub(2)?;
+        let num = s
+            .get(..unit_start)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())?;
+        let scale = match s.get(unit_start..)? {
             "in" => 72.27 * 65536.0,
             "cm" => 72.27 * 65536.0 / 2.54,
             "mm" => 72.27 * 65536.0 / 25.4,
@@ -448,13 +463,17 @@ pub(crate) fn parse_synctex_document_with_options(
             }
         } else if let Some(val) = trimmed.strip_prefix("X Offset:") {
             if in_post_scriptum {
-                post_x_offset = parse_post_dim(val);
+                post_x_offset = Some(parse_post_dim(val).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid postscript X Offset")
+                })?);
             } else if let Ok(off) = val.trim().parse::<i64>() {
                 pre_x_offset = off;
             }
         } else if let Some(val) = trimmed.strip_prefix("Y Offset:") {
             if in_post_scriptum {
-                post_y_offset = parse_post_dim(val);
+                post_y_offset = Some(parse_post_dim(val).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid postscript Y Offset")
+                })?);
             } else if let Ok(off) = val.trim().parse::<i64>() {
                 pre_y_offset = off;
             }
@@ -565,6 +584,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         parse_link_pos(&trimmed[1..], &mut last_v)
                         && let Some((w, h, d)) = parse_whd(rem)
                     {
+                        check_geom(&[x, y, w, h, d])?;
                         let idx = nodes.len();
                         nodes.push(ForwardNode::new(
                             kind,
@@ -735,6 +755,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         parse_link_pos(&trimmed[1..], &mut last_v)
                         && let Some((w, h, d)) = parse_whd(rem)
                     {
+                        check_geom(&[x, y, w, h, d])?;
                         if fix_cross_file_tags
                             && kind == b'r'
                             && w == 0
@@ -775,6 +796,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         parse_link_pos(&trimmed[1..], &mut last_v)
                         && let Some((w, _)) = parse_synctex_int_prefix(rem)
                     {
+                        check_geom(&[x, y, w])?;
                         let idx = nodes.len();
                         nodes.push(ForwardNode::new(
                             b'k',
@@ -803,6 +825,7 @@ pub(crate) fn parse_synctex_document_with_options(
                     if let Some((tag, line, col, x, y, _)) =
                         parse_link_pos(&trimmed[1..], &mut last_v)
                     {
+                        check_geom(&[x, y])?;
                         let idx = nodes.len();
                         nodes.push(ForwardNode::new(
                             kind,
@@ -834,6 +857,7 @@ pub(crate) fn parse_synctex_document_with_options(
                     if let Some((tag, line, col, x, y, _)) =
                         parse_link_pos(&trimmed[1..], &mut last_v)
                     {
+                        check_geom(&[x, y])?;
                         let idx = nodes.len();
                         nodes.push(ForwardNode::new(
                             b'x',
@@ -880,6 +904,7 @@ pub(crate) fn parse_synctex_document_with_options(
                             continue;
                         };
                         if let Some(p_idx) = parent {
+                            check_geom(&[fx, fy])?;
                             let ref_idx = nodes.len();
                             nodes.push(ForwardNode::new(
                                 b'f',
@@ -1216,7 +1241,7 @@ fn forward_candidates_from_reader_with_page_hint_in(
         while let Some(p_idx) = nodes[cursor].parent {
             cursor = p_idx;
             if matches!(nodes[cursor].kind, b'(' | b'h') {
-                if mean.saturating_sub(node_mean_line(nodes, cursor)).abs() > 1 {
+                if mean.saturating_sub(node_mean_line(nodes, cursor)).saturating_abs() > 1 {
                     return idx;
                 } else if nodes[cursor].width > bound
                     || nodes[cursor].height.saturating_add(nodes[cursor].depth) > bound
@@ -1655,9 +1680,12 @@ pub(crate) fn inverse_candidates_in_doc(
         }
     };
     let parent_hd = |idx: usize| -> (i64, i64) {
-        nodes[idx]
-            .parent
-            .map_or((0, 0), |p| (nodes[p].height.abs(), nodes[p].depth.abs()))
+        nodes[idx].parent.map_or((0, 0), |p| {
+            (
+                nodes[p].height.saturating_abs(),
+                nodes[p].depth.saturating_abs(),
+            )
+        })
     };
 
     let h_ordered_distance = |idx: usize| -> i64 {
@@ -1665,7 +1693,7 @@ pub(crate) fn inverse_candidates_in_doc(
         match n.kind {
             b'[' | b'v' | b'h' => {
                 let min = n.h;
-                let max = min.saturating_add(n.width.abs());
+                let max = min.saturating_add(n.width.saturating_abs());
                 if hit_h < min {
                     min.saturating_sub(hit_h)
                 } else if hit_h > max {
@@ -1676,7 +1704,7 @@ pub(crate) fn inverse_candidates_in_doc(
             }
             b'(' => {
                 let min = n.h_v;
-                let max = min.saturating_add(n.width_v.abs());
+                let max = min.saturating_add(n.width_v.saturating_abs());
                 if hit_h < min {
                     min.saturating_sub(hit_h)
                 } else if hit_h > max {
@@ -1712,12 +1740,12 @@ pub(crate) fn inverse_candidates_in_doc(
         let n = &nodes[idx];
         let (min, max) = match n.kind {
             b'[' | b'v' | b'h' => (
-                n.v.saturating_sub(n.height.abs()),
-                n.v.saturating_add(n.depth.abs()),
+                n.v.saturating_sub(n.height.saturating_abs()),
+                n.v.saturating_add(n.depth.saturating_abs()),
             ),
             b'(' => (
-                n.v_v.saturating_sub(n.height_v.abs()),
-                n.v_v.saturating_add(n.depth_v.abs()),
+                n.v_v.saturating_sub(n.height_v.saturating_abs()),
+                n.v_v.saturating_add(n.depth_v.saturating_abs()),
             ),
             b'r' | b'k' | b'g' | b'$' => {
                 let (ph, pd) = parent_hd(idx);
@@ -1760,20 +1788,20 @@ pub(crate) fn inverse_candidates_in_doc(
         match n.kind {
             b'[' => dist_to_box(
                 n.h,
-                n.h.saturating_add(n.width.abs()),
-                n.v.saturating_sub(n.height.abs()),
-                n.v.saturating_add(n.depth.abs()),
+                n.h.saturating_add(n.width.saturating_abs()),
+                n.v.saturating_sub(n.height.saturating_abs()),
+                n.v.saturating_add(n.depth.saturating_abs()),
             ),
             b'(' => dist_to_box(
                 n.h_v,
-                n.h_v.saturating_add(n.width_v.abs()),
-                n.v_v.saturating_sub(n.height_v.abs()),
-                n.v_v.saturating_add(n.depth_v.abs()),
+                n.h_v.saturating_add(n.width_v.saturating_abs()),
+                n.v_v.saturating_sub(n.height_v.saturating_abs()),
+                n.v_v.saturating_add(n.depth_v.saturating_abs()),
             ),
             b'v' | b'h' => {
-                let min_v = n.v.saturating_sub(n.height.abs());
-                let max_v = n.v.saturating_add(n.depth.abs());
-                let right_h = n.h.saturating_add(n.width.abs());
+                let min_v = n.v.saturating_sub(n.height.saturating_abs());
+                let max_v = n.v.saturating_add(n.depth.saturating_abs());
+                let right_h = n.h.saturating_add(n.width.saturating_abs());
                 dist_to_box(n.h, n.h, min_v, max_v)
                     .min(dist_to_box(right_h, right_h, min_v, max_v))
             }
@@ -1795,11 +1823,11 @@ pub(crate) fn inverse_candidates_in_doc(
     let smallest_container = |node: usize, other: usize| -> usize {
         let dims = |idx: usize| -> (i64, i64) {
             if nodes[idx].kind == b'(' {
-                let w = nodes[idx].width_v.abs();
+                let w = nodes[idx].width_v.saturating_abs();
                 let th = nodes[idx]
                     .depth_v
-                    .abs()
-                    .saturating_add(nodes[idx].height_v.abs());
+                    .saturating_abs()
+                    .saturating_add(nodes[idx].height_v.saturating_abs());
                 (w.saturating_mul(th), th)
             } else {
                 (0, 0)
@@ -1813,8 +1841,8 @@ pub(crate) fn inverse_candidates_in_doc(
         if area > other_area {
             return other;
         }
-        let dw = data_width(node).abs();
-        let other_dw = data_width(other).abs();
+        let dw = data_width(node).saturating_abs();
+        let other_dw = data_width(other).saturating_abs();
         if dw > other_dw {
             return node;
         }
@@ -1970,7 +1998,7 @@ pub(crate) fn inverse_candidates_in_doc(
                 }
                 l = Some((ch, 0));
             } else {
-                let d = -d;
+                let d = d.saturating_neg();
                 let replace = match l {
                     None => true,
                     Some((ln, ld)) => {

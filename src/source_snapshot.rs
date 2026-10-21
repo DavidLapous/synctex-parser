@@ -474,10 +474,9 @@ impl SourceSnapshot {
         if self.is_recorded(&absolute) {
             return Ok(absolute);
         }
-        let rel = original.strip_prefix(&self.cwd).unwrap_or(original);
-        if !rel.is_absolute() {
+        if !original.is_absolute() {
             for base in &self.fallback_dirs {
-                if let Ok(cand) = normalize_absolute(rel, base) {
+                if let Ok(cand) = normalize_absolute(original, base) {
                     if self.is_recorded(&cand) {
                         return Ok(cand);
                     }
@@ -492,9 +491,9 @@ impl SourceSnapshot {
         if let Ok(canon) = fs::canonicalize(&absolute) {
             return Ok(canon);
         }
-        if !rel.is_absolute() {
+        if !original.is_absolute() {
             for base in &self.fallback_dirs {
-                if let Ok(cand) = normalize_absolute(rel, base)
+                if let Ok(cand) = normalize_absolute(original, base)
                     && let Ok(canon) = fs::canonicalize(&cand)
                 {
                     return Ok(canon);

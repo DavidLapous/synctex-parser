@@ -2554,3 +2554,272 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
     assert_eq!((guessed.location.byte_column, guessed.location.column, guessed.location.column_char), (11, 10, 10));
     assert!(guessed.warning.unwrap().contains("multiple coarse source anchors"));
 }
+
+#[test]
+fn snapshot_normalize_does_not_substitute_unrelated_absolute_file_in_cwd() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let build_dir = root.join("build");
+    let client_dir = root.join("client");
+    let cache_dir = root.join("cache");
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::create_dir_all(&client_dir).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let pdf = build_dir.join("doc.pdf");
+    let build_tex = build_dir.join("main.tex");
+    let client_tex = client_dir.join("main.tex");
+    let source_text = "\\documentclass{article}\n\\begin{document}\nalpha beta\n\\end{document}\n";
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&build_tex, source_text).unwrap();
+
+    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    fs::write(pdf.with_extension("synctex"), synctex).unwrap();
+
+    fs::write(cache_dir.join("1.txt"), source_text).unwrap();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(source_text.as_bytes()).iter() {
+        write!(digest, "{byte:02x}").unwrap();
+    }
+    let manifest_path = cache_dir.join("manifest.json");
+    let manifest = serde_json::json!({
+        "pdf": pdf,
+        "revision": DocumentRevision::read(&pdf).unwrap(),
+        "cwd": client_dir,
+        "main": build_tex,
+        "files": BTreeMap::from([(build_tex.clone(), "1.txt")]),
+        "digests": BTreeMap::from([(build_tex.clone(), digest)]),
+        "warnings": {},
+    });
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    // Now create an unrelated file at client/main.tex and attempt forward search for it.
+    fs::write(
+        &client_tex,
+        "\\documentclass{article}\n\\begin{document}\ngamma delta\n\\end{document}\n",
+    )
+    .unwrap();
+
+    let strict_err = resolve_forward_with_selector(
+        &pdf,
+        &client_tex,
+        3,
+        1,
+        ForwardSource {
+            snapshot: Some(&manifest_path),
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap_err();
+    assert!(
+        strict_err.to_string().contains("not captured in snapshot"),
+        "expected uncaptured-input error for unrelated client/main.tex, got: {strict_err}"
+    );
+
+    let guess_err = resolve_forward_with_selector(
+        &pdf,
+        &client_tex,
+        3,
+        1,
+        ForwardSource {
+            snapshot: Some(&manifest_path),
+            best_guess: true,
+            ..ForwardSource::default()
+        },
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap_err();
+    assert!(
+        is_forward_unavailable(&guess_err),
+        "expected forward unavailable for unrelated client/main.tex, got: {guess_err}"
+    );
+}
+
+#[test]
+fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &tex,
+        "\\documentclass{article}\n\\begin{document}\nhello\n\\end{document}\n",
+    )
+    .unwrap();
+
+    // Item 4: multibyte UTF-8 and trailing garbage in postscript offset unit suffix (e.g. "1pα", "1ptα") must return Err,
+    // while scientific notation ("0e0sp", "1e0sp", "0E0sp") is accepted.
+    for bad in ["1pα", "1ptα", "1ptx", "0"] {
+        let bad_offset = format!(
+            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n]\n}}1\nPostamble:\nCount:2\nPost scriptum:\nX Offset:{bad}\n",
+            tex.display()
+        );
+        fs::write(pdf.with_extension("synctex"), &bad_offset).unwrap();
+        let pt = InversePoint {
+            page: 1,
+            x: 10.0,
+            y_from_top: 10.0,
+            page_height_pt: 792.0,
+        };
+        assert!(inverse_candidates(&pdf, pt).is_err(), "expected error for {bad}");
+        assert!(resolve_forward(&pdf, &tex, 3, 1).is_err(), "expected error for {bad}");
+    }
+    for ok_dim in ["0sp", "0e0sp", "1e0sp", "0E0sp"] {
+        let ok_offset = format!(
+            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\nPost scriptum:\nX Offset:{ok_dim}\nY Offset:0sp\n",
+            tex.display()
+        );
+        fs::write(pdf.with_extension("synctex"), &ok_offset).unwrap();
+        assert!(resolve_forward(&pdf, &tex, 3, 1).is_ok(), "expected ok for {ok_dim}");
+    }
+
+    // Item 5: i64::MIN width in hbox geometry must be rejected with InvalidInput.
+    let pt = InversePoint {
+        page: 1,
+        x: 10.0,
+        y_from_top: 10.0,
+        page_height_pt: 792.0,
+    };
+    let min_width = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:{},655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        tex.display(),
+        i64::MIN
+    );
+    fs::write(pdf.with_extension("synctex"), &min_width).unwrap();
+    let min_err = inverse_candidates(&pdf, pt).unwrap_err();
+    assert_eq!(min_err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn warm_synctex_cache_respects_snapshot_authority_and_spacing_diacritics() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    // 1. Spacing diacritics (e.g. OT1 acute '\u{00b4}') stay attached to words and match TeX accents.
+    let tokenized = words("alpha caf\u{00b4}e omega");
+    assert_eq!(tokenized, vec![(0, "alpha"), (6, "caf\u{00b4}e"), (13, "omega")]);
+    assert_eq!(normalized_word("caf\u{00b4}e"), "cafe");
+
+    // 2. Warm SyncTeXCache must not reuse a non-snapshot structural map when a snapshot is supplied.
+    let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let build = root.join("build");
+    let storage = root.join("snapshot");
+    for d in [&build, &storage] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let pdf = build.join("deck.pdf");
+    let tex = build.join("main.tex");
+    let compiled = "\\documentclass{beamer}\n\\begin{document}\n\\begin{frame}[fragile]\nSynthetic body words.\n\\end{frame}\n\\end{document}\n";
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let map = "SyncTeX Version:1\nInput:1:./main.tex\nInput:2:./deck.vrb\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    fs::write(pdf.with_extension("synctex"), map).unwrap();
+
+    let cached = storage.join("1.txt");
+    fs::write(&cached, compiled).unwrap();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(compiled.as_bytes()).iter() {
+        write!(digest, "{byte:02x}").unwrap();
+    }
+    let manifest_path = storage.join("manifest.json");
+    let manifest = serde_json::json!({
+        "pdf": pdf,
+        "revision": DocumentRevision::read(&pdf).unwrap(),
+        "cwd": cwd,
+        "main": tex,
+        "files": BTreeMap::from([(tex.clone(), "1.txt")]),
+        "digests": BTreeMap::from([(tex.clone(), digest)]),
+        "warnings": {},
+    });
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let snapshot = SourceSnapshot::load(&manifest_path, &pdf).unwrap();
+
+    let pt = InversePoint {
+        page: 1,
+        x: 19.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let mut cache = SyncTeXCache::default();
+    let _ = resolve_inverse_with_cache(
+        &pdf,
+        pt,
+        None,
+        2,
+        &Operation::default(),
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+    let warm = resolve_inverse_with_cache(
+        &pdf,
+        pt,
+        None,
+        2,
+        &Operation::default(),
+        Some(&snapshot),
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+    assert_eq!(Path::new(&warm.location.file), tex.as_path());
+    assert_eq!(warm.location.line, 5);
+
+    fs::remove_file(&cached).unwrap();
+    let missing_err = resolve_inverse_with_cache(
+        &pdf,
+        pt,
+        None,
+        2,
+        &Operation::default(),
+        Some(&snapshot),
+        true,
+        Some(&mut cache),
+    )
+    .unwrap_err();
+    assert!(
+        missing_err.to_string().contains("required compiled source cache"),
+        "expected required cache error, got: {missing_err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_synctex_sidecar_is_rejected_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let fifo = pdf.with_extension("synctex");
+    let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+    let pt = InversePoint {
+        page: 1,
+        x: 10.0,
+        y_from_top: 10.0,
+        page_height_pt: 792.0,
+    };
+    let err = inverse_candidates(&pdf, pt).unwrap_err();
+    assert!(
+        err.to_string().contains("regular file"),
+        "expected regular-file error for FIFO sidecar, got: {err}"
+    );
+}
