@@ -4,15 +4,18 @@ pub mod source_snapshot;
 #[cfg(test)]
 mod tests;
 
-pub use parser::{
-    forward_candidates, forward_candidates_from_reader, forward_candidates_from_reader_with_options,
-    forward_candidates_from_reader_with_page_hint, forward_candidates_in,
-    forward_candidates_with_page_hint, inverse_candidates, inverse_candidates_from_reader,
-    inverse_candidates_from_reader_with_options, inverse_candidates_in,
-};
-use parser::*;
 use crate::source_snapshot::{SourceSnapshot, valid_absolute_path, valid_warning};
+use parser::*;
+pub use parser::{
+    forward_candidates, forward_candidates_from_reader,
+    forward_candidates_from_reader_with_options, forward_candidates_from_reader_with_page_hint,
+    forward_candidates_in, forward_candidates_with_page_hint, inverse_candidates,
+    inverse_candidates_from_reader, inverse_candidates_from_reader_with_options,
+    inverse_candidates_in,
+};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -25,8 +28,6 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
-#[cfg(test)]
-use std::process::Command;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,25 +168,41 @@ pub(crate) fn synctex_candidates(
     let mut push_pair = |base: &Path| {
         for (extension, compressed) in [("synctex.gz", true), ("synctex", false)] {
             let candidate = base.with_extension(extension);
-            if !candidates.iter().any(|(existing, _)| existing == &candidate) {
+            if !candidates
+                .iter()
+                .any(|(existing, _)| existing == &candidate)
+            {
                 candidates.push((candidate, compressed));
             }
         }
+        if base.extension().is_some() {
+            for (suffix, compressed) in [(".synctex.gz", true), (".synctex", false)] {
+                let mut os = base.as_os_str().to_os_string();
+                os.push(suffix);
+                let candidate = PathBuf::from(os);
+                if !candidates
+                    .iter()
+                    .any(|(existing, _)| existing == &candidate)
+                {
+                    candidates.push((candidate, compressed));
+                }
+            }
+        }
     };
+    push_pair(pdf);
     let effective = build_directory
         .map(Path::to_path_buf)
         .or_else(crate::build_directory);
     if let Some(dir) = effective.as_deref()
         && let Some(name) = pdf.file_name()
     {
-        push_pair(&dir.join(name));
         if dir.is_relative()
             && let Some(parent) = pdf.parent().filter(|p| !p.as_os_str().is_empty())
         {
             push_pair(&parent.join(dir).join(name));
         }
+        push_pair(&dir.join(name));
     }
-    push_pair(pdf);
     candidates
 }
 
@@ -297,9 +314,9 @@ impl ForwardWord {
             && self.words.iter().all(|word| {
                 word.len() <= 128
                     && word.chars().next().is_some_and(char::is_alphanumeric)
-                    && word
-                        .chars()
-                        .all(|ch| ch.is_alphanumeric() || is_combining_mark(ch) || is_spacing_diacritic(ch))
+                    && word.chars().all(|ch| {
+                        ch.is_alphanumeric() || is_combining_mark(ch) || is_spacing_diacritic(ch)
+                    })
             })
     }
 }
@@ -800,12 +817,13 @@ impl SyncTeXCache {
         &mut CachedSyncTeX,
     )> {
         operation.check()?;
+        parser::validate_inverse_point(point)?;
         let Some(companion) = companion_revision_in(pdf, build_directory)? else {
-            return Err(
-                open_synctex_in(pdf, build_directory).err().unwrap_or_else(|| {
+            return Err(open_synctex_in(pdf, build_directory)
+                .err()
+                .unwrap_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
-                }),
-            );
+                }));
         };
         if self
             .entry
@@ -814,6 +832,9 @@ impl SyncTeXCache {
         {
             let mut raw = Vec::new();
             open_synctex_in(pdf, build_directory)?.read_to_end(&mut raw)?;
+            if raw.len() >= 128 * 1024 * 1024 {
+                return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
+            }
             operation.check()?;
             if companion_revision_in(pdf, build_directory)? != Some(companion) {
                 return Err(io::Error::other(
@@ -834,8 +855,12 @@ impl SyncTeXCache {
                 std::io::Cursor::new(&entry.raw),
                 true,
                 Some(point.page),
+                Some(operation),
             )?;
             operation.check()?;
+            if entry.pages.len() >= 32 {
+                entry.pages.clear();
+            }
             entry.pages.insert(point.page, parsed);
         }
         let targets = parser::inverse_candidates_in_doc(&entry.pages[&point.page], point)?;
@@ -939,7 +964,7 @@ pub fn resolve_inverse_with_cache_in(
             (targets, Some(companion), Some(entry))
         }
         None => (
-            parser::inverse_raw_candidates_in(&pdf, point, build_directory)?,
+            parser::inverse_raw_candidates_in(&pdf, point, build_directory, Some(operation))?,
             None,
             None,
         ),
@@ -995,7 +1020,9 @@ fn resolve_inverse_output(
     sources: QuerySources<'_>,
 ) -> io::Result<InverseResolution> {
     let targets = parse_synctex_edit_candidates(stdout);
-    resolve_inverse_targets(pdf, point, word, radius, operation, targets, sources, None, None)
+    resolve_inverse_targets(
+        pdf, point, word, radius, operation, targets, sources, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,8 +1196,8 @@ impl QuerySources<'_> {
 
 type MetadataLocation = (String, Rc<String>, u32, usize, isize);
 
-#[derive(Debug, thiserror::Error)]
-enum InverseFailure {
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InverseFailure {
     #[error("synctex edit returned no match")]
     NoMatch,
     #[error("{0}")]
@@ -1181,6 +1208,10 @@ enum InverseFailure {
         line: u32,
         available: usize,
     },
+}
+
+pub fn inverse_failure(error: &io::Error) -> Option<&InverseFailure> {
+    error.get_ref()?.downcast_ref::<InverseFailure>()
 }
 
 struct InverseAnchor {
@@ -1253,6 +1284,9 @@ impl InverseQuery<'_> {
                     .map(Rc::new)
                     .map_err(|error| error.to_string());
                     self.operation.check()?;
+                    if cache.structural_maps.len() >= 32 {
+                        cache.structural_maps.clear();
+                    }
                     cache.structural_maps.insert(key, loaded.clone());
                     loaded
                 }
@@ -1301,7 +1335,10 @@ impl InverseQuery<'_> {
             let point = self.point;
             let operation = self.operation;
             let build_directory = self.build_directory;
-            let raw = self.synctex_cache.as_deref().map(|cache| cache.raw.as_slice());
+            let raw = self
+                .synctex_cache
+                .as_deref()
+                .map(|cache| cache.raw.as_slice());
             self.geometry_map
                 .get_or_insert_with(|| {
                     let loaded = match raw {
@@ -2012,7 +2049,7 @@ pub(crate) fn open_synctex_with_path_in(
     let mut last_not_found = None;
     for (candidate, _) in synctex_candidates(pdf, build_directory) {
         match crate::source_snapshot::open_regular(&candidate, false) {
-            Ok(file) => return Ok((decode_synctex_file(file, 128 * 1024 * 1024)?, candidate)),
+            Ok(file) => return Ok((decode_synctex_file(file, 128 * 1024 * 1024 + 1)?, candidate)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
             Err(error) => return Err(error),
         }
@@ -2087,7 +2124,7 @@ fn source_map_from_reader(
 
 #[allow(clippy::too_many_arguments)]
 fn source_map_from_reader_in(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     pdf: &Path,
     point: InversePoint,
     generated: &Path,
@@ -2097,6 +2134,7 @@ fn source_map_from_reader_in(
     snapshot: Option<&SourceSnapshot>,
     sidecar_dir: Option<&Path>,
 ) -> io::Result<SourceMap> {
+    let mut reader = reader.take(128 * 1024 * 1024 + 1);
     let mut inputs = std::collections::HashMap::new();
     let mut generated_tags = std::collections::HashSet::new();
     let mut row = String::new();
@@ -2546,13 +2584,10 @@ fn is_fragile_frame(source: &str, frame: &std::ops::Range<usize>) -> bool {
         return false;
     };
     let options = &source[at + 1..end - 1];
-    options
-        .split(',')
-        .flat_map(str::lines)
-        .any(|option| {
-            let option = source_line_text(option).trim();
-            option == "fragile" || option.starts_with("fragile=")
-        })
+    options.split(',').flat_map(str::lines).any(|option| {
+        let option = source_line_text(option).trim();
+        option == "fragile" || option.starts_with("fragile=")
+    })
 }
 
 /// Title pages and running headers can be produced from declarations far
@@ -2808,9 +2843,7 @@ pub(crate) fn parse_synctex_edit_candidates(stdout: &str) -> Vec<RawInverseCandi
                 });
                 active = true;
             }
-        } else if active
-            && let Some(value) = row.strip_prefix("Column:")
-        {
+        } else if active && let Some(value) = row.strip_prefix("Column:") {
             active = false;
             if let Ok(column) = value.trim().parse::<usize>()
                 && column > 1
@@ -2978,7 +3011,8 @@ fn source_tabularx_range(source: &str, line: u32) -> Option<std::ops::Range<usiz
 pub fn is_spacing_diacritic(ch: char) -> bool {
     matches!(
         ch,
-        '\u{00a8}' | '\u{00af}' | '\u{00b4}' | '\u{00b8}' | '\u{02c6}' | '\u{02c7}' | '\u{02d8}'..='\u{02dd}'
+        '\u{00a8}' | '\u{00af}' | '\u{00b4}' | '\u{00b8}' | '\u{02c6}' | '\u{02c7}' | '\u{02d8}'
+            ..='\u{02dd}'
     )
 }
 
@@ -3224,22 +3258,189 @@ fn source_word_location_in_range(
         within_scope,
         &hidden,
     );
-    math::source_location(source, line, lines, within_scope, context, offset, prose).and_then(
-        |(row, byte)| {
-            if !hidden.is_empty() {
-                let absolute = source
-                    .split_inclusive('\n')
-                    .take(row as usize - 1)
-                    .map(str::len)
-                    .sum::<usize>()
-                    + byte;
-                if hidden.iter().any(|range| range.contains(&absolute)) {
-                    return None;
+    let selected_norm = {
+        let pdf = words(context);
+        word_index_at(context, &pdf, offset).map(|idx| normalized_word(pdf[idx].1))
+    };
+    math::source_location(
+        source,
+        line,
+        lines.clone(),
+        within_scope,
+        context,
+        offset,
+        prose,
+    )
+    .and_then(|(row, byte)| {
+        if !hidden.is_empty() {
+            let absolute = source
+                .split_inclusive('\n')
+                .take(row as usize - 1)
+                .map(str::len)
+                .sum::<usize>()
+                + byte;
+            if hidden.iter().any(|range| range.contains(&absolute)) {
+                return None;
+            }
+        }
+        if !within_scope && row != line && crosses_paragraph_boundary(source, line, row) {
+            return None;
+        }
+        if let Some(ref target_word) = selected_norm {
+            let check_lines = if within_scope && is_fragile_frame(source, &lines) {
+                lines.start.saturating_add(1)..lines.end
+            } else {
+                lines.clone()
+            };
+            if defined_macro_conflict(source, check_lines, &hidden, target_word) {
+                return None;
+            }
+        }
+        ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
+    })
+}
+
+fn has_control_word(text: &str, name: &str) -> bool {
+    let mut rest = text;
+    while let Some(pos) = rest.find('\\') {
+        let after_slash = &rest[pos + 1..];
+        if let Some(tail) = after_slash.strip_prefix(name)
+            && !tail
+                .as_bytes()
+                .first()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+        {
+            return true;
+        }
+        rest = after_slash;
+    }
+    false
+}
+
+fn crosses_paragraph_boundary(source: &str, line: u32, row: u32) -> bool {
+    let start = line.min(row).saturating_sub(1) as usize;
+    let end = line.max(row).saturating_sub(1) as usize;
+    for (idx, raw) in source.lines().enumerate().take(end + 1).skip(start) {
+        let text = source_line_text(raw);
+        if idx < end && has_control_word(text, "par") {
+            return true;
+        }
+        if idx > start && idx < end && text.trim().is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+fn defined_macro_conflict(
+    source: &str,
+    lines: std::ops::Range<usize>,
+    hidden: &[std::ops::Range<usize>],
+    target_word: &str,
+) -> bool {
+    if target_word.is_empty() {
+        return false;
+    }
+    let mut macros = Vec::<(&str, &str)>::new();
+    for (start, span) in nonprinting_source_spans(source) {
+        if source.as_bytes().get(start) != Some(&b'\\') {
+            continue;
+        }
+        let (command, end) = math::command(source, start);
+        let mut at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
+        let name = if matches!(command, "def" | "gdef" | "edef" | "xdef") {
+            at = skip_source_space(source, at);
+            if source.as_bytes().get(at) != Some(&b'\\') {
+                continue;
+            }
+            let (name, next) = math::command(source, at);
+            at = next;
+            while at < span.end && source.as_bytes()[at] != b'{' {
+                if source.as_bytes()[at] == b'\\' {
+                    at += 1;
+                    at += source[at..].chars().next().map_or(0, char::len_utf8);
+                } else if source.as_bytes()[at] == b'%' {
+                    at = skip_source_space(source, at);
+                } else {
+                    at += source[at..].chars().next().map_or(1, char::len_utf8);
                 }
             }
-            ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
-        },
-    )
+            name
+        } else if matches!(
+            command,
+            "newcommand"
+                | "renewcommand"
+                | "providecommand"
+                | "DeclareRobustCommand"
+                | "NewDocumentCommand"
+                | "RenewDocumentCommand"
+                | "ProvideDocumentCommand"
+                | "DeclareDocumentCommand"
+        ) {
+            at = skip_source_space(source, at);
+            let name = if let Some((grp, next)) = math::group(source, at) {
+                at = next;
+                source[grp].trim().strip_prefix('\\').unwrap_or("")
+            } else if source.as_bytes().get(at) == Some(&b'\\') {
+                let (name, next) = math::command(source, at);
+                at = next;
+                name
+            } else {
+                continue;
+            };
+            while let Some(opt_end) = optional_argument_end(source, at) {
+                at = opt_end;
+            }
+            if command.contains("Document") {
+                let Some((_, spec_end)) = math::group(source, skip_source_space(source, at)) else {
+                    continue;
+                };
+                at = spec_end;
+            }
+            name
+        } else {
+            continue;
+        };
+        let body_start = skip_source_space(source, at);
+        if !name.is_empty()
+            && let Some((body, _)) = math::group(source, body_start)
+        {
+            macros.push((name, &source[body]));
+        }
+    }
+    let matching_macros: Vec<&str> = macros
+        .into_iter()
+        .filter_map(|(name, body)| {
+            source_words(body)
+                .into_iter()
+                .any(|(_, _, word)| word == target_word)
+                .then_some(name)
+        })
+        .collect();
+    if matching_macros.is_empty() {
+        return false;
+    }
+    let mut line_start = 0usize;
+    for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
+        if index >= lines.start {
+            let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
+            let mut offset = 0usize;
+            while let Some(pos) = text[offset..].find('\\') {
+                let slash = offset + pos;
+                let abs = line_start + slash;
+                let (cmd_name, next) = math::command(text, slash);
+                if !cmd_name.is_empty()
+                    && !hidden.iter().any(|range| range.contains(&abs))
+                    && matching_macros.contains(&cmd_name)
+                {
+                    return true;
+                }
+                offset = next.max(slash + 1);
+            }
+        }
+        line_start += raw_row.len();
+    }
+    false
 }
 
 fn skip_source_space(source: &str, mut at: usize) -> usize {
@@ -3625,4 +3826,3 @@ fn source_prose_scored_location(
     best.filter(|_| !tied)
         .map(|(rank, row, byte)| (row, byte, rank.0))
 }
-

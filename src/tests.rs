@@ -988,8 +988,7 @@ fn inverse_no_match_and_competing_anchors_have_distinct_typed_failures() {
     let pdf = directory.path().join("paper.pdf");
     fs::write(directory.path().join("paper.tex"), "Copper.\nZephyr.\n").unwrap();
     let no_match = inverse_output(&pdf, "SyncTeX result begin\nSyncTeX result end\n", None)
-        .err()
-        .expect("empty native results are not source ambiguity");
+        .expect_err("empty native results are not source ambiguity");
     assert_eq!(no_match.kind(), io::ErrorKind::NotFound);
     assert!(matches!(
         no_match
@@ -1002,8 +1001,7 @@ fn inverse_no_match_and_competing_anchors_have_distinct_typed_failures() {
         "Input: paper.tex\nLine: 1\nInput: paper.tex\nLine: 2\n",
         None,
     )
-    .err()
-    .expect("competing valid anchors are not no-match");
+    .expect_err("competing valid anchors are not no-match");
     assert_eq!(ambiguous.kind(), io::ErrorKind::InvalidData);
     assert!(matches!(
         ambiguous
@@ -1108,8 +1106,7 @@ fn inverse_closing_layout_anchor_does_not_guess_a_neighboring_prose_row() {
         &format!("Input: paper.tex\nLine: 9\nInput: paper.tex\nLine: {coarse_line}\n"),
         QuerySources::default(),
     )
-    .err()
-    .expect("unqualified layout rows must remain competing coarse anchors");
+    .expect_err("unqualified layout rows must remain competing coarse anchors");
     assert!(error.to_string().contains("ambiguous inverse search"));
 }
 
@@ -1139,8 +1136,7 @@ fn inverse_competing_precise_or_coarse_positions_are_ambiguous_in_any_order() {
             (None, "coarse"),
         ] {
             let error = inverse_output(&directory.path().join("paper.pdf"), &stdout, word)
-                .err()
-                .expect("competing source locations must be ambiguous")
+                .expect_err("competing source locations must be ambiguous")
                 .to_string();
             assert!(error.contains("ambiguous inverse search"), "{error}");
             assert!(error.contains(expected), "{error}");
@@ -1179,8 +1175,7 @@ fn inverse_readable_bounds_are_required_even_without_word_refinement() {
         "Input: main.tex\nLine: 490\n",
         None,
     )
-    .err()
-    .expect("a readable out-of-range source anchor must be rejected");
+    .expect_err("a readable out-of-range source anchor must be rejected");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     let failure = error
         .get_ref()
@@ -1499,26 +1494,13 @@ More slide text
         source_word_location(article, 3, "Keywords. Sample-document testing", 13, 1),
         Some((3, 10)),
     );
-    let accented =
-        "\\author{Jane Example\\thanks{Center of \\'Etudes\nMod\\^ele d'Éxemple}}";
+    let accented = "\\author{Jane Example\\thanks{Center of \\'Etudes\nMod\\^ele d'Éxemple}}";
     assert_eq!(
-        source_word_location(
-            accented,
-            1,
-            "Center of Études Modêle d’Éxemple",
-            10,
-            1,
-        ),
+        source_word_location(accented, 1, "Center of Études Modêle d’Éxemple", 10, 1,),
         Some((1, 38)),
     );
     assert_eq!(
-        source_word_location(
-            accented,
-            2,
-            "Center of Études Modêle d’Éxemple",
-            18,
-            1,
-        ),
+        source_word_location(accented, 2, "Center of Études Modêle d’Éxemple", 18, 1,),
         Some((2, 0)),
     );
 
@@ -1552,18 +1534,15 @@ x2,48:0,200
     let pdf = Path::new("/tmp/main.pdf");
     let section = Path::new("/tmp/section.tex");
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 29).unwrap()[0]
-            .page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 29).unwrap()[0].page,
         1
     );
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 44).unwrap()[0]
-            .page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 44).unwrap()[0].page,
         2
     );
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 45).unwrap()[0]
-            .page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 45).unwrap()[0].page,
         2
     );
 }
@@ -1644,14 +1623,18 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
     ) {
         let count = (next_u64(rng) % 6) + 1;
         for idx in 0..count {
-            let tag = if next_u64(rng) % 4 == 0 { 2 } else { 1 };
+            let tag = if next_u64(rng).is_multiple_of(4) {
+                2
+            } else {
+                1
+            };
             let line = base_line + (next_u64(rng) % 8) as i64;
             let x = ((next_u64(rng) % 400_000) as i64) + 10_000;
             let y = ((next_u64(rng) % 600_000) as i64) + 20_000;
             let w = ((next_u64(rng) % 150_000) as i64) + 1_000;
             let h = ((next_u64(rng) % 20_000) as i64) + 500;
             let d = (next_u64(rng) % 5_000) as i64;
-            let y_str = if next_u64(rng) % 5 == 0 {
+            let y_str = if next_u64(rng).is_multiple_of(5) {
                 "=".to_string()
             } else {
                 y.to_string()
@@ -1670,16 +1653,23 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
                 3 => out.push_str(&format!("v{tag},{line}:{x},{y_str}:{w},{h},{d}\n")),
                 4 => out.push_str(&format!("h{tag},{line}:{x},{y_str}:{w},{h},{d}\n")),
                 5 => {
-                    let kw = if next_u64(rng) % 3 == 0 { -w } else { w };
+                    let kw = if next_u64(rng).is_multiple_of(3) {
+                        -w
+                    } else {
+                        w
+                    };
                     out.push_str(&format!("k{tag},{line}:{x},{y_str}:{kw}\n"));
-                    if next_u64(rng) % 2 == 0 {
+                    if next_u64(rng).is_multiple_of(2) {
                         out.push_str(&format!("g{tag},{line}:{x},{y_str}\n"));
                     }
                 }
                 6 => out.push_str(&format!("g{tag},{line}:{x},{y_str}\n")),
                 7 => out.push_str(&format!("r{tag},{line}:{x},{y_str}:{w},{h},{d}\n")),
                 8 => out.push_str(&format!("${tag},{line}:{x},{y_str}\n")),
-                9 if max_form_tag > 0 && (in_hbox || idx > 0) && next_u64(rng) % 2 == 0 => {
+                9 if max_form_tag > 0
+                    && (in_hbox || idx > 0)
+                    && next_u64(rng).is_multiple_of(2) =>
+                {
                     let ftag = ((next_u64(rng) as u32) % max_form_tag) + 1;
                     out.push_str(&format!("f{ftag}:{x},{y_str}\n"));
                 }
@@ -1724,11 +1714,13 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
             synctex.push_str(&format!(")\n]\n}}{p}\n"));
         }
         synctex.push_str("Postamble:\nCount:100\n");
-        if next_u64(&mut rng) % 2 == 0 {
-            let x_unit = ["pt", "bp", "in", "cm", "mm", "pc", "sp", "dd", "cc", "nd", "nc"]
-                [(next_u64(&mut rng) % 11) as usize];
-            let y_unit = ["pt", "bp", "in", "cm", "mm", "pc", "sp", "dd", "cc", "nd", "nc"]
-                [(next_u64(&mut rng) % 11) as usize];
+        if next_u64(&mut rng).is_multiple_of(2) {
+            let x_unit = [
+                "pt", "bp", "in", "cm", "mm", "pc", "sp", "dd", "cc", "nd", "nc",
+            ][(next_u64(&mut rng) % 11) as usize];
+            let y_unit = [
+                "pt", "bp", "in", "cm", "mm", "pc", "sp", "dd", "cc", "nd", "nc",
+            ][(next_u64(&mut rng) % 11) as usize];
             synctex.push_str(&format!(
                 "Post scriptum:\nMagnification:1.25\nX Offset:2{x_unit}\nY Offset:3{y_unit}\n"
             ));
@@ -1843,8 +1835,8 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
                 match next_u64(&mut rng) % 4 {
                     0 => mutated.truncate(idx),
                     1 => {
-                        let b = b"()[]{}<>fxgkhvr$0123456789,-:=\n"
-                            [(next_u64(&mut rng) % 31) as usize];
+                        let b =
+                            b"()[]{}<>fxgkhvr$0123456789,-:=\n"[(next_u64(&mut rng) % 31) as usize];
                         mutated[idx] = b;
                     }
                     2 => {
@@ -2021,7 +2013,7 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
 
     // Multi-input sheet where root vbox uses Input:1 and matched child uses Input:2.
     let synctex = format!(
-        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,10:0,0:30000000,40000000,0\n(2,42:655360,6553600:6553600,655360,0\nx2,42:1310720,6553600\n)\n]\n}}1\n",
+        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,10:0,0:30000000,40000000,0\n(2,42:655360,6553600:6553600,655360,0\nx2,42:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
         main_tex.display(),
         sub_tex.display(),
     );
@@ -2352,16 +2344,8 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
     set_build_directory(Some(build_dir.clone()));
     let forward_global = resolve_forward(&pdf, &tex, 3, 1).unwrap();
     assert_eq!(forward_global.page, 1);
-    let inverse_global = resolve_inverse(
-        &pdf,
-        pt,
-        None,
-        2,
-        &Operation::default(),
-        None,
-        false,
-    )
-    .unwrap();
+    let inverse_global =
+        resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap();
     set_build_directory(None);
     assert_eq!(Path::new(&inverse_global.location.file), tex.as_path());
     assert_eq!(inverse_global.location.line, 3);
@@ -2387,7 +2371,8 @@ fn snapshot_preserves_fallback_source_identity_and_required_cache_validation() {
 
     let pdf = build_dir.join("main.pdf");
     let tex = build_dir.join("main.tex");
-    let source_text = "\\documentclass{article}\n\\begin{document}\nsnapshot fallback line\n\\end{document}\n";
+    let source_text =
+        "\\documentclass{article}\n\\begin{document}\nsnapshot fallback line\n\\end{document}\n";
     fs::write(&pdf, b"pdf-v1").unwrap();
     fs::write(&tex, source_text).unwrap();
 
@@ -2533,8 +2518,22 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
 
     let raw_two = inverse_candidates(&pdf, pt).unwrap();
     assert_eq!(raw_two.len(), 2);
-    assert_eq!((raw_two[0].byte_column, raw_two[0].column, raw_two[0].column_char), (11, 10, 10));
-    assert_eq!((raw_two[1].byte_column, raw_two[1].column, raw_two[1].column_char), (6, 5, 5));
+    assert_eq!(
+        (
+            raw_two[0].byte_column,
+            raw_two[0].column,
+            raw_two[0].column_char
+        ),
+        (11, 10, 10)
+    );
+    assert_eq!(
+        (
+            raw_two[1].byte_column,
+            raw_two[1].column,
+            raw_two[1].column_char
+        ),
+        (6, 5, 5)
+    );
 
     let edit_two = parse_synctex_edit(&format!(
         "SyncTeX result begin\nInput:{}\nLine:3\nColumn:12\nInput:{}\nLine:3\nColumn:7\nSyncTeX result end\n",
@@ -2542,17 +2541,46 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
         tex.display()
     ));
     assert_eq!(edit_two.len(), 2);
-    assert_eq!((edit_two[0].byte_column, edit_two[0].column, edit_two[0].column_char), (11, 10, 10));
-    assert_eq!((edit_two[1].byte_column, edit_two[1].column, edit_two[1].column_char), (6, 5, 5));
+    assert_eq!(
+        (
+            edit_two[0].byte_column,
+            edit_two[0].column,
+            edit_two[0].column_char
+        ),
+        (11, 10, 10)
+    );
+    assert_eq!(
+        (
+            edit_two[1].byte_column,
+            edit_two[1].column,
+            edit_two[1].column_char
+        ),
+        (6, 5, 5)
+    );
 
-    let strict_err = resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap_err();
+    let strict_err =
+        resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap_err();
     assert!(
-        strict_err.to_string().contains("multiple coarse source anchors"),
+        strict_err
+            .to_string()
+            .contains("multiple coarse source anchors"),
         "expected ambiguity error, got: {strict_err}"
     );
     let guessed = resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, true).unwrap();
-    assert_eq!((guessed.location.byte_column, guessed.location.column, guessed.location.column_char), (11, 10, 10));
-    assert!(guessed.warning.unwrap().contains("multiple coarse source anchors"));
+    assert_eq!(
+        (
+            guessed.location.byte_column,
+            guessed.location.column,
+            guessed.location.column_char
+        ),
+        (11, 10, 10)
+    );
+    assert!(
+        guessed
+            .warning
+            .unwrap()
+            .contains("multiple coarse source anchors")
+    );
 }
 
 #[test]
@@ -2669,8 +2697,14 @@ fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
             y_from_top: 10.0,
             page_height_pt: 792.0,
         };
-        assert!(inverse_candidates(&pdf, pt).is_err(), "expected error for {bad}");
-        assert!(resolve_forward(&pdf, &tex, 3, 1).is_err(), "expected error for {bad}");
+        assert!(
+            inverse_candidates(&pdf, pt).is_err(),
+            "expected error for {bad}"
+        );
+        assert!(
+            resolve_forward(&pdf, &tex, 3, 1).is_err(),
+            "expected error for {bad}"
+        );
     }
     for ok_dim in ["0sp", "0e0sp", "1e0sp", "0E0sp"] {
         let ok_offset = format!(
@@ -2678,7 +2712,10 @@ fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
             tex.display()
         );
         fs::write(pdf.with_extension("synctex"), &ok_offset).unwrap();
-        assert!(resolve_forward(&pdf, &tex, 3, 1).is_ok(), "expected ok for {ok_dim}");
+        assert!(
+            resolve_forward(&pdf, &tex, 3, 1).is_ok(),
+            "expected ok for {ok_dim}"
+        );
     }
 
     // Item 5: i64::MIN width in hbox geometry must be rejected with InvalidInput.
@@ -2707,7 +2744,10 @@ fn warm_synctex_cache_respects_snapshot_authority_and_spacing_diacritics() {
 
     // 1. Spacing diacritics (e.g. OT1 acute '\u{00b4}') stay attached to words and match TeX accents.
     let tokenized = words("alpha caf\u{00b4}e omega");
-    assert_eq!(tokenized, vec![(0, "alpha"), (6, "caf\u{00b4}e"), (13, "omega")]);
+    assert_eq!(
+        tokenized,
+        vec![(0, "alpha"), (6, "caf\u{00b4}e"), (13, "omega")]
+    );
     assert_eq!(normalized_word("caf\u{00b4}e"), "cafe");
 
     // 2. Warm SyncTeXCache must not reuse a non-snapshot structural map when a snapshot is supplied.
@@ -2792,7 +2832,9 @@ fn warm_synctex_cache_respects_snapshot_authority_and_spacing_diacritics() {
     )
     .unwrap_err();
     assert!(
-        missing_err.to_string().contains("required compiled source cache"),
+        missing_err
+            .to_string()
+            .contains("required compiled source cache"),
         "expected required cache error, got: {missing_err}"
     );
 }
@@ -2822,4 +2864,206 @@ fn fifo_synctex_sidecar_is_rejected_without_blocking() {
         err.to_string().contains("regular file"),
         "expected regular-file error for FIFO sidecar, got: {err}"
     );
+}
+
+#[test]
+fn macro_printed_text_does_not_jump_to_adjacent_literal_line_with_precise_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let source = concat!(
+        "\\documentclass{article}\n",
+        "\\newcommand{\\Other}{Copper needle Nickel}\n",
+        "\\begin{document}\n",
+        "\\Other\\par\n",
+        "Copper needle Nickel\\par\n",
+        "\\end{document}\n",
+    );
+    fs::write(&tex, source).unwrap();
+
+    // Anchor on line 4 (`\Other\par`) must not jump to literal `Copper needle Nickel` on line 5.
+    assert_eq!(
+        source_word_location(source, 4, "Copper needle Nickel", 7, 2),
+        None
+    );
+
+    let synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,4:0,0:30000000,40000000,0\n(1,4:655360,6553600:6553600,655360,0\nx1,4:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        tex.display()
+    );
+    fs::write(pdf.with_extension("synctex"), synctex).unwrap();
+
+    let pt = InversePoint {
+        page: 1,
+        x: 19.0,
+        y_from_top: 98.0,
+        page_height_pt: 792.0,
+    };
+    let resolved = resolve_inverse(
+        &pdf,
+        pt,
+        Some(("Copper needle Nickel", 7)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(resolved.location.line, 4);
+    assert!(!resolved.location.precise);
+    assert!(resolved.warning.is_none());
+}
+
+#[test]
+fn parser_rejects_truncated_postamble_invalid_headers_unresolved_forms_and_bad_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &tex,
+        "\\documentclass{article}\n\\begin{document}\nword\n\\end{document}\n",
+    )
+    .unwrap();
+
+    let pt = InversePoint {
+        page: 1,
+        x: 10.0,
+        y_from_top: 10.0,
+        page_height_pt: 792.0,
+    };
+
+    // 1. Truncated postamble (SyncTeX Version:1 without Postamble:/Count:)
+    let truncated = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:100,100,0\n]\n}}1\n",
+        tex.display()
+    );
+    assert!(inverse_candidates_from_reader(truncated.as_bytes(), pt).is_err());
+
+    // 2. Unclosed box / sheet
+    let unclosed = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:100,100,0\nPostamble:\nCount:2\n",
+        tex.display()
+    );
+    assert!(inverse_candidates_from_reader(unclosed.as_bytes(), pt).is_err());
+
+    // 3. Non-positive or malformed Unit / Magnification
+    for bad_header in [
+        "Unit:0",
+        "Unit:-1",
+        "Unit:abc",
+        "Magnification:0",
+        "Magnification:-5",
+    ] {
+        let doc = format!(
+            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\n{bad_header}\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:100,100,0\n]\n}}1\nPostamble:\nCount:2\n",
+            tex.display()
+        );
+        assert!(
+            inverse_candidates_from_reader(doc.as_bytes(), pt).is_err(),
+            "expected error for {bad_header}"
+        );
+    }
+
+    // 4. Cyclic or empty form reference (`f`) must return Err, not silently drop
+    let empty_form = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n<1\n>\n{{1\n[1,3:0,0:100,100,0\nf1:0,0\n]\n}}1\nPostamble:\nCount:4\n",
+        tex.display()
+    );
+    assert!(inverse_candidates_from_reader(empty_form.as_bytes(), pt).is_err());
+
+    let cyclic_form = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n<1\n(1,3:0,0:100,100,0\nf1:0,0\n)\n>\n{{1\n[1,3:0,0:100,100,0\nf1:0,0\n]\n}}1\nPostamble:\nCount:5\n",
+        tex.display()
+    );
+    assert!(inverse_candidates_from_reader(cyclic_form.as_bytes(), pt).is_err());
+
+    // 5. Invalid InversePoint rejected by raw inverse APIs
+    let valid_doc = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        tex.display()
+    );
+    for bad_pt in [
+        InversePoint {
+            page: 0,
+            x: 10.0,
+            y_from_top: 10.0,
+            page_height_pt: 792.0,
+        },
+        InversePoint {
+            page: 1,
+            x: f32::NAN,
+            y_from_top: 10.0,
+            page_height_pt: 792.0,
+        },
+        InversePoint {
+            page: 1,
+            x: 10.0,
+            y_from_top: 10.0,
+            page_height_pt: 0.0,
+        },
+    ] {
+        let err = inverse_candidates_from_reader(valid_doc.as_bytes(), bad_pt).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // 6. Public InverseFailure downcasting via inverse_failure()
+    fs::write(pdf.with_extension("synctex"), &valid_doc).unwrap();
+    let miss_err = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 9,
+            x: 10.0,
+            y_from_top: 10.0,
+            page_height_pt: 792.0,
+        },
+        None,
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(inverse_failure(&miss_err), Some(&InverseFailure::NoMatch));
+
+    // 7. `.pdf.synctex` companion discovery and PDF-adjacent precedence over build_directory
+    fs::remove_file(pdf.with_extension("synctex")).unwrap();
+    let pdf_synctex = root.join("doc.pdf.synctex");
+    fs::write(&pdf_synctex, &valid_doc).unwrap();
+    assert_eq!(locate_synctex(&pdf).as_deref(), Some(pdf_synctex.as_path()));
+}
+
+#[test]
+fn protruding_child_box_expands_both_sides_of_parent_visible_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, "line1\nline2\n").unwrap();
+
+    // Parent hbox (line 1) spans x=[655360, 1310720] (~10pt..20pt), y=[6553600-327680, 6553600] (~95pt..100pt).
+    // Child hbox (line 1) protrudes on both left and right: x=[327680, 3276800] (~5pt..50pt)
+    // and both top and bottom: y=[6553600-655360, 6553600+655360] (~90pt..110pt).
+    // A second unrelated hbox (line 2) sits far away at x=13107200 (~200pt).
+    let synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,1:0,0:30000000,40000000,0\n(1,1:655360,6553600:655360,327680,0\n(1,1:327680,6553600:2949120,655360,655360\nx1,1:327680,6553600\n)\n)\n(1,2:13107200,6553600:655360,327680,0\nx1,2:13107200,6553600\n)\n]\n}}1\nPostamble:\nCount:7\n",
+        tex.display()
+    );
+    let hits = inverse_candidates_from_reader_with_options(
+        synctex.as_bytes(),
+        InversePoint {
+            page: 1,
+            x: 45.0,
+            y_from_top: 108.0,
+            page_height_pt: 792.0,
+        },
+        true,
+    )
+    .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].line, 1);
 }

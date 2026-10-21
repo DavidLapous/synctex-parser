@@ -93,35 +93,38 @@ impl ForwardNode {
         }
     }
 
-    fn contain_box(&mut self, bounds: [i64; 4]) {
+    fn contain_box(&mut self, bounds: [i64; 4], fix_both_sides: bool) {
         if self.kind != b'(' {
             return;
         }
         let [min_h, max_h, min_v, max_v] = bounds;
-        if self.width_v < 0 {
-            let mx = self.h_v;
-            let mn = mx.saturating_add(self.width_v);
-            if min_h < mn {
-                self.width_v = min_h.saturating_sub(mx);
-            } else if max_h > mx {
-                self.h_v = max_h;
-                self.width_v = mn.saturating_sub(max_h);
-            }
+        let (cur_min_h, cur_max_h) = if self.width_v < 0 {
+            (self.h_v.saturating_add(self.width_v), self.h_v)
         } else {
-            let mn = self.h_v;
-            let mx = mn.saturating_add(self.width_v);
-            if min_h < mn {
-                self.h_v = min_h;
-                self.width_v = mx.saturating_sub(min_h);
-            } else if max_h > mx {
-                self.width_v = max_h.saturating_sub(mn);
-            }
+            (self.h_v, self.h_v.saturating_add(self.width_v))
+        };
+        let (new_min_h, new_max_h) = if fix_both_sides {
+            (cur_min_h.min(min_h), cur_max_h.max(max_h))
+        } else if min_h < cur_min_h {
+            (min_h, cur_max_h)
+        } else if max_h > cur_max_h {
+            (cur_min_h, max_h)
+        } else {
+            (cur_min_h, cur_max_h)
+        };
+        if self.width_v < 0 {
+            self.h_v = new_max_h;
+            self.width_v = new_min_h.saturating_sub(new_max_h);
+        } else {
+            self.h_v = new_min_h;
+            self.width_v = new_max_h.saturating_sub(new_min_h);
         }
         let mn = self.v_v.saturating_sub(self.height_v);
         let mx = self.v_v.saturating_add(self.depth_v);
         if min_v < mn {
             self.height_v = self.v_v.saturating_sub(min_v);
-        } else if max_v > mx {
+        }
+        if (fix_both_sides || min_v >= mn) && max_v > mx {
             self.depth_v = max_v.saturating_sub(self.v_v);
         }
     }
@@ -178,7 +181,7 @@ fn parse_synctex_int_prefix(text: &str) -> Option<(i64, &str)> {
     Some((text.get(..index)?.parse().ok()?, text.get(index..)?))
 }
 
-const MAX_PROXY_DEPTH: usize = 16;
+const MAX_PROXY_DEPTH: usize = MAX_BOX_DEPTH;
 pub(crate) const MAX_BOX_DEPTH: usize = 512;
 const MAX_FORWARD_NODES: usize = 500_000;
 const MAX_SYNCTEX_BYTES: usize = 128 * 1024 * 1024;
@@ -194,9 +197,21 @@ fn clone_synctex_proxy_subtree(
     depth: usize,
     register_friends: &mut Option<&mut [Vec<usize>; 1024]>,
     sheet_hboxes: &mut Option<&mut Vec<usize>>,
-) -> Option<usize> {
-    if depth > MAX_PROXY_DEPTH || nodes.len() >= MAX_FORWARD_NODES {
-        return None;
+) -> io::Result<usize> {
+    if depth > MAX_PROXY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SyncTeX form proxy depth exceeds limit",
+        ));
+    }
+    if nodes.len() >= MAX_FORWARD_NODES {
+        return Err(io::Error::other("SyncTeX node count exceeds limit"));
+    }
+    if nodes[source].kind == b'f' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SyncTeX form proxy references unresolved form",
+        ));
     }
     let mut clone = nodes[source].clone();
     let children = std::mem::take(&mut clone.children);
@@ -226,7 +241,7 @@ fn clone_synctex_proxy_subtree(
         hboxes.push(index);
     }
     for child in children {
-        if let Some(child_idx) = clone_synctex_proxy_subtree(
+        let child_idx = clone_synctex_proxy_subtree(
             nodes,
             child,
             Some(index),
@@ -236,11 +251,10 @@ fn clone_synctex_proxy_subtree(
             depth + 1,
             register_friends,
             sheet_hboxes,
-        ) {
-            nodes[index].children.push(child_idx);
-        }
+        )?;
+        nodes[index].children.push(child_idx);
     }
-    Some(index)
+    Ok(index)
 }
 
 struct SheetEntry {
@@ -264,14 +278,16 @@ pub(crate) struct ParsedSynctex {
 
 #[cfg(test)]
 pub(crate) fn parse_synctex_document(reader: impl BufRead) -> io::Result<ParsedSynctex> {
-    parse_synctex_document_with_options(reader, false, None)
+    parse_synctex_document_with_options(reader, false, None, None)
 }
 
 pub(crate) fn parse_synctex_document_with_options(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     fix_cross_file_tags: bool,
     target_page: Option<u32>,
+    operation: Option<&Operation>,
 ) -> io::Result<ParsedSynctex> {
+    let mut reader = reader.take(MAX_SYNCTEX_BYTES as u64 + 1);
     let track_friends = target_page.is_none();
     let mut inputs: Vec<(u32, String)> = Vec::new();
     let mut max_lines = std::collections::HashMap::<u32, i64>::new();
@@ -306,19 +322,20 @@ pub(crate) fn parse_synctex_document_with_options(
         if !track_friends {
             return;
         }
-        let bucket =
-            ((i64::from(nodes[idx].tag).saturating_add(nodes[idx].line)).unsigned_abs() as usize)
-                % 1024;
+        let bucket = ((i64::from(nodes[idx].tag).saturating_add(nodes[idx].line)).unsigned_abs()
+            as usize)
+            % 1024;
         friends[bucket].push(idx);
     };
-    let record_max_line = |max_lines: &mut std::collections::HashMap<u32, i64>, tag: u32, line: i64| {
-        if track_friends {
-            max_lines
-                .entry(tag)
-                .and_modify(|max| *max = (*max).max(line))
-                .or_insert(line);
-        }
-    };
+    let record_max_line =
+        |max_lines: &mut std::collections::HashMap<u32, i64>, tag: u32, line: i64| {
+            if track_friends {
+                max_lines
+                    .entry(tag)
+                    .and_modify(|max| *max = (*max).max(line))
+                    .or_insert(line);
+            }
+        };
     let flush_x_set = |x_stack: &mut [Vec<usize>],
                        friends: &mut [Vec<usize>; 1024],
                        nodes: &mut [ForwardNode],
@@ -427,7 +444,17 @@ pub(crate) fn parse_synctex_document_with_options(
 
     let mut row = String::new();
     let mut bytes_read = 0usize;
+    let mut line_count = 0usize;
+    let mut saw_preamble = false;
+    let mut saw_postamble = false;
+    let mut saw_count = false;
     loop {
+        if line_count & 1023 == 0
+            && let Some(op) = operation
+        {
+            op.check()?;
+        }
+        line_count = line_count.saturating_add(1);
         row.clear();
         let count = reader.read_line(&mut row)?;
         if count == 0 {
@@ -446,36 +473,87 @@ pub(crate) fn parse_synctex_document_with_options(
             }
             continue;
         }
-        if let Some(input) = trimmed.strip_prefix("Input:")
+        if trimmed.starts_with("SyncTeX Version:") {
+            saw_preamble = true;
+        } else if trimmed == "Postamble:" {
+            if current_page.is_some()
+                || !form_stack.is_empty()
+                || ignored_form_depth > 0
+                || parent.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unclosed SyncTeX container before postamble",
+                ));
+            }
+            saw_postamble = true;
+        } else if saw_postamble && let Some(count_str) = trimmed.strip_prefix("Count:") {
+            if count_str.trim().parse::<u32>().is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid SyncTeX Count",
+                ));
+            }
+            saw_count = true;
+        } else if let Some(input) = trimmed.strip_prefix("Input:")
             && let Some((tag_str, path)) = input.split_once(':')
             && let Ok(tag) = tag_str.parse::<u32>()
         {
             inputs.push((tag, path.trim_end_matches(' ').to_string()));
         } else if let Some(val) = trimmed.strip_prefix("Magnification:") {
             if in_post_scriptum {
-                post_magnification = val.trim().parse::<f64>().ok();
-            } else if let Ok(mag) = val.trim().parse::<i64>() {
+                let mag = val
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|&m| m.is_finite() && m > 0.0)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid postscript Magnification",
+                        )
+                    })?;
+                post_magnification = Some(mag);
+            } else {
+                let mag = val
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&m| m > 0)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid SyncTeX Magnification")
+                    })?;
                 pre_magnification = mag;
             }
         } else if let Some(val) = trimmed.strip_prefix("Unit:") {
-            if let Ok(unit) = val.trim().parse::<i64>() {
-                pre_unit = unit;
-            }
+            let unit = val
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|&u| u > 0)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid SyncTeX Unit")
+                })?;
+            pre_unit = unit;
         } else if let Some(val) = trimmed.strip_prefix("X Offset:") {
             if in_post_scriptum {
                 post_x_offset = Some(parse_post_dim(val).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "invalid postscript X Offset")
                 })?);
-            } else if let Ok(off) = val.trim().parse::<i64>() {
-                pre_x_offset = off;
+            } else {
+                pre_x_offset = val.trim().parse::<i64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid SyncTeX X Offset")
+                })?;
             }
         } else if let Some(val) = trimmed.strip_prefix("Y Offset:") {
             if in_post_scriptum {
                 post_y_offset = Some(parse_post_dim(val).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "invalid postscript Y Offset")
                 })?);
-            } else if let Ok(off) = val.trim().parse::<i64>() {
-                pre_y_offset = off;
+            } else {
+                pre_y_offset = val.trim().parse::<i64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid SyncTeX Y Offset")
+                })?;
             }
         } else if trimmed.starts_with("Post scriptum:") {
             in_post_scriptum = true;
@@ -510,7 +588,26 @@ pub(crate) fn parse_synctex_document_with_options(
             x_stack.clear();
             last_k = None;
             last_g = None;
-        } else if trimmed.starts_with('}') && form_stack.is_empty() && current_page.is_some() {
+        } else if let Some(page_str) = trimmed.strip_prefix('}')
+            && form_stack.is_empty()
+            && current_page.is_some()
+        {
+            if let Some((close_page, _)) = parse_synctex_int_prefix(page_str)
+                && u32::try_from(close_page).ok() != current_page
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mismatched SyncTeX sheet close tag",
+                ));
+            }
+            if let Some(p_idx) = parent
+                && nodes[p_idx].kind != b'{'
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unclosed SyncTeX box at sheet end",
+                ));
+            }
             current_page = None;
             current_sheet_idx = None;
             parent = None;
@@ -537,6 +634,12 @@ pub(crate) fn parse_synctex_document_with_options(
             }
         } else if trimmed.starts_with('>') && !form_stack.is_empty() {
             let form_root = form_stack.pop().unwrap();
+            if parent != Some(form_root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unclosed SyncTeX box at form end",
+                ));
+            }
             parent = nodes[form_root]
                 .parent
                 .or_else(|| current_sheet_idx.map(|s_idx| sheet_list[s_idx].root));
@@ -635,15 +738,18 @@ pub(crate) fn parse_synctex_document_with_options(
                         parent = next_parent;
                         last_k = None;
                         last_g = None;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "mismatched SyncTeX vbox close",
+                        ));
                     }
                 }
                 b')' => {
                     if let Some(p_idx) = parent
                         && nodes[p_idx].kind == b'('
                     {
-                        if !in_form
-                            && let Some(s_idx) = current_sheet_idx
-                        {
+                        if !in_form && let Some(s_idx) = current_sheet_idx {
                             sheet_list[s_idx].hboxes.push(p_idx);
                         }
                         let ch_len = nodes[p_idx].children.len();
@@ -670,8 +776,8 @@ pub(crate) fn parse_synctex_document_with_options(
                                 if nodes[c_idx].kind == b'(' {
                                     let cw = nodes[c_idx].weight.max(1);
                                     nw = nw.saturating_add(cw);
-                                    cum =
-                                        cum.saturating_add(nodes[c_idx].mean_line.saturating_mul(cw));
+                                    cum = cum
+                                        .saturating_add(nodes[c_idx].mean_line.saturating_mul(cw));
                                 } else {
                                     nw = nw.saturating_add(1);
                                     cum = cum.saturating_add(nodes[c_idx].line);
@@ -690,11 +796,8 @@ pub(crate) fn parse_synctex_document_with_options(
                             .copied()
                             .find(|&c| nodes[c].kind != b'f')
                             .unwrap_or(nodes[p_idx].children[0]);
-                        let (last_tag, last_line, last_col) = (
-                            nodes[last_c].tag,
-                            nodes[last_c].line,
-                            nodes[last_c].column,
-                        );
+                        let (last_tag, last_line, last_col) =
+                            (nodes[last_c].tag, nodes[last_c].line, nodes[last_c].column);
                         let (end_h, end_v) = (
                             nodes[p_idx].h_v.saturating_add(nodes[p_idx].width_v),
                             nodes[p_idx].v_v,
@@ -743,11 +846,16 @@ pub(crate) fn parse_synctex_document_with_options(
                         x_stack.pop();
                         flush_x_set(&mut x_stack, &mut friends, &mut nodes, in_form, p_idx);
                         if let Some(np_idx) = next_parent {
-                            nodes[np_idx].contain_box(box_v);
+                            nodes[np_idx].contain_box(box_v, fix_cross_file_tags);
                         }
                         parent = next_parent;
                         last_k = None;
                         last_g = None;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "mismatched SyncTeX hbox close",
+                        ));
                     }
                 }
                 b'v' | b'h' | b'r' => {
@@ -779,7 +887,7 @@ pub(crate) fn parse_synctex_document_with_options(
                             nodes[p_idx].children.push(idx);
                             if kind == b'h' {
                                 let bounds = nodes[idx].data_box();
-                                nodes[p_idx].contain_box(bounds);
+                                nodes[p_idx].contain_box(bounds, fix_cross_file_tags);
                             }
                         }
                         if kind == b'r' && !in_form {
@@ -810,7 +918,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         if let Some(p_idx) = parent {
                             nodes[p_idx].children.push(idx);
                             let bounds = nodes[idx].data_xob();
-                            nodes[p_idx].contain_box(bounds);
+                            nodes[p_idx].contain_box(bounds, fix_cross_file_tags);
                         }
                         if !in_form {
                             make_friend(&mut friends, &nodes, idx);
@@ -943,75 +1051,91 @@ pub(crate) fn parse_synctex_document_with_options(
         row.clear();
     }
 
+    if current_page.is_some()
+        || !form_stack.is_empty()
+        || ignored_form_depth > 0
+        || parent.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unclosed SyncTeX sheet, form, or box at EOF",
+        ));
+    }
+    if (saw_preamble || saw_postamble) && !(saw_postamble && saw_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated SyncTeX postamble",
+        ));
+    }
+
     for &(ref_idx, p_idx, ftag, fx, fy) in &ref_in_form {
-        let replacement = forms
-            .get(&ftag)
-            .and_then(|&form_root| nodes[form_root].children.first().copied())
-            .and_then(|target| {
-                let (dh, dv) = (fx, fy.saturating_sub(nodes[target].height));
-                let mut none_friends = None;
-                let mut none_hboxes = None;
-                clone_synctex_proxy_subtree(
-                    &mut nodes,
-                    target,
-                    Some(p_idx),
-                    0,
-                    dh,
-                    dv,
-                    0,
-                    &mut none_friends,
-                    &mut none_hboxes,
-                )
-            });
+        if let Some(op) = operation {
+            op.check()?;
+        }
+        let Some(&form_root) = forms.get(&ftag) else {
+            nodes[p_idx].children.retain(|&c| c != ref_idx);
+            continue;
+        };
+        let target = nodes[form_root].children.first().copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SyncTeX form reference targets empty form",
+            )
+        })?;
+        let (dh, dv) = (fx, fy.saturating_sub(nodes[target].height));
+        let mut none_friends = None;
+        let mut none_hboxes = None;
+        let proxy = clone_synctex_proxy_subtree(
+            &mut nodes,
+            target,
+            Some(p_idx),
+            0,
+            dh,
+            dv,
+            0,
+            &mut none_friends,
+            &mut none_hboxes,
+        )?;
         if let Some(pos) = nodes[p_idx].children.iter().position(|&c| c == ref_idx) {
-            if let Some(proxy) = replacement {
-                nodes[p_idx].children[pos] = proxy;
-            } else {
-                nodes[p_idx].children.remove(pos);
-            }
+            nodes[p_idx].children[pos] = proxy;
         }
     }
     for &(ref_idx, p_idx, page, sheet_idx, ftag, fx, fy) in &ref_in_sheet {
-            let replacement = forms
-            .get(&ftag)
-            .and_then(|&form_root| nodes[form_root].children.first().copied())
-            .and_then(|target| {
-                let (dh, dv) = (fx, fy.saturating_sub(nodes[target].height));
-                let mut reg = track_friends.then_some(&mut *friends);
-                let mut hboxes = sheet_idx.map(|s_idx| &mut sheet_list[s_idx].hboxes);
-                clone_synctex_proxy_subtree(
-                    &mut nodes,
-                    target,
-                    Some(p_idx),
-                    page,
-                    dh,
-                    dv,
-                    0,
-                    &mut reg,
-                    &mut hboxes,
-                )
-            });
+        if let Some(op) = operation {
+            op.check()?;
+        }
+        let Some(&form_root) = forms.get(&ftag) else {
+            nodes[p_idx].children.retain(|&c| c != ref_idx);
+            continue;
+        };
+        let target = nodes[form_root].children.first().copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SyncTeX form reference targets empty form",
+            )
+        })?;
+        let (dh, dv) = (fx, fy.saturating_sub(nodes[target].height));
+        let mut reg = track_friends.then_some(&mut *friends);
+        let mut hboxes = sheet_idx.map(|s_idx| &mut sheet_list[s_idx].hboxes);
+        let proxy = clone_synctex_proxy_subtree(
+            &mut nodes,
+            target,
+            Some(p_idx),
+            page,
+            dh,
+            dv,
+            0,
+            &mut reg,
+            &mut hboxes,
+        )?;
         if let Some(pos) = nodes[p_idx].children.iter().position(|&c| c == ref_idx) {
-            if let Some(proxy) = replacement {
-                nodes[p_idx].children[pos] = proxy;
-            } else {
-                nodes[p_idx].children.remove(pos);
-            }
+            nodes[p_idx].children[pos] = proxy;
         }
     }
 
-    if pre_unit <= 0 {
-        pre_unit = 8192;
-    }
-    if pre_magnification <= 0 {
-        pre_magnification = 1000;
-    }
     let base_unit = (pre_unit as f64) / 65781.76;
     let mag_factor = (pre_magnification as f64) / 1000.0;
-    let unit = post_magnification
-        .filter(|&m| m > 0.0)
-        .map_or(base_unit, |m| m * base_unit)
-        * mag_factor;
+    let unit = post_magnification.map_or(base_unit, |m| m * base_unit) * mag_factor;
     let x_off = post_x_offset.map_or((pre_x_offset as f64) * base_unit, |x| x / 65781.76);
     let y_off = post_y_offset.map_or((pre_y_offset as f64) * base_unit, |y| y / 65781.76);
     let bound = (1_500_000.0 / mag_factor) as i64;
@@ -1146,7 +1270,7 @@ fn forward_candidates_from_reader_with_page_hint_in(
         y_off,
         bound,
         ..
-    } = parse_synctex_document_with_options(reader, fix_readahead, None)?;
+    } = parse_synctex_document_with_options(reader, fix_readahead, None, None)?;
 
     let mut matching_tags = std::collections::HashSet::new();
     let mut input_tag = None::<u32>;
@@ -1241,7 +1365,11 @@ fn forward_candidates_from_reader_with_page_hint_in(
         while let Some(p_idx) = nodes[cursor].parent {
             cursor = p_idx;
             if matches!(nodes[cursor].kind, b'(' | b'h') {
-                if mean.saturating_sub(node_mean_line(nodes, cursor)).saturating_abs() > 1 {
+                if mean
+                    .saturating_sub(node_mean_line(nodes, cursor))
+                    .saturating_abs()
+                    > 1
+                {
                     return idx;
                 } else if nodes[cursor].width > bound
                     || nodes[cursor].height.saturating_add(nodes[cursor].depth) > bound
@@ -1378,9 +1506,7 @@ fn forward_candidates_from_reader_with_page_hint_in(
                                     * unit
                                     + y_off) as f32;
                                 let width = ((nodes[bv].width_v as f64) * unit) as f32;
-                                let height = ((nodes[bv]
-                                    .height_v
-                                    .saturating_add(nodes[bv].depth_v)
+                                let height = ((nodes[bv].height_v.saturating_add(nodes[bv].depth_v)
                                     as f64)
                                     * unit) as f32;
                                 if !forward_geometry_valid(p_num, h, v, width, height) {
@@ -1592,6 +1718,21 @@ pub(crate) fn forward_geometry_valid(page: u32, h: f32, v: f32, width: f32, heig
             .all(f32::is_finite)
 }
 
+pub(crate) fn validate_inverse_point(point: InversePoint) -> io::Result<()> {
+    if point.page == 0
+        || !point.x.is_finite()
+        || !point.y_from_top.is_finite()
+        || !point.page_height_pt.is_finite()
+        || point.page_height_pt <= 0.0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SyncTeX inverse query point",
+        ));
+    }
+    Ok(())
+}
+
 pub fn inverse_candidates(pdf: &Path, point: InversePoint) -> io::Result<Vec<SourceLocation>> {
     inverse_candidates_in(pdf, point, None)
 }
@@ -1601,8 +1742,9 @@ pub fn inverse_candidates_in(
     point: InversePoint,
     build_directory: Option<&Path>,
 ) -> io::Result<Vec<SourceLocation>> {
+    validate_inverse_point(point)?;
     let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory)?;
-    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page))?;
+    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page), None)?;
     let raw = inverse_candidates_in_doc(&parsed, point)?;
     Ok(crate::materialize_raw_candidates(
         raw,
@@ -1615,9 +1757,14 @@ pub(crate) fn inverse_raw_candidates_in(
     pdf: &Path,
     point: InversePoint,
     build_directory: Option<&Path>,
+    operation: Option<&Operation>,
 ) -> io::Result<Vec<RawInverseCandidate>> {
+    validate_inverse_point(point)?;
+    if let Some(op) = operation {
+        op.check()?;
+    }
     let reader = crate::open_synctex_in(pdf, build_directory)?;
-    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page))?;
+    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page), operation)?;
     inverse_candidates_in_doc(&parsed, point)
 }
 
@@ -1633,7 +1780,9 @@ pub fn inverse_candidates_from_reader_with_options(
     point: InversePoint,
     fix_cross_file_tags: bool,
 ) -> io::Result<Vec<SourceLocation>> {
-    let parsed = parse_synctex_document_with_options(reader, fix_cross_file_tags, Some(point.page))?;
+    validate_inverse_point(point)?;
+    let parsed =
+        parse_synctex_document_with_options(reader, fix_cross_file_tags, Some(point.page), None)?;
     let raw = inverse_candidates_in_doc(&parsed, point)?;
     Ok(crate::materialize_raw_candidates(raw, None, None))
 }
@@ -1642,13 +1791,26 @@ pub(crate) fn inverse_candidates_in_doc(
     parsed: &ParsedSynctex,
     point: InversePoint,
 ) -> io::Result<Vec<RawInverseCandidate>> {
+    validate_inverse_point(point)?;
     let Some(sheet) = parsed.sheet_list.iter().find(|s| s.page == point.page) else {
         return Ok(Vec::new());
     };
-    let hit_h =
-        i64::from(((point.x - parsed.x_off as f32) / (parsed.unit as f32)) as i32);
-    let hit_v =
-        i64::from(((point.y_from_top - parsed.y_off as f32) / (parsed.unit as f32)) as i32);
+    let raw_h = (f64::from(point.x) - parsed.x_off) / parsed.unit;
+    let raw_v = (f64::from(point.y_from_top) - parsed.y_off) / parsed.unit;
+    if !raw_h.is_finite()
+        || !raw_v.is_finite()
+        || raw_h < f64::from(i32::MIN)
+        || raw_h > f64::from(i32::MAX)
+        || raw_v < f64::from(i32::MIN)
+        || raw_v > f64::from(i32::MAX)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SyncTeX inverse query point out of scaled-point range",
+        ));
+    }
+    let hit_h = i64::from(raw_h as i32);
+    let hit_v = i64::from(raw_v as i32);
     let nodes = &parsed.nodes;
 
     let data_tag = |idx: usize| -> u32 {
@@ -1802,15 +1964,13 @@ pub(crate) fn inverse_candidates_in_doc(
                 let min_v = n.v.saturating_sub(n.height.saturating_abs());
                 let max_v = n.v.saturating_add(n.depth.saturating_abs());
                 let right_h = n.h.saturating_add(n.width.saturating_abs());
-                dist_to_box(n.h, n.h, min_v, max_v)
-                    .min(dist_to_box(right_h, right_h, min_v, max_v))
+                dist_to_box(n.h, n.h, min_v, max_v).min(dist_to_box(right_h, right_h, min_v, max_v))
             }
             b'k' => {
                 let (ph, _) = parent_hd(idx);
                 let min_v = n.v.saturating_sub(ph);
                 let other_h = n.h.saturating_sub(n.width);
-                dist_to_box(n.h, n.h, min_v, n.v)
-                    .min(dist_to_box(other_h, other_h, min_v, n.v))
+                dist_to_box(n.h, n.h, min_v, n.v).min(dist_to_box(other_h, other_h, min_v, n.v))
             }
             b'g' | b'$' | b'x' | b'b' => {
                 let (ph, _) = parent_hd(idx);
@@ -1950,7 +2110,7 @@ pub(crate) fn inverse_candidates_in_doc(
         best
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn get_closest_children_in_box_v2(
         nodes: &[ForwardNode],
         idx: usize,

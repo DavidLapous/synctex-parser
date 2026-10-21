@@ -71,9 +71,7 @@ impl SourceInfo {
                 cwd,
                 main: None,
                 inputs: Vec::new(),
-                warning: Some(
-                    "compiled source list unavailable: no SyncTeX sidecar".into(),
-                ),
+                warning: Some("compiled source list unavailable: no SyncTeX sidecar".into()),
             });
         };
         let pdf_dir = pdf
@@ -227,13 +225,15 @@ fn read_inputs_with_fallbacks(
                 match fs::canonicalize(&absolute) {
                     Ok(path) => path,
                     Err(_) => {
-                        let fallback = (!raw_path.is_absolute()).then(|| {
-                            fallback_dirs.iter().find_map(|dir| {
-                                normalize_absolute(raw_path, dir)
-                                    .ok()
-                                    .and_then(|cand| fs::canonicalize(cand).ok())
+                        let fallback = (!raw_path.is_absolute())
+                            .then(|| {
+                                fallback_dirs.iter().find_map(|dir| {
+                                    normalize_absolute(raw_path, dir)
+                                        .ok()
+                                        .and_then(|cand| fs::canonicalize(cand).ok())
+                                })
                             })
-                        }).flatten();
+                            .flatten();
                         if let Some(found) = fallback {
                             found
                         } else {
@@ -462,9 +462,7 @@ impl SourceSnapshot {
     }
 
     fn is_recorded(&self, path: &Path) -> bool {
-        self.files.contains_key(path)
-            || self.warnings.contains_key(path)
-            || path == self.main
+        self.files.contains_key(path) || self.warnings.contains_key(path) || path == self.main
     }
 
     pub fn normalize(&self, original: &Path) -> io::Result<PathBuf> {

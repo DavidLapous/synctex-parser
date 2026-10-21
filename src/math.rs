@@ -213,8 +213,7 @@ pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usi
                 }
             }
             _ => {
-                let next_special = source[at..]
-                    .as_bytes()
+                let next_special = source.as_bytes()[at..]
                     .iter()
                     .position(|b| matches!(*b, b'%' | b'\\'))
                     .map_or(source.len(), |pos| at + pos);
@@ -260,8 +259,7 @@ fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     let mut open: Option<(&str, usize)> = None;
     let mut i = 0;
     while i < source.len() {
-        let Some(rel) = source[i..]
-            .as_bytes()
+        let Some(rel) = source.as_bytes()[i..]
             .iter()
             .position(|b| matches!(*b, b'%' | b'$' | b'\\'))
         else {
@@ -381,8 +379,7 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
                 i = end;
             }
         } else {
-            let next_special = source[i..]
-                .as_bytes()
+            let next_special = source.as_bytes()[i..]
                 .iter()
                 .position(|b| matches!(*b, b'%' | b'\\'))
                 .map_or(source.len(), |pos| i + pos);
@@ -1050,10 +1047,7 @@ mod tests {
         let offset = context.find("Ωk").unwrap();
         assert_eq!(
             source_location(source, 6, 1..8, false, context, offset, None),
-            Some((
-                6,
-                source.lines().nth(5).unwrap().find("\\Omega_k").unwrap()
-            ))
+            Some((6, source.lines().nth(5).unwrap().find("\\Omega_k").unwrap()))
         );
     }
 
