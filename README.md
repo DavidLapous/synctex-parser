@@ -10,6 +10,13 @@ Diff with original [synctex](https://github.com/jlaurens/synctex).
 
 ## Quick Start
 
+Add `synctex-parser` to your crate (`cargo add synctex-parser`) or `Cargo.toml`:
+
+```toml
+[dependencies]
+synctex-parser = "0.1"
+```
+
 ```rust,no_run
 use std::path::Path;
 use synctex_parser::{InversePoint, Operation, SyncTeXCache, resolve_forward, resolve_inverse_with_cache};
