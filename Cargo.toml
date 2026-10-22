@@ -6,10 +6,14 @@ rust-version = "1.88"
 description = "Pure-Rust SyncTeX parser and forward/inverse query engine with LaTeX/Beamer heuristics"
 license = "MIT"
 repository = "https://github.com/DavidLapous/synctex-parser"
+documentation = "https://docs.rs/synctex-parser"
 readme = "README.md"
 keywords = ["synctex", "latex", "tex", "beamer", "pdf"]
 categories = ["parsing", "text-processing"]
 include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [dependencies]
 flate2 = "1.1.9"

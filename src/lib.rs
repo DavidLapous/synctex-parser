@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 mod math;
 mod parser;
 pub mod source_snapshot;
