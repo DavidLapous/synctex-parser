@@ -174,16 +174,63 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
     }
 }
 
-fn caption_argument(source: &str, mut at: usize) -> Option<(Range<usize>, usize)> {
-    at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
-    at = super::skip_source_space(source, at);
-    if source.as_bytes().get(at) == Some(&b'[') {
-        at = super::optional_argument_end(source, at)?;
+pub(super) fn caption_arguments(
+    source: &str,
+    name: &str,
+    mut at: usize,
+) -> Option<(Option<Range<usize>>, Range<usize>, usize)> {
+    match name {
+        "caption" | "subcaption" => {
+            at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
+            if let Some(opt_end) = super::optional_argument_end(source, at) {
+                at = opt_end;
+            }
+            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            Some((None, body, end))
+        }
+        "captionof" => {
+            at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
+            let (_, end) = group(source, super::skip_source_space(source, at))?;
+            at = end;
+            if let Some(opt_end) = super::optional_argument_end(source, at) {
+                at = opt_end;
+            }
+            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            Some((None, body, end))
+        }
+        "subcaptionbox" | "captionbox" => {
+            at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
+            if let Some(opt_end) = super::optional_argument_end(source, at) {
+                at = opt_end;
+            }
+            let (heading, mut at) = group(source, super::skip_source_space(source, at))?;
+            for _ in 0..2 {
+                if let Some(opt_end) = super::optional_argument_end(source, at) {
+                    at = opt_end;
+                }
+            }
+            let (contents, end) = group(source, super::skip_source_space(source, at))?;
+            Some((Some(heading), contents, end))
+        }
+        "subfloat" => {
+            let mut opts = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let opt_start = super::skip_source_space(source, at);
+                if let Some(opt_end) = super::optional_argument_end(source, opt_start) {
+                    opts.push(opt_start + 1..opt_end - 1);
+                    at = opt_end;
+                } else {
+                    break;
+                }
+            }
+            let (contents, end) = group(source, super::skip_source_space(source, at))?;
+            Some((opts.pop(), contents, end))
+        }
+        _ => None,
     }
-    group(source, super::skip_source_space(source, at))
 }
 
-/// Find a complete long caption argument owning this literal cursor byte.
+/// Find a complete printed caption or subcaption argument owning this literal cursor byte.
 pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
     if byte >= source.len() || !source.is_char_boundary(byte) {
         return None;
@@ -219,14 +266,18 @@ pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usi
                     if byte < at {
                         return None;
                     }
-                } else if name == "caption"
-                    && let Some((argument, _)) = caption_argument(source, at)
-                {
-                    if argument.contains(&byte) {
-                        at = argument.start;
-                        body = Some(argument);
+                } else if let Some((first, second, end)) = caption_arguments(source, name, at) {
+                    if let Some(first) = first.filter(|first| first.contains(&byte)) {
+                        at = first.start;
+                        body = Some(first.start..second.end);
+                    } else if second.contains(&byte) {
+                        at = second.start;
+                        body = Some(second);
                     } else {
-                        at = argument.end + 1;
+                        at = end;
+                        if byte < at {
+                            return None;
+                        }
                     }
                 }
             }
@@ -254,11 +305,14 @@ pub(super) fn math_environment(name: &str) -> bool {
             | "align"
             | "aligned"
             | "alignat"
+            | "alignedat"
             | "flalign"
             | "gather"
             | "gathered"
             | "multline"
             | "eqnarray"
+            | "xalignat"
+            | "xxalignat"
             | "matrix"
             | "pmatrix"
             | "bmatrix"
@@ -267,6 +321,8 @@ pub(super) fn math_environment(name: &str) -> bool {
             | "Vmatrix"
             | "smallmatrix"
             | "cases"
+            | "dcases"
+            | "rcases"
             | "split"
     )
 }
@@ -280,6 +336,7 @@ pub(super) fn in_region(source: &str, byte: usize) -> bool {
 
 fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
+    let mut hidden = super::nonprinting_source_spans(source).peekable();
     let mut open: Option<(&str, usize)> = None;
     let mut i = 0;
     while i < source.len() {
@@ -290,8 +347,19 @@ fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
             break;
         };
         i += rel;
-        if open.is_none() && i >= limit {
-            break;
+        if open.is_none() {
+            if i >= limit {
+                break;
+            }
+            while hidden.peek().is_some_and(|(_, range, _)| range.end <= i) {
+                hidden.next();
+            }
+            if let Some((start, range, _)) = hidden.peek()
+                && *start <= i
+            {
+                i = range.end;
+                continue;
+            }
         }
         let start = i;
         let ch = source.as_bytes()[i] as char;
@@ -353,6 +421,229 @@ fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     result
 }
 
+fn display_region_bounds(source: &str, range: &Range<usize>) -> Option<(usize, usize)> {
+    if source[..range.start].ends_with("\\(")
+        || (source[..range.start].ends_with('$') && !source[..range.start].ends_with("$$"))
+    {
+        return None;
+    }
+    let start = if source[..range.start].ends_with("\\[") || source[..range.start].ends_with("$$") {
+        range.start - 2
+    } else {
+        range.start
+    };
+    Some((start, range.end))
+}
+
+fn inner_halign_contains_line(
+    source: &str,
+    range: Range<usize>,
+    start_line: usize,
+    target: usize,
+) -> bool {
+    let mut open: Option<(&str, usize, usize)> = None;
+    let mut i = range.start;
+    let mut counted_to = range.start;
+    let mut counted_lines = start_line;
+    while i < range.end {
+        let Some(rel) = source.as_bytes()[i..range.end]
+            .iter()
+            .position(|b| matches!(*b, b'%' | b'\\'))
+        else {
+            break;
+        };
+        i += rel;
+        if source.as_bytes()[i] == b'%' {
+            i += source[i..range.end].find('\n').unwrap_or(range.end - i);
+            continue;
+        }
+        let (name, end) = command(source, i);
+        i = end;
+        if matches!(name, "begin" | "end")
+            && let Some((span, end)) = group(source, i).filter(|(_, e)| *e <= range.end)
+        {
+            let env = &source[span];
+            let base = env.trim_end_matches('*');
+            i = end;
+            let is_halign = matches!(
+                base,
+                "aligned"
+                    | "alignedat"
+                    | "gathered"
+                    | "cases"
+                    | "dcases"
+                    | "rcases"
+                    | "array"
+                    | "subarray"
+                    | "smallmatrix"
+                    | "matrix"
+                    | "pmatrix"
+                    | "bmatrix"
+                    | "Bmatrix"
+                    | "vmatrix"
+                    | "Vmatrix"
+                    | "tabular"
+            );
+            if name == "begin" && open.is_none() && is_halign {
+                let first = counted_lines
+                    + source[counted_to..end]
+                        .bytes()
+                        .filter(|c| *c == b'\n')
+                        .count();
+                counted_to = end;
+                counted_lines = first;
+                open = Some((env, 1, first));
+            } else if let Some((expected, ref mut depth, first)) = open
+                && env == expected
+            {
+                if name == "begin" {
+                    *depth += 1;
+                } else {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        let last = counted_lines
+                            + source[counted_to..end]
+                                .bytes()
+                                .filter(|c| *c == b'\n')
+                                .count();
+                        counted_to = end;
+                        counted_lines = last;
+                        open = None;
+                        if first < target && target <= last {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Multi-line display and environment math can report its closing delimiter line
+/// for every interior token. Restrict inverse refinement to the full math region.
+pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
+    let target = line.checked_sub(1)? as usize;
+    let mut counted_to = 0;
+    let mut counted_lines = 0;
+    for range in regions(source, source.len()) {
+        let Some((start, end)) = display_region_bounds(source, &range) else {
+            continue;
+        };
+        let first = counted_lines
+            + source[counted_to..start]
+                .bytes()
+                .filter(|c| *c == b'\n')
+                .count();
+        let last = first
+            + source[start..end]
+                .bytes()
+                .filter(|c| *c == b'\n')
+                .count();
+        counted_to = end;
+        counted_lines = last;
+        if (first..=last).contains(&target) {
+            if first == last {
+                return None;
+            }
+            let env = source[range.start..]
+                .strip_prefix("\\begin")
+                .and_then(|rest| group(rest, 0).map(|(span, _)| &rest[span]))
+                .map(|name| name.trim_end_matches('*'));
+            if env == Some("eqnarray") {
+                return None;
+            }
+            let closes_inner_env = target < last
+                && source
+                    .lines()
+                    .nth(target)
+                    .map(super::source_line_text)
+                    .and_then(|row| row.trim_start().strip_prefix("\\end"))
+                    .and_then(|rest| group(rest, 0).map(|(span, _)| math_environment(&rest[span])))
+                    .unwrap_or(false);
+            if target < last && !closes_inner_env {
+                return None;
+            }
+            return Some(first..last + 1);
+        }
+        if first > target {
+            return None;
+        }
+    }
+    None
+}
+
+/// Forward search inside multi-line display math maps lines without usable
+/// box records to the closing math line while preserving inner `\halign` rows.
+pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    let target = line.checked_sub(1)? as usize;
+    let mut counted_to = 0;
+    let mut counted_lines = 0;
+    for range in regions(source, source.len()) {
+        let Some((start, end)) = display_region_bounds(source, &range) else {
+            continue;
+        };
+        let first = counted_lines
+            + source[counted_to..start]
+                .bytes()
+                .filter(|c| *c == b'\n')
+                .count();
+        let last = first
+            + source[start..end]
+                .bytes()
+                .filter(|c| *c == b'\n')
+                .count();
+        counted_to = end;
+        counted_lines = last;
+        if (first..=last).contains(&target) {
+            if first == last {
+                return None;
+            }
+            if target == first {
+                let line_start = source[..start].rfind('\n').map_or(0, |pos| pos + 1);
+                if !source[line_start..start].trim().is_empty() {
+                    let col_idx = column.saturating_sub(1) as usize;
+                    let col_byte = source[line_start..]
+                        .char_indices()
+                        .nth(col_idx)
+                        .map_or(source.len() - line_start, |(idx, _)| idx);
+                    if line_start + col_byte < start {
+                        continue;
+                    }
+                }
+            }
+            let env = source[range.start..]
+                .strip_prefix("\\begin")
+                .and_then(|rest| group(rest, 0).map(|(span, _)| &rest[span]))
+                .map(|name| name.trim_end_matches('*'));
+            if env == Some("eqnarray") {
+                return (target == first).then_some((first + 1) as u32 + 1);
+            }
+            let collected = matches!(
+                env,
+                Some(
+                    "align"
+                        | "gather"
+                        | "multline"
+                        | "flalign"
+                        | "alignat"
+                        | "xalignat"
+                        | "xxalignat"
+                        | "split"
+                )
+            );
+            if !collected && inner_halign_contains_line(source, range, first, target) {
+                return None;
+            }
+            return Some(last as u32 + 1);
+        }
+        if first > target {
+            return None;
+        }
+    }
+    None
+}
+
 /// Captions are collected before expansion, so SyncTeX can report the closing
 /// line for every word. Restrict refinement to that complete literal argument.
 pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
@@ -379,16 +670,17 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
             i = end;
             if let Some((end, _)) = opaque_command_end(source, name, i) {
                 i = end;
-            } else if name == "caption"
-                && let Some((body, end)) = caption_argument(source, i)
+            } else if let Some((first_printed, second_printed, end)) =
+                caption_arguments(source, name, i)
             {
+                let start = first_printed.as_ref().unwrap_or(&second_printed).start;
                 let first = counted_lines
-                    + source[counted_to..body.start]
+                    + source[counted_to..start]
                         .bytes()
                         .filter(|c| *c == b'\n')
                         .count();
                 let last = first
-                    + source[body.start..end]
+                    + source[start..end]
                         .bytes()
                         .filter(|c| *c == b'\n')
                         .count();
@@ -996,17 +1288,51 @@ fn atoms_with_macros<'a>(
                         group(source, i).filter(|(_, e)| *e <= range.end)?;
                     let environment = &source[environment];
                     let base = environment.trim_end_matches('*');
-                    if matches!(base, "alignat" | "xalignat" | "xxalignat" | "subarray") {
-                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
-                            end = e;
-                        }
-                    } else if matches!(base, "array" | "tabular") {
-                        if let Some(opt_end) =
+                    if (matches!(
+                        base,
+                        "aligned" | "gathered" | "lgathered" | "rgathered" | "multlined"
+                    ) || (environment.ends_with('*')
+                        && matches!(
+                            base,
+                            "matrix"
+                                | "pmatrix"
+                                | "bmatrix"
+                                | "Bmatrix"
+                                | "vmatrix"
+                                | "Vmatrix"
+                                | "smallmatrix"
+                        )))
+                        && let Some(opt_end) =
                             super::optional_argument_end(source, end).filter(|e| *e <= range.end)
-                        {
+                    {
+                        let opt_start = super::skip_source_space(source, end) + 1;
+                        if matches!(
+                            source[opt_start..opt_end - 1].trim(),
+                            "t" | "b" | "c" | "l" | "r"
+                        ) {
                             end = opt_end;
                         }
-                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
+                    }
+                    if matches!(
+                        base,
+                        "alignat"
+                            | "alignedat"
+                            | "xalignat"
+                            | "xxalignat"
+                            | "subarray"
+                            | "array"
+                            | "tabular"
+                    ) {
+                        let after_opt = if matches!(base, "alignedat" | "array" | "tabular") {
+                            super::optional_argument_end(source, end)
+                                .filter(|e| *e <= range.end)
+                                .unwrap_or(end)
+                        } else {
+                            end
+                        };
+                        if let Some((_, e)) =
+                            group(source, after_opt).filter(|(_, e)| *e <= range.end)
+                        {
                             end = e;
                         }
                     } else if matches!(base, "tabular*" | "tabularx") {

@@ -644,7 +644,7 @@ pub fn resolve_forward_with_selector(
     } else {
         original_line.and_then(|text| ForwardWord::at(text, column))
     };
-    // Collected frame/tabularx/caption bodies use their closing compiler line.
+    // Collected frame/tabularx/caption/math bodies use their closing compiler line.
     // Keep the original source position for the page hint, and give Beamer priority.
     let view_line = source
         .as_deref()
@@ -652,6 +652,7 @@ pub fn resolve_forward_with_selector(
             frame_closing_line(source, line)
                 .or_else(|| tabularx_closing_line(source, line))
                 .or_else(|| original_line.and_then(|_| caption_closing_line(source, line, column)))
+                .or_else(|| math::math_closing_line(source, line, column))
         })
         .unwrap_or(line);
     let candidates = forward_candidates_in(
@@ -710,11 +711,17 @@ pub fn resolve_forward_with_selector(
 
 fn best_guess_forward_candidate(candidates: &[ForwardCandidate]) -> io::Result<ForwardCandidate> {
     // SyncTeX orders results by its nearest source anchor. Preserve that order,
-    // skipping only empty geometry; never claim a particular printed word.
+    // skipping zero-height pre-display boxes and empty geometry.
     candidates
         .iter()
         .find(|candidate| {
-            candidate.rect.right > candidate.rect.left || candidate.rect.bottom > candidate.rect.top
+            candidate.rect.right > candidate.rect.left && candidate.rect.bottom > candidate.rect.top
+        })
+        .or_else(|| {
+            candidates.iter().find(|candidate| {
+                candidate.rect.right > candidate.rect.left
+                    || candidate.rect.bottom > candidate.rect.top
+            })
         })
         .copied()
         .ok_or_else(|| {
@@ -3258,7 +3265,8 @@ fn source_word_location(
 ) -> Option<(u32, usize)> {
     let scope = math::caption_lines(source, line)
         .or_else(|| source_frame_range(source, line))
-        .or_else(|| source_tabularx_range(source, line));
+        .or_else(|| source_tabularx_range(source, line))
+        .or_else(|| math::math_lines(source, line));
     let within_scope = scope.is_some();
     let lines = scope.unwrap_or_else(|| {
         line.saturating_sub(radius.saturating_add(1)) as usize
@@ -3452,6 +3460,7 @@ fn source_graphics_location(
         .then(|| {
             source_frame_range(source, line)
                 .or_else(|| source_tabularx_range(source, line))
+                .or_else(|| math::caption_lines(source, line))
                 .filter(|range| line == range.end as u32)
         })
         .flatten();
@@ -3565,7 +3574,7 @@ fn source_graphics_location(
                 {
                     return None;
                 }
-                if let Some(macro_entry) = macros.get(cmd) {
+                if macros.contains_key(cmd) {
                     let mut arg_end = at;
                     while let Some(end) = optional_argument_end(source, arg_end)
                         .or_else(|| overlay_argument_end(source, arg_end))
@@ -3576,12 +3585,44 @@ fn source_graphics_location(
                     if matched
                         .iter()
                         .any(|(full, _, _, _)| full.start < arg_end && full.end > at)
-                        || macro_entry.and_then(|def| def.body).is_none_or(|body| {
-                            body.contains("include")
-                                || macros.keys().any(|k| has_control_word(body, k))
-                        })
                     {
                         return None;
+                    }
+                    let mut stack = vec![cmd];
+                    let mut seen = Vec::new();
+                    while let Some(name) = stack.pop() {
+                        if seen.contains(&name) {
+                            continue;
+                        }
+                        seen.push(name);
+                        let Some(body) = macros.get(name).and_then(|e| e.and_then(|d| d.body))
+                        else {
+                            return None;
+                        };
+                        if body.contains("include")
+                            || body.contains("lrbox")
+                            || [
+                                "csname",
+                                "savebox",
+                                "sbox",
+                                "setbox",
+                                "usebox",
+                                "phantom",
+                                "hphantom",
+                                "vphantom",
+                                "multiput",
+                                "foreach",
+                            ]
+                            .iter()
+                            .any(|w| has_control_word(body, w))
+                        {
+                            return None;
+                        }
+                        for &k in macros.keys() {
+                            if has_control_word(body, k) {
+                                stack.push(k);
+                            }
+                        }
                     }
                 }
             }
@@ -3617,10 +3658,23 @@ fn nonprinting_source_spans(
     ),
 > + '_ {
     let mut at = 0;
+    let mut pending_opt_after = None;
     std::iter::from_fn(move || {
         loop {
             if at >= source.len() {
                 return None;
+            }
+            if pending_opt_after == Some(at) {
+                pending_opt_after = None;
+                let opt_start = skip_source_space(source, at);
+                let mut opt_end = at;
+                while let Some(next) = optional_argument_end(source, opt_end) {
+                    opt_end = next;
+                }
+                if opt_end > opt_start {
+                    at = opt_end;
+                    return Some((opt_start, opt_start..opt_end, None));
+                }
             }
             if source.as_bytes()[at] == b'%' {
                 at += source[at..].find('\n').unwrap_or(source.len() - at);
@@ -3738,6 +3792,22 @@ fn nonprinting_source_spans(
                         at = end;
                     }
                     return Some((start, start..at, None));
+                } else if let Some((heading, contents, full_end)) =
+                    math::caption_arguments(source, command, end)
+                {
+                    let first_visible = heading.as_ref().unwrap_or(&contents);
+                    let prefix_start = skip_source_space(source, at);
+                    let prefix_end = first_visible.start.saturating_sub(1);
+                    if let Some(heading) = heading
+                        && matches!(command, "subcaptionbox" | "captionbox")
+                        && heading.end + 1 < full_end
+                    {
+                        pending_opt_after = Some(heading.end + 1);
+                    }
+                    if prefix_start < prefix_end {
+                        at = prefix_end;
+                        return Some((prefix_start, prefix_start..prefix_end, None));
+                    }
                 } else if matches!(
                     command,
                     "label"
@@ -3819,10 +3889,13 @@ fn nonprinting_source_spans(
                     return Some((start, end..overlay_end, None));
                 }
             } else {
-                at += source.as_bytes()[at + 1..]
+                let limit = pending_opt_after
+                    .filter(|&p| p > at)
+                    .unwrap_or(source.len());
+                at += source.as_bytes()[at + 1..limit]
                     .iter()
                     .position(|&b| matches!(b, b'%' | b'<' | b'\\'))
-                    .map_or(source.len() - at, |pos| pos + 1);
+                    .map_or(limit - at, |pos| pos + 1);
             }
         }
     })

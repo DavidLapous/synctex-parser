@@ -3855,4 +3855,441 @@ fn math_kern_and_depth_and_prose_collision_guards() {
     );
 }
 
+#[test]
+fn math_environments_and_captions_forward_and_inverse_sync() {
+    // 1. Multi-line align / gather / multline / alignat / split / pmatrix / dcases inverse sync
+    //    when SyncTeX reports the closing \end{...} or \] line.
+    let math_source = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{amsmath,mathtools}\n",
+        "\\begin{document}\n",
+        "\\begin{align}\n",
+        "  \\alpha_1 + \\beta_1 &= \\gamma_1 \\\\\n",
+        "  \\delta_2 + \\epsilon_2 &= \\zeta_2\n",
+        "\\end{align}\n",
+        "\\begin{gather*}\n",
+        "  \\eta_1 + \\theta_1 \\\\\n",
+        "  \\iota_2 + \\kappa_2\n",
+        "\\end{gather*}\n",
+        "\\begin{multline}\n",
+        "  \\lambda_1 + \\mu_1 \\\\\n",
+        "  = \\nu_2 + \\xi_2\n",
+        "\\end{multline}\n",
+        "\\begin{equation}\n",
+        "  \\begin{split}\n",
+        "    \\pi_1 &= \\rho_1 \\\\\n",
+        "    \\sigma_2 &= \\tau_2\n",
+        "  \\end{split}\n",
+        "\\end{equation}\n",
+        "\\[\n",
+        "  \\begin{aligned}[t]\n",
+        "    \\upsilon_1 &= \\phi_1 \\\\\n",
+        "    \\chi_2 &= \\psi_2\n",
+        "  \\end{aligned}\n",
+        "\\]\n",
+        "\\begin{equation*}\n",
+        "  M = \\begin{pmatrix*}[r]\n",
+        "    a_{11} & a_{12} \\\\\n",
+        "    a_{21} & a_{22}\n",
+        "  \\end{pmatrix*} + \\begin{dcases}\n",
+        "    b_1 & x > 0 \\\\\n",
+        "    b_2 & x \\le 0\n",
+        "  \\end{dcases}\n",
+        "\\end{equation*}\n",
+        "\\end{document}\n",
+    );
+
+    // align closing line is 7; line 5 has \alpha_1, line 6 has \zeta_2
+    let align_ctx = "\u{03b1}1 + \u{03b2}1 = \u{03b3}1";
+    assert_eq!(
+        source_word_location(math_source, 7, align_ctx, 0, 0),
+        Some((5, math_source.lines().nth(4).unwrap().find("\\alpha_1").unwrap()))
+    );
+    let align_ctx2 = "\u{03b4}2 + \u{03b5}2 = \u{03b6}2";
+    assert_eq!(
+        source_word_location(
+            math_source,
+            7,
+            align_ctx2,
+            align_ctx2.find("\u{03b6}2").unwrap(),
+            0
+        ),
+        Some((6, math_source.lines().nth(5).unwrap().find("\\zeta_2").unwrap()))
+    );
+
+    // gather* closing line is 11; line 9 has \eta_1, line 10 has \kappa_2
+    let gather_ctx = "\u{03b7}1 + \u{03b8}1";
+    assert_eq!(
+        source_word_location(math_source, 11, gather_ctx, 0, 0),
+        Some((9, math_source.lines().nth(8).unwrap().find("\\eta_1").unwrap()))
+    );
+
+    // multline closing line is 15; line 13 has \lambda_1, line 14 has \xi_2
+    let multline_ctx = "= \u{03bd}2 + \u{03be}2";
+    assert_eq!(
+        source_word_location(
+            math_source,
+            15,
+            multline_ctx,
+            multline_ctx.find("\u{03be}2").unwrap(),
+            0
+        ),
+        Some((14, math_source.lines().nth(13).unwrap().find("\\xi_2").unwrap()))
+    );
+
+    // equation + split: SyncTeX reports line 20 (\end{split}) or 21 (\end{equation})
+    let split_ctx = "\u{03c0}1 = \u{03c1}1";
+    for closing in [20, 21] {
+        assert_eq!(
+            source_word_location(math_source, closing, split_ctx, 0, 0),
+            Some((18, math_source.lines().nth(17).unwrap().find("\\pi_1").unwrap()))
+        );
+    }
+
+    // \[ + aligned[t]: SyncTeX reports line 26 (\end{aligned}) or 27 (\])
+    let aligned_ctx = "\u{03c7}2 = \u{03c8}2";
+    for closing in [26, 27] {
+        assert_eq!(
+            source_word_location(
+                math_source,
+                closing,
+                aligned_ctx,
+                aligned_ctx.find("\u{03c8}2").unwrap(),
+                0
+            ),
+            Some((25, math_source.lines().nth(24).unwrap().find("\\psi_2").unwrap()))
+        );
+    }
+
+    // equation* + pmatrix*[r] + dcases: SyncTeX reports line 32 (\end{pmatrix*}), 35 (\end{dcases}), or 36 (\end{equation*})
+    let matrix_ctx = "a21 a22";
+    for closing in [32, 36] {
+        assert_eq!(
+            source_word_location(
+                math_source,
+                closing,
+                matrix_ctx,
+                matrix_ctx.find("a22").unwrap(),
+                0
+            ),
+            Some((31, math_source.lines().nth(30).unwrap().find("a_{22}").unwrap()))
+        );
+    }
+    let dcases_ctx = "b2 x \u{2264} 0";
+    for closing in [35, 36] {
+        assert_eq!(
+            source_word_location(math_source, closing, dcases_ctx, 0, 0),
+            Some((34, math_source.lines().nth(33).unwrap().find("b_2").unwrap()))
+        );
+    }
+
+    // 2. Caption and subcaption variants: prose refinement, nonprinting argument masking,
+    //    and graphics refinement across multi-line \caption, \subcaption, \captionof,
+    //    \subcaptionbox, \captionbox, and \subfloat.
+    let caption_source = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\begin{figure}\n",
+        "  \\caption[AlphaWord beta]{\n",
+        "    AlphaWord gamma\n",
+        "    delta $\\omega_1 + \\omega_2$\n",
+        "  }\n",
+        "  \\captionof{figure}[GammaWord delta]{\n",
+        "    figure epsilon\n",
+        "    GammaWord zeta\n",
+        "  }\n",
+        "  \\subcaptionbox[EtaWord theta]{\n",
+        "    EtaWord iota\\label{sub:first}\n",
+        "  }[0.45\\textwidth][c]{\n",
+        "    \\includegraphics[width=2cm]{figs/sub_one.pdf}\n",
+        "  }\n",
+        "  \\subfloat[KappaWord lambda][\n",
+        "    KappaWord mu\n",
+        "  ]{\n",
+        "    \\includegraphics[width=2cm]{figs/sub_two.pdf}\n",
+        "  }\n",
+        "\\end{figure}\n",
+        "\\end{document}\n",
+    );
+
+    // \caption[AlphaWord beta]{...} closes on line 7:
+    // "AlphaWord" in the visible caption must resolve to line 5, not the [short] argument on line 4.
+    let cap_ctx = "Figure 1: AlphaWord gamma delta \u{03c9}1 + \u{03c9}2";
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            7,
+            cap_ctx,
+            cap_ctx.find("AlphaWord").unwrap(),
+            0
+        ),
+        Some((5, caption_source.lines().nth(4).unwrap().find("AlphaWord").unwrap()))
+    );
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            7,
+            cap_ctx,
+            cap_ctx.find("\u{03c9}2").unwrap(),
+            0
+        ),
+        Some((6, caption_source.lines().nth(5).unwrap().find("\\omega_2").unwrap()))
+    );
+
+    // \captionof{figure}[GammaWord delta]{...} closes on line 11:
+    // Both {figure} and [GammaWord delta] on line 8 are masked; "figure" resolves to line 9
+    // and "GammaWord" resolves to line 10.
+    let capof_ctx = "Figure 2: figure epsilon GammaWord zeta";
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            11,
+            capof_ctx,
+            capof_ctx.find("figure").unwrap(),
+            0
+        ),
+        Some((9, caption_source.lines().nth(8).unwrap().find("figure").unwrap()))
+    );
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            11,
+            capof_ctx,
+            capof_ctx.find("GammaWord").unwrap(),
+            0
+        ),
+        Some((10, caption_source.lines().nth(9).unwrap().find("GammaWord").unwrap()))
+    );
+
+    // \subcaptionbox closes on line 16:
+    // [EtaWord theta] on line 12 and [0.45\textwidth][c] on line 14 are masked;
+    // "EtaWord" resolves to line 13, and graphics refinement on closing line 16 resolves to line 15.
+    let subbox_ctx = "(a) EtaWord iota";
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            16,
+            subbox_ctx,
+            subbox_ctx.find("EtaWord").unwrap(),
+            0
+        ),
+        Some((13, caption_source.lines().nth(12).unwrap().find("EtaWord").unwrap()))
+    );
+    assert_eq!(
+        source_graphics_location(caption_source, 16, 0, 1, true),
+        Some((
+            15,
+            caption_source
+                .lines()
+                .nth(14)
+                .unwrap()
+                .find("figs/sub_one.pdf")
+                .unwrap()
+        ))
+    );
+
+    // \subfloat[KappaWord lambda][KappaWord mu]{...} closes on line 21:
+    // First bracket [KappaWord lambda] on line 17 is masked list-entry; second bracket on line 18 is visible heading;
+    // graphics refinement on closing line 21 resolves to line 20.
+    let subfloat_ctx = "(b) KappaWord mu";
+    assert_eq!(
+        source_word_location(
+            caption_source,
+            21,
+            subfloat_ctx,
+            subfloat_ctx.find("KappaWord").unwrap(),
+            0
+        ),
+        Some((18, caption_source.lines().nth(17).unwrap().find("KappaWord").unwrap()))
+    );
+    assert_eq!(
+        source_graphics_location(caption_source, 21, 0, 1, true),
+        Some((
+            20,
+            caption_source
+                .lines()
+                .nth(19)
+                .unwrap()
+                .find("figs/sub_two.pdf")
+                .unwrap()
+        ))
+    );
+
+    // 3. Forward sync fallback to closing line for multi-line align and \subcaptionbox,
+    //    and preference for positive-height formula boxes over zero-height pre-display hboxes.
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let fwd_tex = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{amsmath,subcaption}\n",
+        "\\begin{document}\n",
+        "\\begin{align}\n",
+        "  a &= b \\\\\n",
+        "  c &= d\n",
+        "\\end{align}\n",
+        "\\subcaptionbox{Heading\n",
+        "  text}[0.4\\textwidth]{\n",
+        "  Body\n",
+        "}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&tex, fwd_tex).unwrap();
+    // Line 7 (\end{align}) has a zero-height pre-display hbox at y=100pt (h=0, d=0)
+    // followed by the real display formula hbox at y=130pt (h=25pt, d=5pt).
+    // Line 11 (closing '}' of \subcaptionbox) has the subcaptionbox hbox at y=220pt (h=40pt, d=0pt).
+    let synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{tex}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:65536\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,12:0,792:612,792,0\n",
+            "(1,7:72,100:200,0,0\n",
+            ")\n",
+            "(1,7:120,130:180,25,5\n",
+            "x1,7:150,125\n",
+            ")\n",
+            "(1,11:72,220:160,40,0\n",
+            "x1,11:100,210\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "Postamble:\n",
+            "Count:8\n",
+        ),
+        tex = tex.display()
+    );
+    fs::write(pdf.with_extension("synctex"), synctex).unwrap();
+
+    // Forward sync from lines 4..=7 (inside align) falls back to closing line 7 and picks the positive-height box
+    // over the zero-height pre-display hbox at y=100.
+    let bp = 72.0 / 72.27;
+    for line in [4, 5, 6, 7] {
+        let hit = resolve_forward(&pdf, &tex, line, 1).unwrap();
+        assert!(
+            (hit.v - 135.0 * bp).abs() < 1e-2,
+            "unexpected v {} for line {line}",
+            hit.v
+        );
+        assert!((hit.height - 30.0 * bp).abs() < 1e-2);
+    }
+
+    // Forward sync from inside \subcaptionbox heading/body (lines 8..=10) falls back to closing line 11.
+    for (line, col) in [(8, 16), (9, 3), (10, 3), (11, 1)] {
+        let hit = resolve_forward(&pdf, &tex, line, col).unwrap();
+        assert!((hit.v - 220.0 * bp).abs() < 1e-2);
+        assert!((hit.height - 40.0 * bp).abs() < 1e-2);
+    }
+
+    // 4. Leading bracketed math in environments without optional args is preserved.
+    let bracket_eq = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\begin{equation}\n",
+        "  [x] + [x]\n",
+        "\\end{equation}\n",
+        "\\end{document}\n",
+    );
+    let bracket_row = bracket_eq.lines().nth(3).unwrap();
+    assert_eq!(
+        source_word_location(bracket_eq, 5, "[x] + [x]", 1, 0),
+        Some((4, bracket_row.find('x').unwrap()))
+    );
+    assert_eq!(
+        source_word_location(bracket_eq, 5, "[x] + [x]", 7, 0),
+        Some((4, bracket_row.rfind('x').unwrap()))
+    );
+
+    // 5. Row-specific inverse anchors in eqnarray and aligned inside equation
+    //    preserve row proximity instead of flattening to whole-display scope.
+    let row_specific = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{amsmath}\n",
+        "\\begin{document}\n",
+        "\\begin{equation}\n",
+        "  \\begin{aligned}\n",
+        "    x &= y \\\\\n",
+        "    z &= w \\\\\n",
+        "    x &= y\n",
+        "  \\end{aligned}\n",
+        "\\end{equation}\n",
+        "\\begin{eqnarray}\n",
+        "  u &=& v \\\\\n",
+        "  p &=& q \\\\\n",
+        "  u &=& v\n",
+        "\\end{eqnarray}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_word_location(row_specific, 6, "x = y", 0, 2),
+        Some((6, row_specific.lines().nth(5).unwrap().find('x').unwrap()))
+    );
+    assert_eq!(
+        source_word_location(row_specific, 12, "u = v", 0, 2),
+        Some((12, row_specific.lines().nth(11).unwrap().find('u').unwrap()))
+    );
+
+    // 6. Prose before display math on the same line does not jump into the display on forward search.
+    let prose_display = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "Intro text \\[\n",
+        "  a = b\n",
+        "\\]\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(prose_display, 3, 1), None);
+    assert_eq!(math::math_closing_line(prose_display, 3, 12), Some(5));
+
+    // 7. Transitive safe user macros inside a Beamer frame do not block graphics refinement,
+    //    whereas a macro that transitively expands to \includegraphics still abstains.
+    let frame_macro_gfx = concat!(
+        "\\documentclass{beamer}\n",
+        "\\newcommand{\\basefield}{\\Bbbk}\n",
+        "\\newcommand{\\indmod}[1]{\\basefield_{#1}}\n",
+        "\\begin{document}\n",
+        "\\begin{frame}{Sample Title}\n",
+        "  $\\indmod{a}$\n",
+        "  \\includegraphics[height=.5\\textheight]{figs/sample_grid.png}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_graphics_location(frame_macro_gfx, 8, 0, 1, true),
+        Some((
+            7,
+            frame_macro_gfx
+                .lines()
+                .nth(6)
+                .unwrap()
+                .find("figs/sample_grid.png")
+                .unwrap()
+        ))
+    );
+    let unsafe_transitive_gfx = concat!(
+        "\\documentclass{beamer}\n",
+        "\\newcommand{\\innerpic}{\\includegraphics{figs/hidden.png}}\n",
+        "\\newcommand{\\outerpic}{\\innerpic}\n",
+        "\\begin{document}\n",
+        "\\begin{frame}{Sample Title}\n",
+        "  \\outerpic\n",
+        "  \\includegraphics{figs/visible.png}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_graphics_location(unsafe_transitive_gfx, 8, 0, 1, true),
+        None
+    );
+}
+
+
 
