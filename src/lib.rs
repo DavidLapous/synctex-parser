@@ -3194,15 +3194,20 @@ fn ordinary_word_source_start(
     if pdf_word.len() < 2 || !pdf_word.bytes().all(|ch| ch.is_ascii_alphabetic()) {
         return Some(byte);
     }
-    source
-        .lines()
-        .nth(line as usize - 1)
-        .and_then(|text| {
-            source_words(source_line_text(text))
-                .into_iter()
-                .find(|(start, end, _)| *start <= byte && byte < *end)
-        })
-        .and_then(|(start, _, word)| (word == pdf_word).then_some(start))
+    if let Some((start, _, word)) = source.lines().nth(line as usize - 1).and_then(|text| {
+        source_words(source_line_text(text))
+            .into_iter()
+            .find(|(start, end, _)| *start <= byte && byte < *end)
+    }) && word == pdf_word
+    {
+        return Some(start);
+    }
+    let line_start: usize = source
+        .split_inclusive('\n')
+        .take(line as usize - 1)
+        .map(str::len)
+        .sum();
+    math::in_region(source, line_start + byte).then_some(byte)
 }
 
 /// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
@@ -3374,22 +3379,16 @@ fn defined_macro_conflict(
                 | "renewcommand"
                 | "providecommand"
                 | "DeclareRobustCommand"
+                | "DeclareMathOperator"
                 | "NewDocumentCommand"
                 | "RenewDocumentCommand"
                 | "ProvideDocumentCommand"
                 | "DeclareDocumentCommand"
         ) {
-            at = skip_source_space(source, at);
-            let name = if let Some((grp, next)) = math::group(source, at) {
-                at = next;
-                source[grp].trim().strip_prefix('\\').unwrap_or("")
-            } else if source.as_bytes().get(at) == Some(&b'\\') {
-                let (name, next) = math::command(source, at);
-                at = next;
-                name
-            } else {
+            let Some((name, next)) = math::macro_target_name(source, at) else {
                 continue;
             };
+            at = next;
             while let Some(opt_end) = optional_argument_end(source, at) {
                 at = opt_end;
             }
@@ -3412,12 +3411,7 @@ fn defined_macro_conflict(
     }
     let matching_macros: Vec<&str> = macros
         .into_iter()
-        .filter_map(|(name, body)| {
-            source_words(body)
-                .into_iter()
-                .any(|(_, _, word)| word == target_word)
-                .then_some(name)
-        })
+        .filter_map(|(name, body)| macro_body_has_word(body, target_word).then_some(name))
         .collect();
     if matching_macros.is_empty() {
         return false;
@@ -3434,10 +3428,67 @@ fn defined_macro_conflict(
                 if !cmd_name.is_empty()
                     && !hidden.iter().any(|range| range.contains(&abs))
                     && matching_macros.contains(&cmd_name)
+                    && !math::resolves_macro_at(source, abs, cmd_name)
                 {
                     return true;
                 }
                 offset = next.max(slash + 1);
+            }
+        }
+        line_start += raw_row.len();
+    }
+    false
+}
+
+fn macro_body_has_word(body: &str, target_word: &str) -> bool {
+    if body.contains("^^") {
+        return true;
+    }
+    let hidden: Vec<_> = nonprinting_source_spans(body)
+        .map(|(_, range)| range)
+        .collect();
+    let mut line_start = 0usize;
+    for raw_row in body.split_inclusive('\n') {
+        let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
+        for (byte, _, word) in source_words(text) {
+            let is_nonprinting_cmd = byte > 0
+                && text.as_bytes()[byte - 1] == b'\\'
+                && matches!(
+                    word.as_str(),
+                    "textcolor"
+                        | "color"
+                        | "textbf"
+                        | "textit"
+                        | "texttt"
+                        | "textrm"
+                        | "textsf"
+                        | "textsc"
+                        | "emph"
+                        | "underline"
+                        | "text"
+                        | "mbox"
+                        | "hbox"
+                        | "mathrm"
+                        | "mathbf"
+                        | "mathit"
+                        | "mathsf"
+                        | "mathtt"
+                        | "mathcal"
+                        | "mathbb"
+                        | "mathfrak"
+                        | "mathscr"
+                        | "boldsymbol"
+                        | "bm"
+                        | "operatorname"
+                );
+            if (byte == 0 || text.as_bytes()[byte - 1] != b'#')
+                && !is_nonprinting_cmd
+                && !hidden
+                    .iter()
+                    .any(|range| range.contains(&(line_start + byte)))
+                && word == target_word
+            {
+                return true;
             }
         }
         line_start += raw_row.len();
@@ -3585,6 +3636,7 @@ fn nonprinting_source_spans(
                         | "renewcommand"
                         | "providecommand"
                         | "DeclareRobustCommand"
+                        | "DeclareMathOperator"
                         | "NewDocumentCommand"
                         | "RenewDocumentCommand"
                         | "ProvideDocumentCommand"
@@ -3661,6 +3713,8 @@ fn nonprinting_source_spans(
                         | "footcite"
                         | "nocite"
                         | "href"
+                        | "textcolor"
+                        | "color"
                         | "includegraphics"
                         | "includesvg"
                         | "input"
@@ -3677,7 +3731,10 @@ fn nonprinting_source_spans(
                         at = end;
                         return Some((
                             start,
-                            if matches!(command, "includegraphics" | "includesvg") {
+                            if matches!(
+                                command,
+                                "includegraphics" | "includesvg" | "textcolor" | "color"
+                            ) {
                                 start..end
                             } else {
                                 body

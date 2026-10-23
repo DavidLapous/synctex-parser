@@ -3067,3 +3067,210 @@ fn protruding_child_box_expands_both_sides_of_parent_visible_bounds() {
     assert!(!hits.is_empty());
     assert_eq!(hits[0].line, 1);
 }
+
+#[test]
+fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
+    let source = concat!(
+        "\\DeclareMathOperator{\\SampleOp}{SampleOp}\n",
+        "\\newcommand{\\samplepair}[2]{\\langle #1, #2 \\rangle}\n",
+        "\\newcommand{\\red}[1]{\\textcolor{red}{#1}}\n",
+        "\\begin{frame}{Sample Title}\n",
+        "The \\red{highlighted} color is red.\n",
+        "$\\SampleOp(x) + \\samplepair{alpha}{beta}$\n",
+        "\\end{frame}\n",
+    );
+    let closing_line = 7;
+
+    let color_context = "The highlighted color is red.";
+    let red_offset = color_context.rfind("red").unwrap();
+    assert_eq!(
+        source_word_location(source, closing_line, color_context, red_offset, 2),
+        Some((5, "The \\red{highlighted} color is ".len()))
+    );
+
+    let math_context = "SampleOp(x) + \u{27e8}alpha, beta\u{27e9}";
+    let op_offset = math_context.find("SampleOp").unwrap();
+    assert_eq!(
+        source_word_location(source, closing_line, math_context, op_offset, 2),
+        Some((6, 1))
+    );
+    let arg_offset = math_context.find("alpha").unwrap();
+    assert_eq!(
+        source_word_location(source, closing_line, math_context, arg_offset, 2),
+        Some((6, "$\\SampleOp(x) + \\samplepair{".len()))
+    );
+
+    let coloneqq_source = concat!(
+        "\\begin{frame}{Sample Title}\n",
+        "$a \\Coloneqq b$\n",
+        "$a \\coloneqq b$\n",
+        "\\end{frame}\n",
+    );
+    assert_eq!(
+        source_word_location(coloneqq_source, 4, "a ::= b", 0, 2),
+        Some((2, 1))
+    );
+    assert_eq!(
+        source_word_location(coloneqq_source, 4, "a := b", 0, 2),
+        Some((3, 1))
+    );
+
+    let nested_source = concat!(
+        "\\newcommand{\\id}[1]{#1}\n",
+        "\\newcommand{\\wrap}[1]{\\id{#1}}\n",
+        "\\begin{frame}{Sample Title}\n",
+        "$\\wrap{alpha} + beta$\n",
+        "\\end{frame}\n",
+    );
+    assert_eq!(
+        source_word_location(nested_source, 5, "alpha + beta", 0, 2),
+        Some((4, "$\\wrap{".len()))
+    );
+
+    // Negative cases: unsafe or ambiguous macro/math forms must not guess.
+    for (bad_source, bad_line, bad_context, bad_word) in [
+        // \def overriding \newcommand in preamble must poison the macro.
+        (
+            concat!(
+                "\\newcommand{\\foo}{alpha}\n",
+                "\\def\\foo{beta}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$\\foo$\n",
+                "\\end{frame}\n",
+            ),
+            5,
+            "alpha",
+            "alpha",
+        ),
+        // \let overriding \newcommand in preamble must poison the macro.
+        (
+            concat!(
+                "\\newcommand{\\foo}{alpha}\n",
+                "\\let\\foo\\relax\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$\\foo$\n",
+                "\\end{frame}\n",
+            ),
+            5,
+            "alpha",
+            "alpha",
+        ),
+        // Body-scoped \renewcommand must poison the macro.
+        (
+            concat!(
+                "\\newcommand{\\foo}{alpha}\n",
+                "\\begin{document}\n",
+                "\\renewcommand{\\foo}{beta}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$\\foo$\n",
+                "\\end{frame}\n",
+                "\\end{document}\n",
+            ),
+            6,
+            "alpha",
+            "alpha",
+        ),
+        // \providecommand must not override unknown prior definition.
+        (
+            concat!(
+                "\\providecommand{\\foo}{alpha}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$\\foo$\n",
+                "\\end{frame}\n",
+            ),
+            4,
+            "alpha",
+            "alpha",
+        ),
+        // Nested macro passing a non-forwarded argument must not attribute to preamble.
+        (
+            concat!(
+                "\\newcommand{\\id}[1]{#1}\n",
+                "\\newcommand{\\wrap}[1]{\\id{a}}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$\\wrap{a} + b$\n",
+                "\\end{frame}\n",
+            ),
+            5,
+            "a + b",
+            "a",
+        ),
+        // \xrightarrow[sub]{sup} reorders tokens and must refuse attribution.
+        (
+            concat!(
+                "\\begin{frame}{Sample Title}\n",
+                "$A \\xrightarrow[sub]{sup} B$\n",
+                "\\end{frame}\n",
+            ),
+            3,
+            "A sup sub \u{2192} B",
+            "sup",
+        ),
+        // \coloneq glyph depends on package/font and must be treated as opaque.
+        (
+            concat!(
+                "\\begin{frame}{Sample Title}\n",
+                "$a \\coloneq b$\n",
+                "\\end{frame}\n",
+            ),
+            3,
+            "a := b",
+            "a",
+        ),
+        // Subscript/superscript reordering across macro boundary must refuse attribution.
+        (
+            concat!(
+                "\\newcommand{\\subi}{_i}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "$x\\subi^2$\n",
+                "\\end{frame}\n",
+            ),
+            4,
+            "x2i",
+            "x",
+        ),
+        // ^^ hex notation inside macro body must be treated as opaque.
+        (
+            concat!(
+                "\\newcommand{\\hexword}{^^61bc}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "\\hexword{} and abc\n",
+                "\\end{frame}\n",
+            ),
+            4,
+            "abc and abc",
+            "abc",
+        ),
+        // Self-printing command (\TeX) in macro body must conflict with prose "TeX".
+        (
+            concat!(
+                "\\newcommand{\\logo}{\\TeX}\n",
+                "\\begin{frame}{Sample Title}\n",
+                "\\logo{} and TeX\n",
+                "\\end{frame}\n",
+            ),
+            4,
+            "TeX and TeX",
+            "TeX",
+        ),
+        // Reordered math region containing the same word ("abc" in \sqrt[abc]{x})
+        // must prevent attributing "abc" to another math region "$abc$".
+        (
+            concat!(
+                "\\begin{frame}{Sample Title}\n",
+                "$\\sqrt[abc]{x}$ and $abc$\n",
+                "\\end{frame}\n",
+            ),
+            3,
+            "abcx and abc",
+            "abc",
+        ),
+    ] {
+        let offset = bad_context.find(bad_word).unwrap();
+        assert_eq!(
+            source_word_location(bad_source, bad_line, bad_context, offset, 2),
+            None,
+            "expected None for {bad_word:?} in {bad_context:?}"
+        );
+    }
+}

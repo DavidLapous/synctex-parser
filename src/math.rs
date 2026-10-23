@@ -1,7 +1,14 @@
 //! Conservative lexical matching, not a TeX macro expander.
 use latex2mathml::token::Token;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MacroDef<'a> {
+    arity: u8,
+    body: &'a str,
+}
 
 #[derive(Debug)]
 struct Atom {
@@ -254,6 +261,12 @@ pub(super) fn math_environment(name: &str) -> bool {
 }
 
 /// Only closed, literal math regions qualify; escaped dollars and comments do not.
+pub(super) fn in_region(source: &str, byte: usize) -> bool {
+    regions(source, byte.saturating_add(1))
+        .into_iter()
+        .any(|range| range.contains(&byte))
+}
+
 fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     let mut open: Option<(&str, usize)> = None;
@@ -484,33 +497,313 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
     result
 }
 
+pub(super) fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
+    at = super::skip_source_space(source, at);
+    if let Some((grp, next)) = group(source, at) {
+        let name = source[grp].trim().strip_prefix('\\')?.trim();
+        (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic())).then_some((name, next))
+    } else if source.as_bytes().get(at) == Some(&b'\\') {
+        let (name, next) = command(source, at);
+        (!name.is_empty()).then_some((name, next))
+    } else {
+        None
+    }
+}
+
+pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
+    let mut table = BTreeMap::<&str, Option<MacroDef<'_>>>::new();
+    let mut in_preamble = true;
+    let mut brace_depth = 0usize;
+    let mut group_depth = 0usize;
+    let mut if_depth = 0usize;
+    let mut at = 0usize;
+    while at < source.len() {
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            }
+            b'{' => {
+                brace_depth += 1;
+                at += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                at += 1;
+            }
+            b'$' => {
+                in_preamble = false;
+                at += 1;
+            }
+            b'\\' => {
+                let (cmd, end) = command(source, at);
+                at = end;
+                if let Some((opaque_end, _)) = opaque_command_end(source, cmd, at) {
+                    at = opaque_end;
+                    continue;
+                }
+                if matches!(cmd, "(" | "[") {
+                    in_preamble = false;
+                    continue;
+                }
+                if matches!(cmd, "begingroup" | "bgroup") {
+                    group_depth += 1;
+                    continue;
+                }
+                if matches!(cmd, "endgroup" | "egroup") {
+                    group_depth = group_depth.saturating_sub(1);
+                    continue;
+                }
+                if cmd.starts_with("if") && cmd != "iff" {
+                    if_depth += 1;
+                    continue;
+                }
+                if cmd == "fi" {
+                    if_depth = if_depth.saturating_sub(1);
+                    continue;
+                }
+                if cmd == "begin" {
+                    in_preamble = false;
+                    if let Some((_, next)) = group(source, at) {
+                        at = next;
+                    }
+                    group_depth += 1;
+                    continue;
+                }
+                if cmd == "end" {
+                    group_depth = group_depth.saturating_sub(1);
+                    if let Some((_, next)) = group(source, at) {
+                        at = next;
+                    }
+                    continue;
+                }
+                if cmd == "csname" {
+                    if let Some(pos) = source[at..].find("\\endcsname") {
+                        let name = source[at..at + pos].trim();
+                        if !name.is_empty() {
+                            table.insert(name, None);
+                        }
+                        at += pos + "\\endcsname".len();
+                    }
+                    continue;
+                }
+                if matches!(cmd, "let" | "futurelet") {
+                    if let Some((name, mut next)) = macro_target_name(source, at) {
+                        table.insert(name, None);
+                        next = super::skip_source_space(source, next);
+                        if cmd == "let" && source.as_bytes().get(next) == Some(&b'=') {
+                            next = super::skip_source_space(source, next + 1);
+                        }
+                        if source.as_bytes().get(next) == Some(&b'\\') {
+                            next = command(source, next).1;
+                        } else if next < source.len() {
+                            next += source[next..].chars().next().map_or(1, char::len_utf8);
+                        }
+                        at = next;
+                    }
+                    continue;
+                }
+                let top_level =
+                    in_preamble && brace_depth == 0 && group_depth == 0 && if_depth == 0;
+                at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                if matches!(cmd, "def" | "gdef" | "edef" | "xdef") {
+                    if let Some((name, mut next)) = macro_target_name(source, at) {
+                        table.insert(name, None);
+                        while next < source.len() && source.as_bytes()[next] != b'{' {
+                            if source.as_bytes()[next] == b'\\' {
+                                next = command(source, next).1;
+                            } else if source.as_bytes()[next] == b'%' {
+                                next = super::skip_source_space(source, next);
+                            } else {
+                                next += source[next..].chars().next().map_or(1, char::len_utf8);
+                            }
+                        }
+                        if let Some((_, body_end)) = group(source, next) {
+                            at = body_end;
+                        }
+                    }
+                    continue;
+                }
+                if matches!(
+                    cmd,
+                    "NewDocumentCommand"
+                        | "RenewDocumentCommand"
+                        | "ProvideDocumentCommand"
+                        | "DeclareDocumentCommand"
+                ) {
+                    if let Some((name, mut next)) = macro_target_name(source, at) {
+                        table.insert(name, None);
+                        while let Some(opt_end) = super::optional_argument_end(source, next) {
+                            next = opt_end;
+                        }
+                        if let Some((_, spec_end)) = group(source, next) {
+                            next = spec_end;
+                        }
+                        if let Some((_, body_end)) = group(source, next) {
+                            at = body_end;
+                        }
+                    }
+                    continue;
+                }
+                let (name, arity) = if cmd == "DeclareMathOperator" {
+                    let Some((name, next)) = macro_target_name(source, at) else {
+                        continue;
+                    };
+                    at = next;
+                    (name, Some(0u8))
+                } else if matches!(
+                    cmd,
+                    "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand"
+                ) {
+                    let Some((name, mut next)) = macro_target_name(source, at) else {
+                        continue;
+                    };
+                    let mut arity = (cmd != "providecommand").then_some(0u8);
+                    if let Some(opt_end) = super::optional_argument_end(source, next) {
+                        let opt =
+                            source[super::skip_source_space(source, next) + 1..opt_end - 1].trim();
+                        arity = arity
+                            .filter(|_| opt.len() == 1 && opt.as_bytes()[0].is_ascii_digit())
+                            .map(|_| opt.as_bytes()[0] - b'0');
+                        next = opt_end;
+                        while let Some(extra_end) = super::optional_argument_end(source, next) {
+                            arity = None;
+                            next = extra_end;
+                        }
+                    }
+                    at = next;
+                    (name, arity)
+                } else {
+                    continue;
+                };
+                let Some((body_range, body_end)) = group(source, at) else {
+                    table.insert(name, None);
+                    continue;
+                };
+                at = body_end;
+                let Some(arity) = arity.filter(|_| top_level) else {
+                    table.insert(name, None);
+                    continue;
+                };
+                let body = &source[body_range];
+                let mut valid = !body.contains('$') && !body.contains("^^");
+                let mut seen_params = 0u16;
+                for (idx, _) in body.match_indices('#') {
+                    let Some(d) = body
+                        .as_bytes()
+                        .get(idx + 1)
+                        .filter(|b| (b'1'..=b'0' + arity).contains(b))
+                        .map(|b| b - b'1')
+                    else {
+                        valid = false;
+                        break;
+                    };
+                    if (seen_params >> d) != 0 {
+                        valid = false;
+                        break;
+                    }
+                    seen_params |= 1 << d;
+                }
+                let entry = valid.then_some(MacroDef { arity, body });
+                match table.get(name) {
+                    Some(Some(existing))
+                        if entry.is_some_and(|e| {
+                            e.arity == existing.arity && e.body == existing.body
+                        }) => {}
+                    Some(_) => {
+                        table.insert(name, None);
+                    }
+                    None => {
+                        table.insert(name, entry);
+                    }
+                }
+            }
+            _ => {
+                at += source[at..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    table
+}
+
+pub(super) fn resolves_macro_at(source: &str, byte: usize, name: &str) -> bool {
+    let table = macros(source);
+    if !table.get(name).is_some_and(Option::is_some) {
+        return false;
+    }
+    let Some(range) = regions(source, byte.saturating_add(1))
+        .into_iter()
+        .find(|range| range.contains(&byte))
+    else {
+        return false;
+    };
+    atoms_with_macros(source, range, &table, 0, None, &[])
+        .is_some_and(|(_, opaque, reordered)| !opaque && !reordered)
+}
+
 /// An opaque expression can render glyphs absent from its lexical atoms, or
 /// change their extraction order. Its math atoms cannot prove a location.
-fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
+fn atoms_with_macros<'a>(
+    source: &'a str,
+    range: Range<usize>,
+    macros: &BTreeMap<&str, Option<MacroDef<'a>>>,
+    depth: u8,
+    span_override: Option<Range<usize>>,
+    args: &[(&'a str, Range<usize>)],
+) -> Option<(Vec<Atom>, bool, bool)> {
     let mut result = Vec::new();
     let mut opaque = false;
+    let mut reordered = false;
     let mut i = range.start;
     while i < range.end {
         let start = i;
         let ch = source[i..].chars().next()?;
         i += ch.len_utf8();
+        let emit_span = |s: Range<usize>| span_override.clone().unwrap_or(s);
         match ch {
             '%' => i += source[i..range.end].find('\n').unwrap_or(range.end - i),
             '{' | '}' | '&' => {}
+            '#' => {
+                if let Some((arg_src, arg_rng)) = source
+                    .as_bytes()
+                    .get(i)
+                    .filter(|b| i < range.end && (b'1'..=b'9').contains(b))
+                    .and_then(|b| args.get(usize::from(b - b'1')))
+                {
+                    i += 1;
+                    let (sub, sub_opaque, sub_reordered) =
+                        atoms_with_macros(arg_src, arg_rng.clone(), macros, depth + 1, None, &[])?;
+                    result.extend(sub);
+                    opaque |= sub_opaque;
+                    reordered |= sub_reordered;
+                } else {
+                    i += usize::from(
+                        i < range.end && source.as_bytes().get(i).is_some_and(u8::is_ascii_digit),
+                    );
+                    opaque = true;
+                    append(&mut result, '\0', emit_span(start..i));
+                }
+            }
             '_' | '^' => {
+                if ch == '^' && source[i..range.end].starts_with('^') {
+                    i += 1;
+                    opaque = true;
+                    append(&mut result, '\0', emit_span(start..i));
+                    continue;
+                }
                 // A single script has a linear base/script order. Simultaneous
                 // scripts on the same base can extract in visual rather than source order.
-                let arg = super::skip_source_space(source, i).min(range.end);
-                let arg_end = match source.as_bytes().get(arg) {
-                    Some(b'{') => group(source, arg).map(|(_, end)| end),
-                    Some(b'\\') => Some(command(source, arg).1),
-                    Some(_) => source[arg..range.end]
+                let arg_pos = super::skip_source_space(source, i).min(range.end);
+                let arg_end = match source.as_bytes().get(arg_pos) {
+                    Some(b'{') => group(source, arg_pos).map(|(_, end)| end),
+                    Some(b'\\') => Some(command(source, arg_pos).1),
+                    Some(b'#') => Some((arg_pos + 2).min(range.end)),
+                    Some(_) => source[arg_pos..range.end]
                         .chars()
                         .next()
-                        .map(|c| arg + c.len_utf8()),
+                        .map(|c| arg_pos + c.len_utf8()),
                     None => None,
                 };
-                opaque |= arg_end.is_none_or(|end| {
+                reordered |= arg_end.is_none_or(|end| {
                     let after = super::skip_source_space(source, end).min(range.end);
                     source[after..range.end].starts_with(['_', '^'])
                 });
@@ -518,7 +811,7 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
             '\\' => {
                 let (name, end) = command(source, start);
                 i = end;
-                let span = start..end;
+                let span = emit_span(start..end);
                 if name == "label" {
                     i = group(source, i)?.1;
                     continue;
@@ -542,10 +835,96 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                     i = end;
                     continue;
                 }
+                if let Some(entry) = macros.get(name).copied() {
+                    if depth < 4
+                        && let Some(def) = entry
+                    {
+                        let mut call_args = Vec::with_capacity(usize::from(def.arity));
+                        let mut arg_cursor = i;
+                        for _ in 0..def.arity {
+                            let Some((arg_rng, arg_end)) =
+                                group(source, arg_cursor).filter(|(_, end)| *end <= range.end)
+                            else {
+                                break;
+                            };
+                            arg_cursor = arg_end;
+                            let arg = if span_override.is_some() {
+                                let trimmed = source[arg_rng].trim();
+                                (trimmed.len() == 2 && trimmed.starts_with('#'))
+                                    .then(|| trimmed.as_bytes()[1].checked_sub(b'1'))
+                                    .flatten()
+                                    .and_then(|idx| args.get(usize::from(idx)))
+                                    .cloned()
+                            } else {
+                                Some((source, arg_rng))
+                            };
+                            let Some(arg) = arg else {
+                                break;
+                            };
+                            call_args.push(arg);
+                        }
+                        if call_args.len() == usize::from(def.arity) {
+                            i = arg_cursor;
+                            let after = super::skip_source_space(source, i).min(range.end);
+                            let body_has_script_or_cmd = def.body.contains(['_', '^', '\\']);
+                            let args_have_script = call_args
+                                .iter()
+                                .any(|(src, rng)| src[rng.clone()].contains(['_', '^']));
+                            if body_has_script_or_cmd
+                                && (source[after..range.end].starts_with(['_', '^'])
+                                    || (def.body.contains(['_', '^']) && args_have_script))
+                            {
+                                reordered = true;
+                            }
+                            let (sub, sub_opaque, sub_reordered) = atoms_with_macros(
+                                def.body,
+                                0..def.body.len(),
+                                macros,
+                                depth + 1,
+                                Some(span.clone()),
+                                &call_args,
+                            )?;
+                            if sub_opaque {
+                                opaque = true;
+                                append(&mut result, '\0', span);
+                            } else {
+                                result.extend(sub);
+                                reordered |= sub_reordered;
+                            }
+                            continue;
+                        }
+                    }
+                    opaque = true;
+                    append(&mut result, '\0', span);
+                    while let Some((_, end)) = group(source, i).filter(|(_, end)| *end <= range.end)
+                    {
+                        i = end;
+                    }
+                    continue;
+                }
                 // These standard wrappers change appearance, not character identity.
                 if matches!(
                     name,
                     "mathcal"
+                        | "mathbb"
+                        | "mathbbm"
+                        | "mathds"
+                        | "mathfrak"
+                        | "mathscr"
+                        | "mathrm"
+                        | "mathbf"
+                        | "mathsf"
+                        | "mathtt"
+                        | "mathit"
+                        | "textbf"
+                        | "textit"
+                        | "textrm"
+                        | "textsf"
+                        | "texttt"
+                        | "textup"
+                        | "emph"
+                        | "bm"
+                        | "boldsymbol"
                         | "boxed"
                         | "mathnormal"
                         | "textnormal"
@@ -555,7 +934,64 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                         | "scriptscriptstyle"
                         | "limits"
                         | "nolimits"
+                        | "mathrel"
+                        | "mathbin"
+                        | "mathord"
+                        | "mathop"
+                        | "mathopen"
+                        | "mathclose"
+                        | "mathpunct"
+                        | "mathinner"
+                        | "quad"
+                        | "qquad"
+                        | "enspace"
+                        | "thinspace"
+                        | "medspace"
+                        | "thickspace"
+                        | "negthinspace"
+                        | "negmedspace"
+                        | "negthickspace"
+                        | ","
+                        | ":"
+                        | ";"
+                        | "!"
+                        | ">"
+                        | "/"
+                        | " "
+                        | "\t"
+                        | "\n"
+                        | "\r"
+                        | "widetilde"
+                        | "widehat"
+                        | "overline"
+                        | "underline"
+                        | "overrightarrow"
+                        | "overleftarrow"
+                        | "bigl"
+                        | "bigr"
+                        | "Bigl"
+                        | "Bigr"
+                        | "biggl"
+                        | "biggr"
+                        | "Biggl"
+                        | "Biggr"
+                        | "bigm"
+                        | "Bigm"
+                        | "biggm"
+                        | "Biggm"
                 ) {
+                    continue;
+                }
+                if matches!(
+                    name,
+                    "textcolor" | "color" | "phantom" | "hphantom" | "vphantom"
+                ) {
+                    while let Some(opt_end) = super::optional_argument_end(source, i) {
+                        i = opt_end;
+                    }
+                    if let Some((_, grp_end)) = group(source, i) {
+                        i = grp_end;
+                    }
                     continue;
                 }
                 match Token::from_command(name) {
@@ -576,7 +1012,7 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                     Token::Sqrt => {
                         // Optional root indices change PDF extraction order and
                         // contain non-rendered brackets; do not treat them as text.
-                        opaque |= source[i..range.end].trim_start().starts_with('[');
+                        reordered |= source[i..range.end].trim_start().starts_with('[');
                         append(&mut result, '√', span);
                     }
                     Token::Left | Token::Right | Token::Middle | Token::Big(_) => {
@@ -593,20 +1029,74 @@ fn atoms(source: &str, range: Range<usize>) -> Option<(Vec<Atom>, bool)> {
                     | Token::Over(_, _)
                     | Token::Under(_, _)
                     | Token::NewLine => {}
-                    _ => {
-                        opaque = true;
-                        append(&mut result, '\0', span);
-                        while let Some((_, end)) = group(source, i) {
-                            i = end;
+                    _ => match name {
+                        "colon" => append(&mut result, ':', span),
+                        "langle" => append(&mut result, '⟨', span),
+                        "rangle" => append(&mut result, '⟩', span),
+                        "lceil" => append(&mut result, '⌈', span),
+                        "rceil" => append(&mut result, '⌉', span),
+                        "lfloor" => append(&mut result, '⌊', span),
+                        "rfloor" => append(&mut result, '⌋', span),
+                        "lvert" | "rvert" | "vert" => append(&mut result, '|', span),
+                        "lVert" | "rVert" | "Vert" => append(&mut result, '‖', span),
+                        "Bbbk" => append(&mut result, 'k', span),
+                        "hookrightarrow" => append(&mut result, '↪', span),
+                        "hookleftarrow" => append(&mut result, '↩', span),
+                        "twoheadrightarrow" => append(&mut result, '↠', span),
+                        "twoheadleftarrow" => append(&mut result, '↞', span),
+                        "bigsqcup" | "sqcup" => append(&mut result, '⊔', span),
+                        "bigsqcap" | "sqcap" => append(&mut result, '⊓', span),
+                        "llbracket" => append(&mut result, '⟦', span),
+                        "rrbracket" => append(&mut result, '⟧', span),
+                        "smallsetminus" => append(&mut result, '∖', span),
+                        "varnothing" => append(&mut result, '∅', span),
+                        "to" => append(&mut result, '→', span),
+                        "gets" => append(&mut result, '←', span),
+                        "xrightarrow" | "xleftarrow" => {
+                            reordered |= source[i..range.end].trim_start().starts_with('[');
+                            append(
+                                &mut result,
+                                if name == "xrightarrow" { '→' } else { '←' },
+                                span,
+                            );
                         }
-                    }
+                        "iff" => append(&mut result, '⇔', span),
+                        "implies" => append(&mut result, '⇒', span),
+                        "coloneqq" => {
+                            for c in [':', '='] {
+                                append(&mut result, c, span.clone());
+                            }
+                        }
+                        "Coloneqq" => {
+                            for c in [':', ':', '='] {
+                                append(&mut result, c, span.clone());
+                            }
+                        }
+                        "eqqcolon" => {
+                            for c in ['=', ':'] {
+                                append(&mut result, c, span.clone());
+                            }
+                        }
+                        "Eqqcolon" => {
+                            for c in ['=', ':', ':'] {
+                                append(&mut result, c, span.clone());
+                            }
+                        }
+                        _ => {
+                            opaque = true;
+                            append(&mut result, '\0', span);
+                            while let Some((_, end)) = group(source, i) {
+                                i = end;
+                            }
+                        }
+                    },
                 }
             }
-            c if !c.is_whitespace() => append(&mut result, c, start..i),
+            c if !c.is_whitespace() => append(&mut result, c, emit_span(start..i)),
             _ => {}
         }
     }
-    Some((result, opaque))
+    Some((result, opaque, reordered))
 }
 
 fn private_use(c: char) -> bool {
@@ -663,18 +1153,34 @@ pub(super) fn source_location(
             word.end += 1;
         }
     }
+    let macros = macros(source);
     let mut best = None;
     let mut tied = false;
     let mut saw_opaque = false;
+    let mut opaque_word = false;
+    let has_word = |atoms: &[Atom]| {
+        atoms.windows(word.len()).any(|w| {
+            w.iter()
+                .zip(&pdf[word.clone()])
+                .all(|(a, b)| a.value == b.value)
+        })
+    };
     for range in regions {
         if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
             || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
         {
             continue;
         }
-        let (atoms, opaque) = atoms(source, range.clone())?;
+        let (atoms, opaque, reordered) =
+            atoms_with_macros(source, range.clone(), &macros, 0, None, &[])?;
         if opaque {
             saw_opaque = true;
+            opaque_word |= has_word(&atoms);
+            continue;
+        }
+        if reordered {
+            saw_opaque |= atoms.iter().any(|atom| atom.value == pdf[selected].value);
+            opaque_word |= has_word(&atoms);
             continue;
         }
         let atoms = inline_context(source, &range, atoms);
@@ -780,15 +1286,18 @@ pub(super) fn source_location(
             }
         }
     }
-    let known_math = best.is_some();
-    let mathematical = best.filter(|_| !tied).map(|(_, location)| location);
+    let known_math = best.is_some() || opaque_word;
+    let mathematical = best
+        .filter(|_| !tied && !opaque_word)
+        .map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
+        && !opaque_word
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
         return prose.map(|(row, byte, _)| (row, byte));
     }
-    // Opaque math leaves symbols uncertain. A complete literal word still
-    // identifies its known source span when no second known match competes.
+    // Opaque math leaves symbols uncertain. A complete literal prose word still
+    // identifies its known source span when no math match competes.
     if saw_opaque {
         let literal_word = word.len() > 1
             && pdf[word.clone()]
