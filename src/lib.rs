@@ -3,6 +3,7 @@
 mod math;
 mod parser;
 pub mod source_snapshot;
+mod symbols;
 #[cfg(test)]
 mod tests;
 

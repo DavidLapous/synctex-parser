@@ -1,8 +1,7 @@
 //! Conservative lexical matching, not a TeX macro expander.
-use latex2mathml::token::Token;
+use crate::symbols::{MathCommand, canonical, classify_command, negated_symbol};
 use std::collections::BTreeMap;
 use std::ops::Range;
-use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MacroDef<'a> {
@@ -15,33 +14,6 @@ struct Atom {
     value: char,
     span: Range<usize>,
     word_join: bool,
-}
-
-fn canonical(value: char) -> impl Iterator<Item = char> {
-    // Normalize typographic/operator codepoint variants that share a TeX glyph.
-    let mapped = match value {
-        '−' => '-',
-        '∗' => '*',
-        '∙' => '•',
-        '·' => '⋅',
-        '⋯' => '…',
-        '∆' => 'Δ',
-        '⩽' => '≤',
-        '⩾' => '≥',
-        '∣' => '|',
-        '∥' => '‖',
-        '⋃' => '∪',
-        '⋂' => '∩',
-        '⋁' => '∨',
-        '⋀' => '∧',
-        '⨀' => '⊙',
-        '⨁' => '⊕',
-        '⨂' => '⊗',
-        '⨄' => '⊎',
-        '⨆' => '⊔',
-        _ => value,
-    };
-    std::iter::once(mapped).nfkc()
 }
 
 fn append_joined(atoms: &mut Vec<Atom>, value: char, span: Range<usize>, mut join: bool) {
@@ -1054,236 +1026,6 @@ fn atoms_with_macros<'a>(
                     append(&mut result, '\0', span);
                     continue;
                 }
-                // These standard wrappers change appearance, not character identity.
-                if matches!(
-                    name,
-                    "mathcal"
-                        | "mathbb"
-                        | "mathbbm"
-                        | "mathbbb"
-                        | "mathds"
-                        | "mathfrak"
-                        | "mathscr"
-                        | "mathrm"
-                        | "mathbf"
-                        | "mathbfit"
-                        | "mathsf"
-                        | "mathsfit"
-                        | "mathbfsfit"
-                        | "mathbfcal"
-                        | "mathbfscr"
-                        | "mathtt"
-                        | "mathit"
-                        | "mathnormal"
-                        | "mathbold"
-                        | "symrm"
-                        | "symit"
-                        | "symsf"
-                        | "symtt"
-                        | "symbb"
-                        | "symcal"
-                        | "symscr"
-                        | "symfrak"
-                        | "symnormal"
-                        | "symbf"
-                        | "symbfit"
-                        | "symbfsfit"
-                        | "symsfit"
-                        | "symbfcal"
-                        | "symbffrak"
-                        | "symbfscr"
-                        | "symbfsf"
-                        | "symbftt"
-                        | "textbf"
-                        | "textit"
-                        | "textrm"
-                        | "textsf"
-                        | "texttt"
-                        | "textup"
-                        | "textnormal"
-                        | "textsc"
-                        | "textsl"
-                        | "textmd"
-                        | "textlf"
-                        | "textulc"
-                        | "normalfont"
-                        | "rmfamily"
-                        | "sffamily"
-                        | "ttfamily"
-                        | "bfseries"
-                        | "mdseries"
-                        | "lfseries"
-                        | "itshape"
-                        | "slshape"
-                        | "scshape"
-                        | "upshape"
-                        | "rm"
-                        | "bf"
-                        | "it"
-                        | "sl"
-                        | "sf"
-                        | "tt"
-                        | "sc"
-                        | "cal"
-                        | "mit"
-                        | "oldstylenums"
-                        | "emph"
-                        | "bm"
-                        | "boldsymbol"
-                        | "boxed"
-                        | "displaystyle"
-                        | "textstyle"
-                        | "scriptstyle"
-                        | "scriptscriptstyle"
-                        | "limits"
-                        | "nolimits"
-                        | "mathrel"
-                        | "mathbin"
-                        | "mathord"
-                        | "mathop"
-                        | "mathopen"
-                        | "mathclose"
-                        | "mathpunct"
-                        | "mathinner"
-                        | "quad"
-                        | "qquad"
-                        | "enspace"
-                        | "thinspace"
-                        | "medspace"
-                        | "thickspace"
-                        | "negthinspace"
-                        | "negmedspace"
-                        | "negthickspace"
-                        | ","
-                        | ":"
-                        | ";"
-                        | "!"
-                        | ">"
-                        | "/"
-                        | " "
-                        | "\t"
-                        | "\n"
-                        | "\r"
-                        | "widetilde"
-                        | "widehat"
-                        | "overline"
-                        | "underline"
-                        | "overrightarrow"
-                        | "overleftarrow"
-                        | "bigl"
-                        | "bigr"
-                        | "Bigl"
-                        | "Bigr"
-                        | "biggl"
-                        | "biggr"
-                        | "Biggl"
-                        | "Biggr"
-                        | "bigm"
-                        | "Bigm"
-                        | "biggm"
-                        | "Biggm"
-                        | "dfrac"
-                        | "tfrac"
-                        | "cfrac"
-                        | "binom"
-                        | "tbinom"
-                        | "dbinom"
-                        | "substack"
-                        | "mbox"
-                        | "hbox"
-                        | "mathclap"
-                        | "mathllap"
-                        | "mathrlap"
-                ) {
-                    continue;
-                }
-                if matches!(name, "kern" | "mkern" | "mskip" | "hskip" | "vskip") {
-                    let mut dim_end = skip_tex_dimen(source, i, range.end)?;
-                    if matches!(name, "mskip" | "hskip" | "vskip") {
-                        loop {
-                            let kw = super::skip_source_space(source, dim_end).min(range.end);
-                            let kw_end = if source[kw..range.end]
-                                .get(..4)
-                                .is_some_and(|s| s.eq_ignore_ascii_case("plus"))
-                            {
-                                kw + 4
-                            } else if source[kw..range.end]
-                                .get(..5)
-                                .is_some_and(|s| s.eq_ignore_ascii_case("minus"))
-                            {
-                                kw + 5
-                            } else {
-                                break;
-                            };
-                            if source
-                                .as_bytes()
-                                .get(kw_end)
-                                .is_some_and(u8::is_ascii_alphabetic)
-                            {
-                                break;
-                            }
-                            dim_end = skip_tex_dimen(source, kw_end, range.end)?;
-                        }
-                    }
-                    i = dim_end;
-                    continue;
-                }
-                if matches!(
-                    name,
-                    "textcolor"
-                        | "color"
-                        | "phantom"
-                        | "hphantom"
-                        | "vphantom"
-                        | "hspace"
-                        | "vspace"
-                        | "raisebox"
-                        | "ref"
-                        | "eqref"
-                        | "pageref"
-                        | "autoref"
-                        | "cref"
-                        | "Cref"
-                        | "cite"
-                        | "citep"
-                        | "citet"
-                        | "nocite"
-                ) {
-                    i += usize::from(
-                        i < range.end && source.as_bytes().get(i) == Some(&b'*'),
-                    );
-                    while let Some(opt_end) = super::optional_argument_end(source, i)
-                        .or_else(|| super::overlay_argument_end(source, i))
-                        .filter(|e| *e <= range.end)
-                    {
-                        i = opt_end;
-                    }
-                    if let Some((_, grp_end)) = group(source, i).filter(|(_, e)| *e <= range.end) {
-                        i = grp_end;
-                    }
-                    while name == "raisebox"
-                        && let Some(opt_end) =
-                            super::optional_argument_end(source, i).filter(|e| *e <= range.end)
-                    {
-                        i = opt_end;
-                    }
-                    if matches!(
-                        name,
-                        "ref"
-                            | "eqref"
-                            | "pageref"
-                            | "autoref"
-                            | "cref"
-                            | "Cref"
-                            | "cite"
-                            | "citep"
-                            | "citet"
-                            | "nocite"
-                    ) {
-                        append(&mut result, '\0', span);
-                    }
-                    continue;
-                }
                 if name == "not" {
                     let next = super::skip_source_space(source, i).min(range.end);
                     let negated = if source[next..range.end].starts_with('=') {
@@ -1299,34 +1041,9 @@ fn atoms_with_macros<'a>(
                         if macros.contains_key(next_cmd) {
                             return None;
                         }
-                        let c = match next_cmd {
-                            "in" => Some('∉'),
-                            "owns" | "ni" => Some('∌'),
-                            "exists" => Some('∄'),
-                            "equiv" => Some('≢'),
-                            "le" | "leq" | "leqslant" => Some('≰'),
-                            "ge" | "geq" | "geqslant" => Some('≱'),
-                            "lt" => Some('≮'),
-                            "gt" => Some('≯'),
-                            "subset" => Some('⊄'),
-                            "supset" => Some('⊅'),
-                            "subseteq" => Some('⊈'),
-                            "supseteq" => Some('⊉'),
-                            "sim" => Some('≁'),
-                            "approx" => Some('≉'),
-                            "cong" => Some('≇'),
-                            "prec" => Some('⊀'),
-                            "succ" => Some('⊁'),
-                            "preceq" => Some('⋠'),
-                            "succeq" => Some('⋡'),
-                            "vdash" => Some('⊬'),
-                            "models" | "vDash" => Some('⊭'),
-                            "Vdash" => Some('⊮'),
-                            "mid" | "vert" => Some('∤'),
-                            "parallel" | "Vert" | "|" => Some('∦'),
-                            _ => None,
-                        };
-                        c.filter(|_| next_end <= range.end).map(|c| (c, next_end))
+                        negated_symbol(next_cmd)
+                            .filter(|_| next_end <= range.end)
+                            .map(|c| (c, next_end))
                     } else {
                         None
                     };
@@ -1338,20 +1055,73 @@ fn atoms_with_macros<'a>(
                     }
                     continue;
                 }
-                match Token::from_command(name) {
-                    Token::Operator(_) if name == "ni" => append(&mut result, '∋', span),
-                    Token::Operator(_) if name == "smallsetminus" => append(&mut result, '∖', span),
-                    Token::Letter(c, _)
-                    | Token::Operator(c)
-                    | Token::BigOp(c)
-                    | Token::Integral(c) => append(&mut result, c, span),
-                    Token::Function(text) | Token::Lim(text) => append_words(&mut result, text, span),
-                    Token::Paren(text) if !text.starts_with('&') => {
-                        for c in text.chars() {
-                            append(&mut result, c, span.clone());
+                match classify_command(name) {
+                    MathCommand::Transparent => {}
+                    MathCommand::DelimiterPrefix => {
+                        let following = source[i..range.end].trim_start();
+                        if following.starts_with('.') {
+                            i = range.end - following.len() + 1;
                         }
                     }
-                    Token::Sqrt => {
+                    MathCommand::Dimension { allow_glue } => {
+                        let mut dim_end = skip_tex_dimen(source, i, range.end)?;
+                        if allow_glue {
+                            loop {
+                                let kw = super::skip_source_space(source, dim_end).min(range.end);
+                                let kw_end = if source[kw..range.end]
+                                    .get(..4)
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("plus"))
+                                {
+                                    kw + 4
+                                } else if source[kw..range.end]
+                                    .get(..5)
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("minus"))
+                                {
+                                    kw + 5
+                                } else {
+                                    break;
+                                };
+                                if source
+                                    .as_bytes()
+                                    .get(kw_end)
+                                    .is_some_and(u8::is_ascii_alphabetic)
+                                {
+                                    break;
+                                }
+                                dim_end = skip_tex_dimen(source, kw_end, range.end)?;
+                            }
+                        }
+                        i = dim_end;
+                    }
+                    MathCommand::DiscardArg {
+                        emit_gap,
+                        trailing_opt,
+                    } => {
+                        i += usize::from(
+                            i < range.end && source.as_bytes().get(i) == Some(&b'*'),
+                        );
+                        while let Some(opt_end) = super::optional_argument_end(source, i)
+                            .or_else(|| super::overlay_argument_end(source, i))
+                            .filter(|e| *e <= range.end)
+                        {
+                            i = opt_end;
+                        }
+                        if let Some((_, grp_end)) =
+                            group(source, i).filter(|(_, e)| *e <= range.end)
+                        {
+                            i = grp_end;
+                        }
+                        while trailing_opt
+                            && let Some(opt_end) =
+                                super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                        {
+                            i = opt_end;
+                        }
+                        if emit_gap {
+                            append(&mut result, '\0', span);
+                        }
+                    }
+                    MathCommand::Sqrt => {
                         if let Some(opt_end) =
                             super::optional_argument_end(source, i).filter(|e| *e <= range.end)
                         {
@@ -1371,247 +1141,43 @@ fn atoms_with_macros<'a>(
                         }
                         append(&mut result, '√', span);
                     }
-                    Token::Left | Token::Right | Token::Middle | Token::Big(_) => {
-                        let following = source[i..range.end].trim_start();
-                        if following.starts_with('.') {
-                            i = range.end - following.len() + 1;
+                    MathCommand::ExtensibleArrow(arrow) => {
+                        if let Some(opt_end) =
+                            super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                        {
+                            let opt_start = super::skip_source_space(source, i) + 1;
+                            append(&mut result, '\0', span.clone());
+                            let sub = atoms_with_macros(
+                                source,
+                                opt_start..opt_end - 1,
+                                macros,
+                                depth + 1,
+                                span_override.clone(),
+                                args,
+                            )?;
+                            result.extend(sub);
+                            append(&mut result, '\0', span.clone());
+                            i = opt_end;
+                        }
+                        append(&mut result, arrow, span.clone());
+                        append(&mut result, '\0', span);
+                    }
+                    MathCommand::Symbol(c) => append(&mut result, c, span),
+                    MathCommand::MultiSymbol(chars) => {
+                        for &c in chars {
+                            append(&mut result, c, span.clone());
                         }
                     }
-                    Token::Style(_)
-                    | Token::Space(_)
-                    | Token::Frac
-                    | Token::Text
-                    | Token::OperatorName
-                    | Token::Over(_, _)
-                    | Token::Under(_, _)
-                    | Token::NewLine => {}
-                    _ => match name {
-                        "varkappa" => append(&mut result, 'ϰ', span),
-                        "backepsilon" => append(&mut result, '϶', span),
-                        "varGamma" => append(&mut result, 'Γ', span),
-                        "varDelta" => append(&mut result, 'Δ', span),
-                        "varTheta" => append(&mut result, 'Θ', span),
-                        "varLambda" => append(&mut result, 'Λ', span),
-                        "varXi" => append(&mut result, 'Ξ', span),
-                        "varPi" => append(&mut result, 'Π', span),
-                        "varSigma" => append(&mut result, 'Σ', span),
-                        "varUpsilon" => append(&mut result, 'Υ', span),
-                        "varPhi" => append(&mut result, 'Φ', span),
-                        "varPsi" => append(&mut result, 'Ψ', span),
-                        "varOmega" => append(&mut result, 'Ω', span),
-                        "le" | "leqslant" => append(&mut result, '≤', span),
-                        "ge" | "geqslant" => append(&mut result, '≥', span),
-                        "neg" => append(&mut result, '¬', span),
-                        "owns" => append(&mut result, '∋', span),
-                        "bigotimes" => append(&mut result, '⨂', span),
-                        "biguplus" => append(&mut result, '⨄', span),
-                        "frown" | "smallfrown" => append(&mut result, '⌢', span),
-                        "smallsmile" => append(&mut result, '⌣', span),
-                        "dots" | "dotsb" | "dotsc" | "dotsi" | "dotsm" | "dotso" | "hdots" => {
-                            append(&mut result, '…', span)
+                    MathCommand::Words(text) => append_words(&mut result, text, span),
+                    MathCommand::Unknown => {
+                        while let Some(end) = super::optional_argument_end(source, i)
+                            .or_else(|| super::overlay_argument_end(source, i))
+                            .filter(|e| *e <= range.end)
+                        {
+                            i = end;
                         }
-                        "ast" => append(&mut result, '∗', span),
-                        "diamond" => append(&mut result, '⋄', span),
-                        "Diamond" | "lozenge" => append(&mut result, '◊', span),
-                        "blacklozenge" => append(&mut result, '⧫', span),
-                        "Box" | "square" => append(&mut result, '□', span),
-                        "blacksquare" => append(&mut result, '■', span),
-                        "bigstar" => append(&mut result, '★', span),
-                        "triangle" | "vartriangle" => append(&mut result, '△', span),
-                        "bigtriangledown" | "triangledown" => append(&mut result, '▽', span),
-                        "blacktriangle" => append(&mut result, '▲', span),
-                        "blacktriangledown" => append(&mut result, '▼', span),
-                        "blacktriangleleft" => append(&mut result, '◀', span),
-                        "blacktriangleright" => append(&mut result, '▶', span),
-                        "vartriangleleft" => append(&mut result, '⊲', span),
-                        "vartriangleright" => append(&mut result, '⊳', span),
-                        "trianglelefteq" => append(&mut result, '⊴', span),
-                        "trianglerighteq" => append(&mut result, '⊵', span),
-                        "bigcirc" => append(&mut result, '◯', span),
-                        "centerdot" => append(&mut result, '⋅', span),
-                        "intercal" => append(&mut result, '⊺', span),
-                        "amalg" => append(&mut result, '⨿', span),
-                        "wr" => append(&mut result, '≀', span),
-                        "dagger" | "dag" => append(&mut result, '†', span),
-                        "ddagger" | "ddag" => append(&mut result, '‡', span),
-                        "ltimes" => append(&mut result, '⋉', span),
-                        "rtimes" => append(&mut result, '⋊', span),
-                        "bowtie" | "Join" => append(&mut result, '⋈', span),
-                        "asymp" => append(&mut result, '≍', span),
-                        "doteq" => append(&mut result, '≐', span),
-                        "circeq" => append(&mut result, '≗', span),
-                        "triangleq" => append(&mut result, '≜', span),
-                        "bumpeq" => append(&mut result, '≏', span),
-                        "Bumpeq" => append(&mut result, '≎', span),
-                        "eqsim" => append(&mut result, '≂', span),
-                        "backsimeq" => append(&mut result, '⋍', span),
-                        "thicksim" => append(&mut result, '∼', span),
-                        "thickapprox" => append(&mut result, '≈', span),
-                        "lesssim" => append(&mut result, '≲', span),
-                        "gtrsim" => append(&mut result, '≳', span),
-                        "lessapprox" => append(&mut result, '⪅', span),
-                        "gtrapprox" => append(&mut result, '⪆', span),
-                        "lessgtr" => append(&mut result, '≶', span),
-                        "gtrless" => append(&mut result, '≷', span),
-                        "lesseqgtr" => append(&mut result, '⋚', span),
-                        "gtreqless" => append(&mut result, '⋛', span),
-                        "preceq" => append(&mut result, '⪯', span),
-                        "succeq" => append(&mut result, '⪰', span),
-                        "preccurlyeq" => append(&mut result, '≼', span),
-                        "succcurlyeq" => append(&mut result, '≽', span),
-                        "precsim" => append(&mut result, '≾', span),
-                        "succsim" => append(&mut result, '≿', span),
-                        "nprec" => append(&mut result, '⊀', span),
-                        "nsucc" => append(&mut result, '⊁', span),
-                        "subseteqq" => append(&mut result, '⫅', span),
-                        "supseteqq" => append(&mut result, '⫆', span),
-                        "nsubseteq" => append(&mut result, '⊈', span),
-                        "nsupseteq" => append(&mut result, '⊉', span),
-                        "subsetneq" | "varsubsetneq" => append(&mut result, '⊊', span),
-                        "supsetneq" | "varsupsetneq" => append(&mut result, '⊋', span),
-                        "sqsubset" => append(&mut result, '⊏', span),
-                        "sqsupset" => append(&mut result, '⊐', span),
-                        "nmid" => append(&mut result, '∤', span),
-                        "nparallel" => append(&mut result, '∦', span),
-                        "nless" => append(&mut result, '≮', span),
-                        "ngtr" => append(&mut result, '≯', span),
-                        "nleq" | "nleqslant" => append(&mut result, '≰', span),
-                        "ngeq" | "ngeqslant" => append(&mut result, '≱', span),
-                        "nsim" => append(&mut result, '≁', span),
-                        "ncong" => append(&mut result, '≇', span),
-                        "vDash" => append(&mut result, '⊨', span),
-                        "Vdash" => append(&mut result, '⊩', span),
-                        "Vvdash" => append(&mut result, '⊪', span),
-                        "nvdash" => append(&mut result, '⊬', span),
-                        "nvDash" => append(&mut result, '⊭', span),
-                        "nVdash" => append(&mut result, '⊮', span),
-                        "nVDash" => append(&mut result, '⊯', span),
-                        "surd" => append(&mut result, '√', span),
-                        "measuredangle" => append(&mut result, '∡', span),
-                        "sphericalangle" => append(&mut result, '∢', span),
-                        "nexists" => append(&mut result, '∄', span),
-                        "hslash" => append(&mut result, 'ℏ', span),
-                        "beth" => append(&mut result, 'ℶ', span),
-                        "gimel" => append(&mut result, 'ℷ', span),
-                        "daleth" => append(&mut result, 'ℸ', span),
-                        "complement" => append(&mut result, '∁', span),
-                        "mho" => append(&mut result, '℧', span),
-                        "prime" => append(&mut result, '′', span),
-                        "backprime" => append(&mut result, '‵', span),
-                        "checkmark" => append(&mut result, '✓', span),
-                        "maltese" => append(&mut result, '✠', span),
-                        "S" | "mathsection" => append(&mut result, '§', span),
-                        "P" | "mathparagraph" => append(&mut result, '¶', span),
-                        "pounds" | "mathsterling" => append(&mut result, '£', span),
-                        "yen" => append(&mut result, '¥', span),
-                        "backslash" => append(&mut result, '\\', span),
-                        "ulcorner" => append(&mut result, '⌜', span),
-                        "urcorner" => append(&mut result, '⌝', span),
-                        "llcorner" => append(&mut result, '⌞', span),
-                        "lrcorner" => append(&mut result, '⌟', span),
-                        "iiiint" => append(&mut result, '⨌', span),
-                        "intop" => append(&mut result, '∫', span),
-                        "ointop" => append(&mut result, '∮', span),
-                        "oiint" => append(&mut result, '∯', span),
-                        "oiiint" => append(&mut result, '∰', span),
-                        "idotsint" => {
-                            for c in ['∫', '…', '∫'] {
-                                append(&mut result, c, span.clone());
-                            }
-                        }
-                        "colon" => append(&mut result, ':', span),
-                        "langle" => append(&mut result, '⟨', span),
-                        "rangle" => append(&mut result, '⟩', span),
-                        "lceil" => append(&mut result, '⌈', span),
-                        "rceil" => append(&mut result, '⌉', span),
-                        "lfloor" => append(&mut result, '⌊', span),
-                        "rfloor" => append(&mut result, '⌋', span),
-                        "lvert" | "rvert" | "vert" => append(&mut result, '|', span),
-                        "lVert" | "rVert" | "Vert" | "|" => append(&mut result, '‖', span),
-                        "Bbbk" => append(&mut result, 'k', span),
-                        "hookrightarrow" => append(&mut result, '↪', span),
-                        "hookleftarrow" => append(&mut result, '↩', span),
-                        "twoheadrightarrow" => append(&mut result, '↠', span),
-                        "twoheadleftarrow" => append(&mut result, '↞', span),
-                        "leadsto" | "rightsquigarrow" => append(&mut result, '⇝', span),
-                        "leftrightsquigarrow" => append(&mut result, '↭', span),
-                        "mapsfrom" => append(&mut result, '↤', span),
-                        "longmapsfrom" => append(&mut result, '⟻', span),
-                        "Longmapsto" => append(&mut result, '⟾', span),
-                        "bigsqcup" | "sqcup" => append(&mut result, '⊔', span),
-                        "bigsqcap" | "sqcap" => append(&mut result, '⊓', span),
-                        "llbracket" => append(&mut result, '⟦', span),
-                        "rrbracket" => append(&mut result, '⟧', span),
-                        "varnothing" => append(&mut result, '∅', span),
-                        "to" => append(&mut result, '→', span),
-                        "gets" => append(&mut result, '←', span),
-                        "xrightarrow" | "xleftarrow" => {
-                            if let Some(opt_end) =
-                                super::optional_argument_end(source, i).filter(|e| *e <= range.end)
-                            {
-                                let opt_start = super::skip_source_space(source, i) + 1;
-                                append(&mut result, '\0', span.clone());
-                                let sub = atoms_with_macros(
-                                    source,
-                                    opt_start..opt_end - 1,
-                                    macros,
-                                    depth + 1,
-                                    span_override.clone(),
-                                    args,
-                                )?;
-                                result.extend(sub);
-                                append(&mut result, '\0', span.clone());
-                                i = opt_end;
-                            }
-                            append(
-                                &mut result,
-                                if name == "xrightarrow" { '→' } else { '←' },
-                                span.clone(),
-                            );
-                            append(&mut result, '\0', span);
-                        }
-                        "iff" => append(&mut result, '⇔', span),
-                        "implies" => append(&mut result, '⇒', span),
-                        "impliedby" => append(&mut result, '⇐', span),
-                        "coloneqq" | "coloneq" | "defeq" | "assign" => {
-                            for c in [':', '='] {
-                                append(&mut result, c, span.clone());
-                            }
-                        }
-                        "Coloneqq" => {
-                            for c in [':', ':', '='] {
-                                append(&mut result, c, span.clone());
-                            }
-                        }
-                        "eqqcolon" | "eqcolon" => {
-                            for c in ['=', ':'] {
-                                append(&mut result, c, span.clone());
-                            }
-                        }
-                        "Eqqcolon" => {
-                            for c in ['=', ':', ':'] {
-                                append(&mut result, c, span.clone());
-                            }
-                        }
-                        "Pr" | "gcd" | "deg" | "hom" | "lg" | "mod" | "arcsinh" | "arccosh"
-                        | "arctanh" | "csch" | "sech" => append_words(&mut result, name, span),
-                        "argmin" => append_words(&mut result, "arg min", span),
-                        "argmax" => append_words(&mut result, "arg max", span),
-                        "injlim" => append_words(&mut result, "inj lim", span),
-                        "projlim" => append_words(&mut result, "proj lim", span),
-                        "varinjlim" | "varprojlim" | "varliminf" | "varlimsup" => {
-                            append_words(&mut result, "lim", span)
-                        }
-                        _ => {
-                            while let Some(end) = super::optional_argument_end(source, i)
-                                .or_else(|| super::overlay_argument_end(source, i))
-                                .filter(|e| *e <= range.end)
-                            {
-                                i = end;
-                            }
-                            append(&mut result, '\0', span);
-                        }
-                    },
+                        append(&mut result, '\0', span);
+                    }
                 }
             }
             c if !c.is_whitespace() => {
