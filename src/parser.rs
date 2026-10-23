@@ -274,6 +274,7 @@ pub(crate) struct ParsedSynctex {
     x_off: f64,
     y_off: f64,
     bound: i64,
+    fix_cross_file_tags: bool,
 }
 
 #[cfg(test)]
@@ -1151,6 +1152,7 @@ pub(crate) fn parse_synctex_document_with_options(
         x_off,
         y_off,
         bound,
+        fix_cross_file_tags,
     })
 }
 
@@ -1733,6 +1735,217 @@ pub(crate) fn validate_inverse_point(point: InversePoint) -> io::Result<()> {
     Ok(())
 }
 
+fn is_graphics_leaf_subtree(nodes: &[ForwardNode], root: usize) -> bool {
+    let d = &nodes[root];
+    if d.kind != b'(' || d.target.is_some() || d.width <= 0 || d.height <= 0 || d.depth != 0 {
+        return false;
+    }
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        let n = &nodes[idx];
+        let mut hboxes = 0usize;
+        for &ch in &n.children {
+            let c = &nodes[ch];
+            if c.target.is_some() || c.tag != d.tag || c.line != d.line {
+                return false;
+            }
+            match c.kind {
+                b'(' => {
+                    hboxes += 1;
+                    if hboxes > 1 {
+                        return false;
+                    }
+                    stack.push(ch);
+                }
+                b'b' | b'g' | b'k' => {}
+                b'r' if c.width == n.width && c.height == n.height && c.depth == 0 => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+fn single_hbox_child(nodes: &[ForwardNode], idx: usize, allow_kern: bool) -> Option<usize> {
+    let mut found = None;
+    for &ch in &nodes[idx].children {
+        match nodes[ch].kind {
+            b'(' => {
+                if found.replace(ch).is_some() {
+                    return None;
+                }
+            }
+            b'b' | b'g' => {}
+            b'k' if allow_kern && nodes[ch].target.is_none() => {}
+            _ => return None,
+        }
+    }
+    found
+}
+
+pub(crate) fn is_generated_graphics_tex(path: &str) -> bool {
+    let p = path.trim().as_bytes();
+    [b".pdf_tex".as_slice(), b".pdftex_t", b".pstex_t"]
+        .iter()
+        .any(|ext| {
+            p.len() >= ext.len() && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext)
+        })
+}
+
+fn tag_is_generated_graphics_tex(inputs: &[(u32, String)], tag: u32) -> bool {
+    inputs
+        .iter()
+        .rev()
+        .find(|(t, _)| *t == tag)
+        .is_some_and(|(_, p)| is_generated_graphics_tex(p))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GraphicsBox {
+    box_idx: usize,
+    host_idx: usize,
+    gen_root: Option<usize>,
+}
+
+/// Detect the outer bounding horizontal box of an `\includegraphics` /
+/// `\includesvg` construct from its `\Gscale@box` zero-width hbox pair and its
+/// enclosing `\Ginclude@...` / `\Gin@setfile` wrappers.
+fn graphics_outer_box(
+    nodes: &[ForwardNode],
+    inputs: &[(u32, String)],
+    fix_cross_file_tags: bool,
+    b_idx: usize,
+) -> Option<GraphicsBox> {
+    let b = &nodes[b_idx];
+    if b.kind != b'('
+        || b.target.is_some()
+        || b.tag == 0
+        || b.line <= 0
+        || b.width != 0
+        || b.height <= 0
+        || b.depth != 0
+    {
+        return None;
+    }
+    let c_idx = single_hbox_child(nodes, b_idx, false)?;
+    let c = &nodes[c_idx];
+    if c.target.is_some()
+        || c.tag != b.tag
+        || c.line != b.line
+        || c.width != 0
+        || c.height <= 0
+        || c.depth != 0
+    {
+        return None;
+    }
+    let d_idx = single_hbox_child(nodes, c_idx, true)?;
+    let d = &nodes[d_idx];
+    if d.tag != b.tag || d.line != b.line || !is_graphics_leaf_subtree(nodes, d_idx) {
+        return None;
+    }
+    let compensated = c.children.iter().any(|&ch| {
+        let child = &nodes[ch];
+        child.tag == b.tag
+            && child.line == b.line
+            && (child.kind == b'g'
+                || (child.kind == b'k' && child.width == d.width.saturating_neg()))
+    });
+    if !compensated {
+        return None;
+    }
+    let mut cur = b_idx;
+    let mut outer = b_idx;
+    let mut wrappers = 0usize;
+    while let Some(p_idx) = nodes[cur].parent {
+        let p = &nodes[p_idx];
+        let pure_wrapper = p
+            .children
+            .iter()
+            .all(|&ch| ch == cur || nodes[ch].kind == b'b');
+        if p.kind != b'('
+            || p.target.is_some()
+            || p.tag != b.tag
+            || p.line != b.line
+            || single_hbox_child(nodes, p_idx, true) != Some(cur)
+            || !(pure_wrapper || p.width == 0 || nodes[cur].width == 0)
+        {
+            break;
+        }
+        wrappers += 1;
+        cur = p_idx;
+        if p.width > 0 && p.height.saturating_add(p.depth) > 0 {
+            outer = p_idx;
+        }
+    }
+    if wrappers < 2 || outer == b_idx {
+        return None;
+    }
+    if tag_is_generated_graphics_tex(inputs, nodes[outer].tag) {
+        if !fix_cross_file_tags {
+            return None;
+        }
+        let gen_tag = nodes[outer].tag;
+        while let Some(p_idx) = nodes[cur].parent {
+            let p = &nodes[p_idx];
+            if !matches!(p.kind, b'(' | b'[')
+                || p.target.is_some()
+                || p.tag != gen_tag
+            {
+                break;
+            }
+            cur = p_idx;
+            if p.width > 0 && p.height.saturating_add(p.depth) > 0 {
+                outer = p_idx;
+            }
+        }
+        let host_idx = nodes[cur].parent?;
+        let host = &nodes[host_idx];
+        if !matches!(host.kind, b'(' | b'[')
+            || host.target.is_some()
+            || host.tag == 0
+            || host.line <= 0
+            || tag_is_generated_graphics_tex(inputs, host.tag)
+        {
+            return None;
+        }
+        return Some(GraphicsBox {
+            box_idx: outer,
+            host_idx,
+            gen_root: Some(cur),
+        });
+    }
+    Some(GraphicsBox {
+        box_idx: outer,
+        host_idx: outer,
+        gen_root: None,
+    })
+}
+
+fn sheet_graphics_boxes(
+    nodes: &[ForwardNode],
+    inputs: &[(u32, String)],
+    fix_cross_file_tags: bool,
+    root: usize,
+) -> Vec<GraphicsBox> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        if let Some(g) = graphics_outer_box(nodes, inputs, fix_cross_file_tags, idx) {
+            if !out
+                .iter()
+                .any(|existing: &GraphicsBox| existing.box_idx == g.box_idx && existing.host_idx == g.host_idx)
+            {
+                out.push(g);
+            }
+            continue;
+        }
+        for &ch in nodes[idx].children.iter().rev() {
+            stack.push(ch);
+        }
+    }
+    out
+}
+
 pub fn inverse_candidates(pdf: &Path, point: InversePoint) -> io::Result<Vec<SourceLocation>> {
     inverse_candidates_in(pdf, point, None)
 }
@@ -2263,9 +2476,46 @@ pub(crate) fn inverse_candidates_in_doc(
         (None, None) => container.into_iter().collect(),
     };
 
+    let graphics_boxes = sheet_graphics_boxes(
+        nodes,
+        &parsed.inputs,
+        parsed.fix_cross_file_tags,
+        sheet.root,
+    );
+    let point_in_data_box = |idx: usize| -> bool {
+        let [min_h, max_h, min_v, max_v] = nodes[idx].data_box();
+        min_h <= hit_h && hit_h <= max_h && min_v <= hit_v && hit_v <= max_v
+    };
+    let hit_graphics_total = graphics_boxes
+        .iter()
+        .filter(|g| point_in_data_box(g.box_idx))
+        .count();
+
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
-    for idx in selected_nodes {
+    for mut idx in selected_nodes {
+        if parsed.fix_cross_file_tags
+            && tag_is_generated_graphics_tex(&parsed.inputs, nodes[idx].tag)
+        {
+            let mut cur = idx;
+            loop {
+                if let Some(g) = graphics_boxes.iter().find(|g| {
+                    g.gen_root.is_some_and(|gr| {
+                        gr == cur
+                            || (nodes[cur].kind == b'b'
+                                && nodes[cur].parent == Some(g.host_idx)
+                                && nodes[cur].tag == nodes[gr].tag)
+                    })
+                }) {
+                    idx = g.host_idx;
+                    break;
+                }
+                let Some(p_idx) = nodes[cur].parent else {
+                    break;
+                };
+                cur = p_idx;
+            }
+        }
         let tag = nodes[idx].tag;
         let Some((_, raw_path)) = parsed.inputs.iter().rev().find(|(t, _)| *t == tag) else {
             continue;
@@ -2273,7 +2523,7 @@ pub(crate) fn inverse_candidates_in_doc(
         let file = raw_path.trim();
         if file.is_empty() {
             continue;
-        }
+        };
         let Ok(line) = u32::try_from(nodes[idx].line) else {
             continue;
         };
@@ -2283,11 +2533,34 @@ pub(crate) fn inverse_candidates_in_doc(
         let compiler_column = usize::try_from(nodes[idx].column)
             .ok()
             .filter(|&col| col > 1);
+        let mut same_anchor_count = 0usize;
+        let mut hit_index = None;
+        let mut hit_same_anchor = 0usize;
+        for g in &graphics_boxes {
+            if nodes[g.host_idx].tag == tag && nodes[g.host_idx].line == nodes[idx].line {
+                if point_in_data_box(g.box_idx) {
+                    hit_index = Some(same_anchor_count);
+                    hit_same_anchor += 1;
+                }
+                same_anchor_count += 1;
+            }
+        }
+        let graphics = if hit_same_anchor == 1 && hit_graphics_total == 1 {
+            hit_index.map(|index| GraphicsHit::Unique {
+                index,
+                count: same_anchor_count,
+            })
+        } else if hit_same_anchor > 0 {
+            Some(GraphicsHit::Ambiguous)
+        } else {
+            None
+        };
         if seen.insert((file, line, compiler_column)) {
             results.push(RawInverseCandidate {
                 file: file.to_owned(),
                 line,
                 compiler_column,
+                graphics,
             });
         }
     }

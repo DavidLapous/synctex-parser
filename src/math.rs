@@ -4,32 +4,71 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MacroDef<'a> {
-    arity: u8,
-    body: &'a str,
+    pub(super) arity: u8,
+    pub(super) body: &'a str,
 }
 
 #[derive(Debug)]
 struct Atom {
     value: char,
     span: Range<usize>,
+    word_join: bool,
 }
 
 fn canonical(value: char) -> impl Iterator<Item = char> {
-    // TeX's literal hyphen and a PDF mathematical minus denote the same operator.
-    std::iter::once(if value == '−' { '-' } else { value }).nfkc()
+    // Normalize typographic/operator codepoint variants that share a TeX glyph.
+    let mapped = match value {
+        '−' => '-',
+        '∗' => '*',
+        '∙' => '•',
+        '·' => '⋅',
+        '⋯' => '…',
+        '∆' => 'Δ',
+        '⩽' => '≤',
+        '⩾' => '≥',
+        '∣' => '|',
+        '∥' => '‖',
+        '⋃' => '∪',
+        '⋂' => '∩',
+        '⋁' => '∨',
+        '⋀' => '∧',
+        '⨀' => '⊙',
+        '⨁' => '⊕',
+        '⨂' => '⊗',
+        '⨄' => '⊎',
+        '⨆' => '⊔',
+        _ => value,
+    };
+    std::iter::once(mapped).nfkc()
+}
+
+fn append_joined(atoms: &mut Vec<Atom>, value: char, span: Range<usize>, mut join: bool) {
+    for value in canonical(value).filter(|c| !c.is_whitespace()) {
+        let word_join = join && value.is_alphanumeric();
+        atoms.push(Atom {
+            value,
+            span: span.clone(),
+            word_join,
+        });
+        join = value.is_alphanumeric();
+    }
 }
 
 fn append(atoms: &mut Vec<Atom>, value: char, span: Range<usize>) {
-    atoms.extend(
-        canonical(value)
-            .filter(|c| !c.is_whitespace())
-            .map(|value| Atom {
-                value,
-                span: span.clone(),
-            }),
-    );
+    append_joined(atoms, value, span, false);
+}
+
+fn append_words(atoms: &mut Vec<Atom>, text: &str, span: Range<usize>) {
+    for word in text.split_whitespace() {
+        let mut join = false;
+        for c in word.chars() {
+            let before = atoms.len();
+            append_joined(atoms, c, span.clone(), join);
+            join |= atoms.len() > before;
+        }
+    }
 }
 
 pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
@@ -181,10 +220,10 @@ pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usi
     let mut body = None;
     let mut at = 0;
     while at <= byte {
-        while hidden.peek().is_some_and(|(_, range)| range.end <= at) {
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= at) {
             hidden.next();
         }
-        if let Some((start, range)) = hidden.peek()
+        if let Some((start, range, _)) = hidden.peek()
             && *start <= at
         {
             at = range.end;
@@ -226,7 +265,7 @@ pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usi
                     .map_or(source.len(), |pos| at + pos);
                 let limit = hidden
                     .peek()
-                    .map_or(next_special, |(start, _)| next_special.min(*start));
+                    .map_or(next_special, |(start, _, _)| next_special.min(*start));
                 at = limit.max(at + source[at..].chars().next()?.len_utf8());
             }
         }
@@ -351,10 +390,10 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
     let mut counted_to = 0;
     let mut counted_lines = 0;
     while i < source.len() {
-        while hidden.peek().is_some_and(|(_, range)| range.end <= i) {
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= i) {
             hidden.next();
         }
-        if let Some((start, range)) = hidden.peek()
+        if let Some((start, range, _)) = hidden.peek()
             && *start <= i
         {
             i = range.end;
@@ -398,7 +437,7 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
                 .map_or(source.len(), |pos| i + pos);
             let limit = hidden
                 .peek()
-                .map_or(next_special, |(start, _)| next_special.min(*start));
+                .map_or(next_special, |(start, _, _)| next_special.min(*start));
             i = limit.max(i + ch.len_utf8());
         }
     }
@@ -497,7 +536,7 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
     result
 }
 
-pub(super) fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
+fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
     at = super::skip_source_space(source, at);
     if let Some((grp, next)) = group(source, at) {
         let name = source[grp].trim().strip_prefix('\\')?.trim();
@@ -531,7 +570,9 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                 at += 1;
             }
             b'$' => {
-                in_preamble = false;
+                if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
+                    in_preamble = false;
+                }
                 at += 1;
             }
             b'\\' => {
@@ -542,7 +583,9 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                     continue;
                 }
                 if matches!(cmd, "(" | "[") {
-                    in_preamble = false;
+                    if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
+                        in_preamble = false;
+                    }
                     continue;
                 }
                 if matches!(cmd, "begingroup" | "bgroup") {
@@ -562,8 +605,12 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                     continue;
                 }
                 if cmd == "begin" {
-                    in_preamble = false;
-                    if let Some((_, next)) = group(source, at) {
+                    if let Some((env, next)) = group(source, at) {
+                        if &source[env] == "document"
+                            || (brace_depth == 0 && group_depth == 0 && if_depth == 0)
+                        {
+                            in_preamble = false;
+                        }
                         at = next;
                     }
                     group_depth += 1;
@@ -605,42 +652,19 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                 let top_level =
                     in_preamble && brace_depth == 0 && group_depth == 0 && if_depth == 0;
                 at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                if matches!(cmd, "def" | "gdef" | "edef" | "xdef") {
-                    if let Some((name, mut next)) = macro_target_name(source, at) {
-                        table.insert(name, None);
-                        while next < source.len() && source.as_bytes()[next] != b'{' {
-                            if source.as_bytes()[next] == b'\\' {
-                                next = command(source, next).1;
-                            } else if source.as_bytes()[next] == b'%' {
-                                next = super::skip_source_space(source, next);
-                            } else {
-                                next += source[next..].chars().next().map_or(1, char::len_utf8);
-                            }
-                        }
-                        if let Some((_, body_end)) = group(source, next) {
-                            at = body_end;
-                        }
-                    }
-                    continue;
-                }
                 if matches!(
                     cmd,
-                    "NewDocumentCommand"
+                    "def"
+                        | "gdef"
+                        | "edef"
+                        | "xdef"
+                        | "NewDocumentCommand"
                         | "RenewDocumentCommand"
                         | "ProvideDocumentCommand"
                         | "DeclareDocumentCommand"
                 ) {
-                    if let Some((name, mut next)) = macro_target_name(source, at) {
+                    if let Some((name, _)) = macro_target_name(source, at) {
                         table.insert(name, None);
-                        while let Some(opt_end) = super::optional_argument_end(source, next) {
-                            next = opt_end;
-                        }
-                        if let Some((_, spec_end)) = group(source, next) {
-                            next = spec_end;
-                        }
-                        if let Some((_, body_end)) = group(source, next) {
-                            at = body_end;
-                        }
                     }
                     continue;
                 }
@@ -675,11 +699,12 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                 } else {
                     continue;
                 };
-                let Some((body_range, body_end)) = group(source, at) else {
+                let body_open = super::skip_source_space(source, at);
+                let Some((body_range, _)) = group(source, body_open) else {
                     table.insert(name, None);
                     continue;
                 };
-                at = body_end;
+                at = body_open;
                 let Some(arity) = arity.filter(|_| top_level) else {
                     table.insert(name, None);
                     continue;
@@ -703,17 +728,17 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                     }
                     seen_params |= 1 << d;
                 }
-                let entry = valid.then_some(MacroDef { arity, body });
+                let Some(def) = valid.then_some(MacroDef { arity, body }) else {
+                    table.insert(name, None);
+                    continue;
+                };
                 match table.get(name) {
-                    Some(Some(existing))
-                        if entry.is_some_and(|e| {
-                            e.arity == existing.arity && e.body == existing.body
-                        }) => {}
+                    Some(Some(existing)) if *existing == def => {}
                     Some(_) => {
                         table.insert(name, None);
                     }
                     None => {
-                        table.insert(name, entry);
+                        table.insert(name, Some(def));
                     }
                 }
             }
@@ -725,23 +750,71 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
     table
 }
 
-pub(super) fn resolves_macro_at(source: &str, byte: usize, name: &str) -> bool {
-    let table = macros(source);
-    if !table.get(name).is_some_and(Option::is_some) {
-        return false;
+fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
+    pos = super::skip_source_space(source, pos).min(limit);
+    let mut group_end = None;
+    let mut parse_limit = limit;
+    if let Some((inner, end)) = group(source, pos).filter(|(_, e)| *e <= limit) {
+        pos = super::skip_source_space(source, inner.start).min(inner.end);
+        parse_limit = inner.end;
+        group_end = Some(end);
     }
-    let Some(range) = regions(source, byte.saturating_add(1))
-        .into_iter()
-        .find(|range| range.contains(&byte))
-    else {
-        return false;
-    };
-    atoms_with_macros(source, range, &table, 0, None, &[])
-        .is_some_and(|(_, opaque, reordered)| !opaque && !reordered)
+    while pos < parse_limit && matches!(source.as_bytes()[pos], b'+' | b'-') {
+        pos = super::skip_source_space(source, pos + 1).min(parse_limit);
+    }
+    let num_start = pos;
+    let mut digits = 0usize;
+    while pos < parse_limit && source.as_bytes()[pos].is_ascii_digit() {
+        pos += 1;
+        digits += 1;
+    }
+    if pos < parse_limit && matches!(source.as_bytes()[pos], b'.' | b',') {
+        pos += 1;
+        while pos < parse_limit && source.as_bytes()[pos].is_ascii_digit() {
+            pos += 1;
+            digits += 1;
+        }
+    }
+    if pos == num_start || digits == 0 {
+        return None;
+    }
+    pos = super::skip_source_space(source, pos).min(parse_limit);
+    if source[pos..parse_limit]
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+        && !source
+            .as_bytes()
+            .get(pos + 4)
+            .is_some_and(u8::is_ascii_alphabetic)
+    {
+        pos = super::skip_source_space(source, pos + 4).min(parse_limit);
+    }
+    for unit in [
+        "filll", "fill", "fil", "pt", "pc", "in", "bp", "cm", "mm", "dd", "cc", "sp", "em", "ex",
+        "mu", "nd", "nc", "px",
+    ] {
+        if source[pos..parse_limit]
+            .get(..unit.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(unit))
+            && !source
+                .as_bytes()
+                .get(pos + unit.len())
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
+            let unit_end = pos + unit.len();
+            if let Some(end) = group_end {
+                return (super::skip_source_space(source, unit_end).min(parse_limit) == parse_limit)
+                    .then_some(end);
+            }
+            return Some(unit_end);
+        }
+    }
+    None
 }
 
-/// An opaque expression can render glyphs absent from its lexical atoms, or
-/// change their extraction order. Its math atoms cannot prove a location.
+/// Tokenize a math region into character atoms with source byte spans.
+/// Unknown or reordered constructs emit `'\0'` gap atoms so adjacent tokens
+/// stop context scoring at the unknown boundary while remaining addressable.
 fn atoms_with_macros<'a>(
     source: &'a str,
     range: Range<usize>,
@@ -749,13 +822,32 @@ fn atoms_with_macros<'a>(
     depth: u8,
     span_override: Option<Range<usize>>,
     args: &[(&'a str, Range<usize>)],
-) -> Option<(Vec<Atom>, bool, bool)> {
+) -> Option<Vec<Atom>> {
+    if depth >= 64 {
+        return None;
+    }
     let mut result = Vec::new();
-    let mut opaque = false;
-    let mut reordered = false;
     let mut i = range.start;
+    let mut prev_alnum_end = None;
+    let script_arg = |pos: usize| -> Option<(Range<usize>, usize)> {
+        let pos = super::skip_source_space(source, pos).min(range.end);
+        match *source.as_bytes().get(pos)? {
+            b'{' => group(source, pos).filter(|(_, end)| *end <= range.end),
+            b'\\' => {
+                let (_, end) = command(source, pos);
+                (end <= range.end).then_some((pos..end, end))
+            }
+            b'#' => (pos + 2 <= range.end).then_some((pos..pos + 2, pos + 2)),
+            _ => source[pos..range.end]
+                .chars()
+                .next()
+                .map(|c| (pos..pos + c.len_utf8(), pos + c.len_utf8())),
+        }
+    };
     while i < range.end {
         let start = i;
+        let continuing = prev_alnum_end == Some(start);
+        prev_alnum_end = None;
         let ch = source[i..].chars().next()?;
         i += ch.len_utf8();
         let emit_span = |s: Range<usize>| span_override.clone().unwrap_or(s);
@@ -770,74 +862,135 @@ fn atoms_with_macros<'a>(
                     .and_then(|b| args.get(usize::from(b - b'1')))
                 {
                     i += 1;
-                    let (sub, sub_opaque, sub_reordered) =
+                    let sub =
                         atoms_with_macros(arg_src, arg_rng.clone(), macros, depth + 1, None, &[])?;
                     result.extend(sub);
-                    opaque |= sub_opaque;
-                    reordered |= sub_reordered;
                 } else {
                     i += usize::from(
                         i < range.end && source.as_bytes().get(i).is_some_and(u8::is_ascii_digit),
                     );
-                    opaque = true;
                     append(&mut result, '\0', emit_span(start..i));
                 }
             }
             '_' | '^' => {
                 if ch == '^' && source[i..range.end].starts_with('^') {
                     i += 1;
-                    opaque = true;
+                    let hex = source[i..range.end]
+                        .bytes()
+                        .take(2)
+                        .take_while(u8::is_ascii_hexdigit)
+                        .count();
+                    i += if hex == 2 {
+                        2
+                    } else {
+                        source[i..range.end].chars().next().map_or(0, char::len_utf8)
+                    };
                     append(&mut result, '\0', emit_span(start..i));
                     continue;
                 }
-                // A single script has a linear base/script order. Simultaneous
-                // scripts on the same base can extract in visual rather than source order.
-                let arg_pos = super::skip_source_space(source, i).min(range.end);
-                let arg_end = match source.as_bytes().get(arg_pos) {
-                    Some(b'{') => group(source, arg_pos).map(|(_, end)| end),
-                    Some(b'\\') => Some(command(source, arg_pos).1),
-                    Some(b'#') => Some((arg_pos + 2).min(range.end)),
-                    Some(_) => source[arg_pos..range.end]
-                        .chars()
-                        .next()
-                        .map(|c| arg_pos + c.len_utf8()),
-                    None => None,
+                // Simultaneous scripts on the same base can extract in visual
+                // rather than source order; isolate them with '\0' boundaries.
+                let Some((arg1, end1)) = script_arg(i) else {
+                    append(&mut result, '\0', emit_span(start..i));
+                    continue;
                 };
-                reordered |= arg_end.is_none_or(|end| {
-                    let after = super::skip_source_space(source, end).min(range.end);
-                    source[after..range.end].starts_with(['_', '^'])
-                });
+                let after1 = super::skip_source_space(source, end1).min(range.end);
+                if source[after1..range.end].starts_with(['_', '^'])
+                    && !source[after1..range.end].starts_with("^^")
+                {
+                    append(&mut result, '\0', emit_span(start..i));
+                    let sub = atoms_with_macros(
+                        source,
+                        arg1,
+                        macros,
+                        depth + 1,
+                        span_override.clone(),
+                        args,
+                    )?;
+                    result.extend(sub);
+                    i = after1;
+                    while i < range.end
+                        && source[i..range.end].starts_with(['_', '^'])
+                        && !source[i..range.end].starts_with("^^")
+                    {
+                        append(&mut result, '\0', emit_span(i..i + 1));
+                        let Some((arg_next, end_next)) = script_arg(i + 1) else {
+                            i += 1;
+                            break;
+                        };
+                        let sub = atoms_with_macros(
+                            source,
+                            arg_next,
+                            macros,
+                            depth + 1,
+                            span_override.clone(),
+                            args,
+                        )?;
+                        result.extend(sub);
+                        i = super::skip_source_space(source, end_next).min(range.end);
+                    }
+                    append(&mut result, '\0', emit_span(start..i));
+                }
             }
             '\\' => {
                 let (name, end) = command(source, start);
                 i = end;
                 let span = emit_span(start..end);
                 if name == "label" {
-                    i = group(source, i)?.1;
+                    while let Some(opt_end) =
+                        super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                    {
+                        i = opt_end;
+                    }
+                    if let Some((_, grp_end)) = group(source, i).filter(|(_, e)| *e <= range.end) {
+                        i = grp_end;
+                    }
                     continue;
                 }
                 if name == "begin" {
-                    let (environment, end) = group(source, i)?;
+                    let (environment, mut end) =
+                        group(source, i).filter(|(_, e)| *e <= range.end)?;
                     let environment = &source[environment];
-                    if !math_environment(environment) {
-                        opaque = true;
+                    let base = environment.trim_end_matches('*');
+                    if matches!(base, "alignat" | "xalignat" | "xxalignat" | "subarray") {
+                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
+                            end = e;
+                        }
+                    } else if matches!(base, "array" | "tabular") {
+                        if let Some(opt_end) =
+                            super::optional_argument_end(source, end).filter(|e| *e <= range.end)
+                        {
+                            end = opt_end;
+                        }
+                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
+                            end = e;
+                        }
+                    } else if matches!(base, "tabular*" | "tabularx") {
+                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
+                            end = e;
+                        }
+                        if let Some(opt_end) =
+                            super::optional_argument_end(source, end).filter(|e| *e <= range.end)
+                        {
+                            end = opt_end;
+                        }
+                        if let Some((_, e)) = group(source, end).filter(|(_, e)| *e <= range.end) {
+                            end = e;
+                        }
+                    } else if !math_environment(environment) {
                         append(&mut result, '\0', span);
                     }
                     i = end;
-                    if environment.trim_end_matches('*') == "alignat" {
-                        i = group(source, i)?.1;
-                    }
                     continue;
                 }
                 if name == "end" {
-                    let (environment, end) = group(source, i)?;
-                    opaque |= !math_environment(&source[environment]);
+                    let (_, end) = group(source, i).filter(|(_, e)| *e <= range.end)?;
                     i = end;
                     continue;
                 }
-                if let Some(entry) = macros.get(name).copied() {
-                    if depth < 4
-                        && let Some(def) = entry
+                if let Some(macro_entry) = macros.get(name).copied() {
+                    if let Some(def) = macro_entry
+                        && depth + 16 <= 64
                     {
                         let mut call_args = Vec::with_capacity(usize::from(def.arity));
                         let mut arg_cursor = i;
@@ -866,40 +1019,39 @@ fn atoms_with_macros<'a>(
                         if call_args.len() == usize::from(def.arity) {
                             i = arg_cursor;
                             let after = super::skip_source_space(source, i).min(range.end);
-                            let body_has_script_or_cmd = def.body.contains(['_', '^', '\\']);
-                            let args_have_script = call_args
-                                .iter()
-                                .any(|(src, rng)| src[rng.clone()].contains(['_', '^']));
-                            if body_has_script_or_cmd
+                            let boundary_script = def.body.contains(['_', '^', '\\'])
                                 && (source[after..range.end].starts_with(['_', '^'])
-                                    || (def.body.contains(['_', '^']) && args_have_script))
-                            {
-                                reordered = true;
+                                    || (def.body.contains(['_', '^'])
+                                        && call_args.iter().any(|(src, rng)| {
+                                            src[rng.clone()].contains(['_', '^'])
+                                        })));
+                            if boundary_script {
+                                append(&mut result, '\0', span.clone());
                             }
-                            let (sub, sub_opaque, sub_reordered) = atoms_with_macros(
+                            let sub = atoms_with_macros(
                                 def.body,
                                 0..def.body.len(),
                                 macros,
-                                depth + 1,
+                                depth + 16,
                                 Some(span.clone()),
                                 &call_args,
                             )?;
-                            if sub_opaque {
-                                opaque = true;
+                            result.extend(sub);
+                            if boundary_script {
                                 append(&mut result, '\0', span);
-                            } else {
-                                result.extend(sub);
-                                reordered |= sub_reordered;
                             }
                             continue;
                         }
+                        i = arg_cursor;
                     }
-                    opaque = true;
-                    append(&mut result, '\0', span);
-                    while let Some((_, end)) = group(source, i).filter(|(_, end)| *end <= range.end)
+                    while let Some(end) = super::optional_argument_end(source, i)
+                        .or_else(|| super::overlay_argument_end(source, i))
+                        .or_else(|| group(source, i).map(|(_, e)| e))
+                        .filter(|e| *e <= range.end)
                     {
                         i = end;
                     }
+                    append(&mut result, '\0', span);
                     continue;
                 }
                 // These standard wrappers change appearance, not character identity.
@@ -908,26 +1060,77 @@ fn atoms_with_macros<'a>(
                     "mathcal"
                         | "mathbb"
                         | "mathbbm"
+                        | "mathbbb"
                         | "mathds"
                         | "mathfrak"
                         | "mathscr"
                         | "mathrm"
                         | "mathbf"
+                        | "mathbfit"
                         | "mathsf"
+                        | "mathsfit"
+                        | "mathbfsfit"
+                        | "mathbfcal"
+                        | "mathbfscr"
                         | "mathtt"
                         | "mathit"
+                        | "mathnormal"
+                        | "mathbold"
+                        | "symrm"
+                        | "symit"
+                        | "symsf"
+                        | "symtt"
+                        | "symbb"
+                        | "symcal"
+                        | "symscr"
+                        | "symfrak"
+                        | "symnormal"
+                        | "symbf"
+                        | "symbfit"
+                        | "symbfsfit"
+                        | "symsfit"
+                        | "symbfcal"
+                        | "symbffrak"
+                        | "symbfscr"
+                        | "symbfsf"
+                        | "symbftt"
                         | "textbf"
                         | "textit"
                         | "textrm"
                         | "textsf"
                         | "texttt"
                         | "textup"
+                        | "textnormal"
+                        | "textsc"
+                        | "textsl"
+                        | "textmd"
+                        | "textlf"
+                        | "textulc"
+                        | "normalfont"
+                        | "rmfamily"
+                        | "sffamily"
+                        | "ttfamily"
+                        | "bfseries"
+                        | "mdseries"
+                        | "lfseries"
+                        | "itshape"
+                        | "slshape"
+                        | "scshape"
+                        | "upshape"
+                        | "rm"
+                        | "bf"
+                        | "it"
+                        | "sl"
+                        | "sf"
+                        | "tt"
+                        | "sc"
+                        | "cal"
+                        | "mit"
+                        | "oldstylenums"
                         | "emph"
                         | "bm"
                         | "boldsymbol"
                         | "boxed"
-                        | "mathnormal"
-                        | "textnormal"
                         | "displaystyle"
                         | "textstyle"
                         | "scriptstyle"
@@ -979,40 +1182,193 @@ fn atoms_with_macros<'a>(
                         | "Bigm"
                         | "biggm"
                         | "Biggm"
+                        | "dfrac"
+                        | "tfrac"
+                        | "cfrac"
+                        | "binom"
+                        | "tbinom"
+                        | "dbinom"
+                        | "substack"
+                        | "mbox"
+                        | "hbox"
+                        | "mathclap"
+                        | "mathllap"
+                        | "mathrlap"
                 ) {
+                    continue;
+                }
+                if matches!(name, "kern" | "mkern" | "mskip" | "hskip" | "vskip") {
+                    let mut dim_end = skip_tex_dimen(source, i, range.end)?;
+                    if matches!(name, "mskip" | "hskip" | "vskip") {
+                        loop {
+                            let kw = super::skip_source_space(source, dim_end).min(range.end);
+                            let kw_end = if source[kw..range.end]
+                                .get(..4)
+                                .is_some_and(|s| s.eq_ignore_ascii_case("plus"))
+                            {
+                                kw + 4
+                            } else if source[kw..range.end]
+                                .get(..5)
+                                .is_some_and(|s| s.eq_ignore_ascii_case("minus"))
+                            {
+                                kw + 5
+                            } else {
+                                break;
+                            };
+                            if source
+                                .as_bytes()
+                                .get(kw_end)
+                                .is_some_and(u8::is_ascii_alphabetic)
+                            {
+                                break;
+                            }
+                            dim_end = skip_tex_dimen(source, kw_end, range.end)?;
+                        }
+                    }
+                    i = dim_end;
                     continue;
                 }
                 if matches!(
                     name,
-                    "textcolor" | "color" | "phantom" | "hphantom" | "vphantom"
+                    "textcolor"
+                        | "color"
+                        | "phantom"
+                        | "hphantom"
+                        | "vphantom"
+                        | "hspace"
+                        | "vspace"
+                        | "raisebox"
+                        | "ref"
+                        | "eqref"
+                        | "pageref"
+                        | "autoref"
+                        | "cref"
+                        | "Cref"
+                        | "cite"
+                        | "citep"
+                        | "citet"
+                        | "nocite"
                 ) {
-                    while let Some(opt_end) = super::optional_argument_end(source, i) {
+                    i += usize::from(
+                        i < range.end && source.as_bytes().get(i) == Some(&b'*'),
+                    );
+                    while let Some(opt_end) = super::optional_argument_end(source, i)
+                        .or_else(|| super::overlay_argument_end(source, i))
+                        .filter(|e| *e <= range.end)
+                    {
                         i = opt_end;
                     }
-                    if let Some((_, grp_end)) = group(source, i) {
+                    if let Some((_, grp_end)) = group(source, i).filter(|(_, e)| *e <= range.end) {
                         i = grp_end;
+                    }
+                    while name == "raisebox"
+                        && let Some(opt_end) =
+                            super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                    {
+                        i = opt_end;
+                    }
+                    if matches!(
+                        name,
+                        "ref"
+                            | "eqref"
+                            | "pageref"
+                            | "autoref"
+                            | "cref"
+                            | "Cref"
+                            | "cite"
+                            | "citep"
+                            | "citet"
+                            | "nocite"
+                    ) {
+                        append(&mut result, '\0', span);
+                    }
+                    continue;
+                }
+                if name == "not" {
+                    let next = super::skip_source_space(source, i).min(range.end);
+                    let negated = if source[next..range.end].starts_with('=') {
+                        Some(('≠', next + 1))
+                    } else if source[next..range.end].starts_with('<') {
+                        Some(('≮', next + 1))
+                    } else if source[next..range.end].starts_with('>') {
+                        Some(('≯', next + 1))
+                    } else if source[next..range.end].starts_with('|') {
+                        Some(('∤', next + 1))
+                    } else if source[next..range.end].starts_with('\\') {
+                        let (next_cmd, next_end) = command(source, next);
+                        if macros.contains_key(next_cmd) {
+                            return None;
+                        }
+                        let c = match next_cmd {
+                            "in" => Some('∉'),
+                            "owns" | "ni" => Some('∌'),
+                            "exists" => Some('∄'),
+                            "equiv" => Some('≢'),
+                            "le" | "leq" | "leqslant" => Some('≰'),
+                            "ge" | "geq" | "geqslant" => Some('≱'),
+                            "lt" => Some('≮'),
+                            "gt" => Some('≯'),
+                            "subset" => Some('⊄'),
+                            "supset" => Some('⊅'),
+                            "subseteq" => Some('⊈'),
+                            "supseteq" => Some('⊉'),
+                            "sim" => Some('≁'),
+                            "approx" => Some('≉'),
+                            "cong" => Some('≇'),
+                            "prec" => Some('⊀'),
+                            "succ" => Some('⊁'),
+                            "preceq" => Some('⋠'),
+                            "succeq" => Some('⋡'),
+                            "vdash" => Some('⊬'),
+                            "models" | "vDash" => Some('⊭'),
+                            "Vdash" => Some('⊮'),
+                            "mid" | "vert" => Some('∤'),
+                            "parallel" | "Vert" | "|" => Some('∦'),
+                            _ => None,
+                        };
+                        c.filter(|_| next_end <= range.end).map(|c| (c, next_end))
+                    } else {
+                        None
+                    };
+                    if let Some((c, next_end)) = negated {
+                        i = next_end;
+                        append(&mut result, c, emit_span(start..i));
+                    } else {
+                        return None;
                     }
                     continue;
                 }
                 match Token::from_command(name) {
+                    Token::Operator(_) if name == "ni" => append(&mut result, '∋', span),
+                    Token::Operator(_) if name == "smallsetminus" => append(&mut result, '∖', span),
                     Token::Letter(c, _)
                     | Token::Operator(c)
                     | Token::BigOp(c)
                     | Token::Integral(c) => append(&mut result, c, span),
-                    Token::Function(text) | Token::Lim(text) => {
-                        for c in text.chars() {
-                            append(&mut result, c, span.clone());
-                        }
-                    }
+                    Token::Function(text) | Token::Lim(text) => append_words(&mut result, text, span),
                     Token::Paren(text) if !text.starts_with('&') => {
                         for c in text.chars() {
                             append(&mut result, c, span.clone());
                         }
                     }
                     Token::Sqrt => {
-                        // Optional root indices change PDF extraction order and
-                        // contain non-rendered brackets; do not treat them as text.
-                        reordered |= source[i..range.end].trim_start().starts_with('[');
+                        if let Some(opt_end) =
+                            super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                        {
+                            let opt_start = super::skip_source_space(source, i) + 1;
+                            append(&mut result, '\0', span.clone());
+                            let sub = atoms_with_macros(
+                                source,
+                                opt_start..opt_end - 1,
+                                macros,
+                                depth + 1,
+                                span_override.clone(),
+                                args,
+                            )?;
+                            result.extend(sub);
+                            append(&mut result, '\0', span.clone());
+                            i = opt_end;
+                        }
                         append(&mut result, '√', span);
                     }
                     Token::Left | Token::Right | Token::Middle | Token::Big(_) => {
@@ -1030,6 +1386,139 @@ fn atoms_with_macros<'a>(
                     | Token::Under(_, _)
                     | Token::NewLine => {}
                     _ => match name {
+                        "varkappa" => append(&mut result, 'ϰ', span),
+                        "backepsilon" => append(&mut result, '϶', span),
+                        "varGamma" => append(&mut result, 'Γ', span),
+                        "varDelta" => append(&mut result, 'Δ', span),
+                        "varTheta" => append(&mut result, 'Θ', span),
+                        "varLambda" => append(&mut result, 'Λ', span),
+                        "varXi" => append(&mut result, 'Ξ', span),
+                        "varPi" => append(&mut result, 'Π', span),
+                        "varSigma" => append(&mut result, 'Σ', span),
+                        "varUpsilon" => append(&mut result, 'Υ', span),
+                        "varPhi" => append(&mut result, 'Φ', span),
+                        "varPsi" => append(&mut result, 'Ψ', span),
+                        "varOmega" => append(&mut result, 'Ω', span),
+                        "le" | "leqslant" => append(&mut result, '≤', span),
+                        "ge" | "geqslant" => append(&mut result, '≥', span),
+                        "neg" => append(&mut result, '¬', span),
+                        "owns" => append(&mut result, '∋', span),
+                        "bigotimes" => append(&mut result, '⨂', span),
+                        "biguplus" => append(&mut result, '⨄', span),
+                        "frown" | "smallfrown" => append(&mut result, '⌢', span),
+                        "smallsmile" => append(&mut result, '⌣', span),
+                        "dots" | "dotsb" | "dotsc" | "dotsi" | "dotsm" | "dotso" | "hdots" => {
+                            append(&mut result, '…', span)
+                        }
+                        "ast" => append(&mut result, '∗', span),
+                        "diamond" => append(&mut result, '⋄', span),
+                        "Diamond" | "lozenge" => append(&mut result, '◊', span),
+                        "blacklozenge" => append(&mut result, '⧫', span),
+                        "Box" | "square" => append(&mut result, '□', span),
+                        "blacksquare" => append(&mut result, '■', span),
+                        "bigstar" => append(&mut result, '★', span),
+                        "triangle" | "vartriangle" => append(&mut result, '△', span),
+                        "bigtriangledown" | "triangledown" => append(&mut result, '▽', span),
+                        "blacktriangle" => append(&mut result, '▲', span),
+                        "blacktriangledown" => append(&mut result, '▼', span),
+                        "blacktriangleleft" => append(&mut result, '◀', span),
+                        "blacktriangleright" => append(&mut result, '▶', span),
+                        "vartriangleleft" => append(&mut result, '⊲', span),
+                        "vartriangleright" => append(&mut result, '⊳', span),
+                        "trianglelefteq" => append(&mut result, '⊴', span),
+                        "trianglerighteq" => append(&mut result, '⊵', span),
+                        "bigcirc" => append(&mut result, '◯', span),
+                        "centerdot" => append(&mut result, '⋅', span),
+                        "intercal" => append(&mut result, '⊺', span),
+                        "amalg" => append(&mut result, '⨿', span),
+                        "wr" => append(&mut result, '≀', span),
+                        "dagger" | "dag" => append(&mut result, '†', span),
+                        "ddagger" | "ddag" => append(&mut result, '‡', span),
+                        "ltimes" => append(&mut result, '⋉', span),
+                        "rtimes" => append(&mut result, '⋊', span),
+                        "bowtie" | "Join" => append(&mut result, '⋈', span),
+                        "asymp" => append(&mut result, '≍', span),
+                        "doteq" => append(&mut result, '≐', span),
+                        "circeq" => append(&mut result, '≗', span),
+                        "triangleq" => append(&mut result, '≜', span),
+                        "bumpeq" => append(&mut result, '≏', span),
+                        "Bumpeq" => append(&mut result, '≎', span),
+                        "eqsim" => append(&mut result, '≂', span),
+                        "backsimeq" => append(&mut result, '⋍', span),
+                        "thicksim" => append(&mut result, '∼', span),
+                        "thickapprox" => append(&mut result, '≈', span),
+                        "lesssim" => append(&mut result, '≲', span),
+                        "gtrsim" => append(&mut result, '≳', span),
+                        "lessapprox" => append(&mut result, '⪅', span),
+                        "gtrapprox" => append(&mut result, '⪆', span),
+                        "lessgtr" => append(&mut result, '≶', span),
+                        "gtrless" => append(&mut result, '≷', span),
+                        "lesseqgtr" => append(&mut result, '⋚', span),
+                        "gtreqless" => append(&mut result, '⋛', span),
+                        "preceq" => append(&mut result, '⪯', span),
+                        "succeq" => append(&mut result, '⪰', span),
+                        "preccurlyeq" => append(&mut result, '≼', span),
+                        "succcurlyeq" => append(&mut result, '≽', span),
+                        "precsim" => append(&mut result, '≾', span),
+                        "succsim" => append(&mut result, '≿', span),
+                        "nprec" => append(&mut result, '⊀', span),
+                        "nsucc" => append(&mut result, '⊁', span),
+                        "subseteqq" => append(&mut result, '⫅', span),
+                        "supseteqq" => append(&mut result, '⫆', span),
+                        "nsubseteq" => append(&mut result, '⊈', span),
+                        "nsupseteq" => append(&mut result, '⊉', span),
+                        "subsetneq" | "varsubsetneq" => append(&mut result, '⊊', span),
+                        "supsetneq" | "varsupsetneq" => append(&mut result, '⊋', span),
+                        "sqsubset" => append(&mut result, '⊏', span),
+                        "sqsupset" => append(&mut result, '⊐', span),
+                        "nmid" => append(&mut result, '∤', span),
+                        "nparallel" => append(&mut result, '∦', span),
+                        "nless" => append(&mut result, '≮', span),
+                        "ngtr" => append(&mut result, '≯', span),
+                        "nleq" | "nleqslant" => append(&mut result, '≰', span),
+                        "ngeq" | "ngeqslant" => append(&mut result, '≱', span),
+                        "nsim" => append(&mut result, '≁', span),
+                        "ncong" => append(&mut result, '≇', span),
+                        "vDash" => append(&mut result, '⊨', span),
+                        "Vdash" => append(&mut result, '⊩', span),
+                        "Vvdash" => append(&mut result, '⊪', span),
+                        "nvdash" => append(&mut result, '⊬', span),
+                        "nvDash" => append(&mut result, '⊭', span),
+                        "nVdash" => append(&mut result, '⊮', span),
+                        "nVDash" => append(&mut result, '⊯', span),
+                        "surd" => append(&mut result, '√', span),
+                        "measuredangle" => append(&mut result, '∡', span),
+                        "sphericalangle" => append(&mut result, '∢', span),
+                        "nexists" => append(&mut result, '∄', span),
+                        "hslash" => append(&mut result, 'ℏ', span),
+                        "beth" => append(&mut result, 'ℶ', span),
+                        "gimel" => append(&mut result, 'ℷ', span),
+                        "daleth" => append(&mut result, 'ℸ', span),
+                        "complement" => append(&mut result, '∁', span),
+                        "mho" => append(&mut result, '℧', span),
+                        "prime" => append(&mut result, '′', span),
+                        "backprime" => append(&mut result, '‵', span),
+                        "checkmark" => append(&mut result, '✓', span),
+                        "maltese" => append(&mut result, '✠', span),
+                        "S" | "mathsection" => append(&mut result, '§', span),
+                        "P" | "mathparagraph" => append(&mut result, '¶', span),
+                        "pounds" | "mathsterling" => append(&mut result, '£', span),
+                        "yen" => append(&mut result, '¥', span),
+                        "backslash" => append(&mut result, '\\', span),
+                        "ulcorner" => append(&mut result, '⌜', span),
+                        "urcorner" => append(&mut result, '⌝', span),
+                        "llcorner" => append(&mut result, '⌞', span),
+                        "lrcorner" => append(&mut result, '⌟', span),
+                        "iiiint" => append(&mut result, '⨌', span),
+                        "intop" => append(&mut result, '∫', span),
+                        "ointop" => append(&mut result, '∮', span),
+                        "oiint" => append(&mut result, '∯', span),
+                        "oiiint" => append(&mut result, '∰', span),
+                        "idotsint" => {
+                            for c in ['∫', '…', '∫'] {
+                                append(&mut result, c, span.clone());
+                            }
+                        }
                         "colon" => append(&mut result, ':', span),
                         "langle" => append(&mut result, '⟨', span),
                         "rangle" => append(&mut result, '⟩', span),
@@ -1038,31 +1527,53 @@ fn atoms_with_macros<'a>(
                         "lfloor" => append(&mut result, '⌊', span),
                         "rfloor" => append(&mut result, '⌋', span),
                         "lvert" | "rvert" | "vert" => append(&mut result, '|', span),
-                        "lVert" | "rVert" | "Vert" => append(&mut result, '‖', span),
+                        "lVert" | "rVert" | "Vert" | "|" => append(&mut result, '‖', span),
                         "Bbbk" => append(&mut result, 'k', span),
                         "hookrightarrow" => append(&mut result, '↪', span),
                         "hookleftarrow" => append(&mut result, '↩', span),
                         "twoheadrightarrow" => append(&mut result, '↠', span),
                         "twoheadleftarrow" => append(&mut result, '↞', span),
+                        "leadsto" | "rightsquigarrow" => append(&mut result, '⇝', span),
+                        "leftrightsquigarrow" => append(&mut result, '↭', span),
+                        "mapsfrom" => append(&mut result, '↤', span),
+                        "longmapsfrom" => append(&mut result, '⟻', span),
+                        "Longmapsto" => append(&mut result, '⟾', span),
                         "bigsqcup" | "sqcup" => append(&mut result, '⊔', span),
                         "bigsqcap" | "sqcap" => append(&mut result, '⊓', span),
                         "llbracket" => append(&mut result, '⟦', span),
                         "rrbracket" => append(&mut result, '⟧', span),
-                        "smallsetminus" => append(&mut result, '∖', span),
                         "varnothing" => append(&mut result, '∅', span),
                         "to" => append(&mut result, '→', span),
                         "gets" => append(&mut result, '←', span),
                         "xrightarrow" | "xleftarrow" => {
-                            reordered |= source[i..range.end].trim_start().starts_with('[');
+                            if let Some(opt_end) =
+                                super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                            {
+                                let opt_start = super::skip_source_space(source, i) + 1;
+                                append(&mut result, '\0', span.clone());
+                                let sub = atoms_with_macros(
+                                    source,
+                                    opt_start..opt_end - 1,
+                                    macros,
+                                    depth + 1,
+                                    span_override.clone(),
+                                    args,
+                                )?;
+                                result.extend(sub);
+                                append(&mut result, '\0', span.clone());
+                                i = opt_end;
+                            }
                             append(
                                 &mut result,
                                 if name == "xrightarrow" { '→' } else { '←' },
-                                span,
+                                span.clone(),
                             );
+                            append(&mut result, '\0', span);
                         }
                         "iff" => append(&mut result, '⇔', span),
                         "implies" => append(&mut result, '⇒', span),
-                        "coloneqq" => {
+                        "impliedby" => append(&mut result, '⇐', span),
+                        "coloneqq" | "coloneq" | "defeq" | "assign" => {
                             for c in [':', '='] {
                                 append(&mut result, c, span.clone());
                             }
@@ -1072,7 +1583,7 @@ fn atoms_with_macros<'a>(
                                 append(&mut result, c, span.clone());
                             }
                         }
-                        "eqqcolon" => {
+                        "eqqcolon" | "eqcolon" => {
                             for c in ['=', ':'] {
                                 append(&mut result, c, span.clone());
                             }
@@ -1082,21 +1593,35 @@ fn atoms_with_macros<'a>(
                                 append(&mut result, c, span.clone());
                             }
                         }
+                        "Pr" | "gcd" | "deg" | "hom" | "lg" | "mod" | "arcsinh" | "arccosh"
+                        | "arctanh" | "csch" | "sech" => append_words(&mut result, name, span),
+                        "argmin" => append_words(&mut result, "arg min", span),
+                        "argmax" => append_words(&mut result, "arg max", span),
+                        "injlim" => append_words(&mut result, "inj lim", span),
+                        "projlim" => append_words(&mut result, "proj lim", span),
+                        "varinjlim" | "varprojlim" | "varliminf" | "varlimsup" => {
+                            append_words(&mut result, "lim", span)
+                        }
                         _ => {
-                            opaque = true;
-                            append(&mut result, '\0', span);
-                            while let Some((_, end)) = group(source, i) {
+                            while let Some(end) = super::optional_argument_end(source, i)
+                                .or_else(|| super::overlay_argument_end(source, i))
+                                .filter(|e| *e <= range.end)
+                            {
                                 i = end;
                             }
+                            append(&mut result, '\0', span);
                         }
                     },
                 }
             }
-            c if !c.is_whitespace() => append(&mut result, c, emit_span(start..i)),
+            c if !c.is_whitespace() => {
+                append_joined(&mut result, c, emit_span(start..i), continuing);
+                prev_alnum_end = c.is_alphanumeric().then_some(i);
+            }
             _ => {}
         }
     }
-    Some((result, opaque, reordered))
+    Some(result)
 }
 
 fn private_use(c: char) -> bool {
@@ -1156,33 +1681,13 @@ pub(super) fn source_location(
     let macros = macros(source);
     let mut best = None;
     let mut tied = false;
-    let mut saw_opaque = false;
-    let mut opaque_word = false;
-    let has_word = |atoms: &[Atom]| {
-        atoms.windows(word.len()).any(|w| {
-            w.iter()
-                .zip(&pdf[word.clone()])
-                .all(|(a, b)| a.value == b.value)
-        })
-    };
     for range in regions {
         if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
             || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
         {
             continue;
         }
-        let (atoms, opaque, reordered) =
-            atoms_with_macros(source, range.clone(), &macros, 0, None, &[])?;
-        if opaque {
-            saw_opaque = true;
-            opaque_word |= has_word(&atoms);
-            continue;
-        }
-        if reordered {
-            saw_opaque |= atoms.iter().any(|atom| atom.value == pdf[selected].value);
-            opaque_word |= has_word(&atoms);
-            continue;
-        }
+        let atoms = atoms_with_macros(source, range.clone(), &macros, 0, None, &[])?;
         let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
             if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
@@ -1208,17 +1713,10 @@ pub(super) fn source_location(
             }
             // A PDF word cannot be a substring of a longer source word.
             if pdf[selected].value.is_alphanumeric()
-                && (begin
-                    .checked_sub(1)
-                    .and_then(|i| atoms.get(i))
-                    .is_some_and(|previous| {
-                        previous.value.is_alphanumeric()
-                            && previous.span.end == atoms[begin].span.start
-                    })
-                    || atoms.get(begin + word.len()).is_some_and(|next| {
-                        next.value.is_alphanumeric()
-                            && atoms[begin + word.len() - 1].span.end == next.span.start
-                    }))
+                && (atoms[begin].word_join
+                    || atoms
+                        .get(begin + word.len())
+                        .is_some_and(|next| next.word_join))
             {
                 continue;
             }
@@ -1250,7 +1748,7 @@ pub(super) fn source_location(
                             score += 9 - distance;
                             lexical_score += usize::from(a.value.is_alphanumeric());
                         }
-                        (Some(_), Some(_)) if distance == 1 => {
+                        (Some(a), Some(_)) if a.value != '\0' && distance == 1 => {
                             contradictions += 1;
                             break;
                         }
@@ -1264,7 +1762,7 @@ pub(super) fn source_location(
                 continue;
             }
             let location = (row as u32, atom.span.start - starts[row - 1]);
-            let proximity = if within_frame {
+            let proximity = if within_frame || score == 0 {
                 0
             } else {
                 location.0.abs_diff(line)
@@ -1286,40 +1784,11 @@ pub(super) fn source_location(
             }
         }
     }
-    let known_math = best.is_some() || opaque_word;
-    let mathematical = best
-        .filter(|_| !tied && !opaque_word)
-        .map(|(_, location)| location);
+    let mathematical = best.filter(|_| !tied).map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
-        && !opaque_word
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
         return prose.map(|(row, byte, _)| (row, byte));
-    }
-    // Opaque math leaves symbols uncertain. A complete literal prose word still
-    // identifies its known source span when no math match competes.
-    if saw_opaque {
-        let literal_word = word.len() > 1
-            && pdf[word.clone()]
-                .iter()
-                .all(|atom| atom.value.is_alphabetic());
-        if prose.is_some() && known_math {
-            return None;
-        }
-        let prose = prose.filter(|(row, _, score)| {
-            !known_math
-                && (*score >= 3
-                    || (literal_word
-                        || source
-                            .lines()
-                            .nth(*row as usize - 1)
-                            .is_some_and(|line| line.contains("\\begin{frame}")))
-                        && pdf[word.clone()]
-                            .iter()
-                            .all(|atom| atom.value.is_alphabetic()))
-        });
-        let mathematical = mathematical.filter(|_| literal_word);
-        return prose.map(|(row, byte, _)| (row, byte)).or(mathematical);
     }
     match (prose, mathematical) {
         (Some(_), Some(_)) => None,
@@ -1470,14 +1939,23 @@ mod tests {
     }
 
     #[test]
-    fn opaque_duplicate_expressions_cannot_make_other_matches_unique() {
+    fn unknown_commands_insert_gap_atoms_without_poisoning_known_tokens() {
         let source = "$x\\longmapsto y+\\custom{z}$\n$x\\longmapsto y$";
         assert_eq!(source_location(source, 2, 0..2, true, "x⟼y", 1, None), None);
         let source = "$x\\longmapsto\\custom y$\n$x\\longmapsto h$";
-        assert_eq!(source_location(source, 2, 0..2, true, "x⟼y", 1, None), None);
-        assert_eq!(source_location(source, 2, 0..2, true, "x⟼h", 1, None), None);
+        assert_eq!(
+            source_location(source, 2, 0..2, true, "x⟼y", 1, None),
+            Some((1, 2))
+        );
+        assert_eq!(
+            source_location(source, 2, 0..2, true, "x⟼h", 1, None),
+            Some((2, 2))
+        );
         let source = "$\\alpha\\custom{z}$\n$\\beta$";
-        assert_eq!(source_location(source, 2, 0..2, true, "β", 0, None), None);
+        assert_eq!(
+            source_location(source, 2, 0..2, true, "β", 0, None),
+            Some((2, 1))
+        );
         let source = "$\\custom{z}$\nA. Box in 2020";
         assert_eq!(
             source_location(source, 2, 0..2, true, "A. Box", 0, Some((2, 0, 3))),
@@ -1498,15 +1976,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_equations_opaque_commands_and_private_glyphs_stay_coarse() {
+    fn duplicate_equations_unknown_commands_and_private_glyphs() {
         let source = "$\\alpha\\leq\\beta$\n$\\gamma\\geq\\delta$\n$\\alpha\\leq\\beta$";
         assert_eq!(
             source_location(source, 3, 0..3, true, "α≤β γ≥δ α≤β", 0, None),
             None
         );
         assert_eq!(
-            source_location("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0, Some((1, 9, 0))),
-            None
+            source_location("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0, None),
+            Some((1, 9))
         );
         assert_eq!(
             source_location("$\\mathcal H$", 1, 0..1, false, "\u{e234}", 0, None),
@@ -1575,5 +2053,164 @@ caption}";
         assert_eq!(caption_lines(source, 3), None);
         assert_eq!(caption_lines(source, 6), None);
         assert_eq!(caption_lines(source, 9), Some(7..9));
+    }
+
+    #[test]
+    fn text_math_modifiers_greek_variants_and_standard_symbols_match() {
+        for wrapper in [
+            "text",
+            "texttt",
+            "textnormal",
+            "textit",
+            "textbf",
+            "textrm",
+            "textsf",
+            "textup",
+            "textsc",
+            "textsl",
+            "textmd",
+            "mathrm",
+            "mathit",
+            "mathbf",
+            "mathsf",
+            "mathtt",
+            "mathcal",
+            "mathbb",
+            "mathfrak",
+            "mathscr",
+            "mathnormal",
+            "symrm",
+            "symit",
+            "symbf",
+            "symsf",
+            "symtt",
+            "symbb",
+            "symcal",
+            "symscr",
+            "symfrak",
+            "symnormal",
+        ] {
+            let source = format!("$\\{wrapper}{{K}}+y$");
+            assert_eq!(
+                source_location(&source, 1, 0..1, false, "K+y", 0, None),
+                Some((1, source.find("{K}").unwrap() + 1)),
+                "{wrapper}"
+            );
+        }
+
+        let greek = "$\\varkappa+\\varepsilon+\\varphi+\\vartheta+\\varrho+\\varpi+\\varsigma+\\varGamma+\\varDelta+\\varOmega$";
+        let greek_pdf = "ϰ+ϵ+ϕ+ϑ+ϱ+ϖ+ς+Γ+∆+Ω";
+        for (needle, tex) in [
+            ("ϰ", "\\varkappa"),
+            ("ϵ", "\\varepsilon"),
+            ("ϕ", "\\varphi"),
+            ("ϑ", "\\vartheta"),
+            ("ϱ", "\\varrho"),
+            ("ϖ", "\\varpi"),
+            ("ς", "\\varsigma"),
+            ("Γ", "\\varGamma"),
+            ("∆", "\\varDelta"),
+            ("Ω", "\\varOmega"),
+        ] {
+            assert_eq!(
+                source_location(
+                    greek,
+                    1,
+                    0..1,
+                    false,
+                    greek_pdf,
+                    greek_pdf.find(needle).unwrap(),
+                    None,
+                ),
+                Some((1, greek.find(tex).unwrap())),
+                "{tex}"
+            );
+        }
+
+        let symbols = "$a\\le b\\ge c\\ni d\\owns e\\bigotimes f\\frown g\\smallsetminus h\\neg p\\not\\in S\\not=0\\dots\\ast\\|v\\|\\mid w$";
+        let symbols_pdf = "a≤b≥c∋d∋e⨂f⌢g∖h¬p∉S≠0⋯*‖v‖|w";
+        for (needle, tex) in [
+            ("≤", "\\le"),
+            ("≥", "\\ge"),
+            ("⨂", "\\bigotimes"),
+            ("⌢", "\\frown"),
+            ("∖", "\\smallsetminus"),
+            ("¬", "\\neg"),
+            ("∉", "\\not\\in"),
+            ("≠", "\\not="),
+            ("⋯", "\\dots"),
+            ("*", "\\ast"),
+            ("|w", "\\mid"),
+        ] {
+            assert_eq!(
+                source_location(
+                    symbols,
+                    1,
+                    0..1,
+                    false,
+                    symbols_pdf,
+                    symbols_pdf.find(needle).unwrap(),
+                    None,
+                ),
+                Some((1, symbols.find(tex).unwrap())),
+                "{tex}"
+            );
+        }
+
+        let trig = "$x\\sin\\theta + \\Pr(A) + \\gcd(m,n)$";
+        let trig_pdf = "x sin θ + Pr(A) + gcd(m,n)";
+        for (needle, tex) in [
+            ("x", "x"),
+            ("sin", "\\sin"),
+            ("θ", "\\theta"),
+            ("Pr", "\\Pr"),
+            ("gcd", "\\gcd"),
+        ] {
+            assert_eq!(
+                source_location(
+                    trig,
+                    1,
+                    0..1,
+                    false,
+                    trig_pdf,
+                    trig_pdf.find(needle).unwrap(),
+                    None,
+                ),
+                Some((1, trig.find(tex).unwrap())),
+                "{tex}"
+            );
+        }
+        assert_eq!(
+            source_location("$\\sin x$", 1, 0..1, false, "s", 0, None),
+            None
+        );
+
+        let liminf_frame = "$\\liminf x$\n$\\lim x$";
+        assert_eq!(
+            source_location(liminf_frame, 1, 0..2, true, "lim inf x", 0, None),
+            Some((1, 1))
+        );
+        assert_eq!(
+            source_location(liminf_frame, 1, 0..2, true, "lim inf x", 4, None),
+            Some((1, 1))
+        );
+
+        let redefined_not = "\\renewcommand{\\in}{=}\n$a\\not\\in b$\n$a\\not=b$";
+        assert_eq!(
+            source_location(redefined_not, 2, 1..3, true, "a≠b", 0, None),
+            None
+        );
+        assert_eq!(
+            source_location(
+                "$a\\not<b\\not>c\\not\\leq d\\not\\geq e$",
+                1,
+                0..1,
+                false,
+                "a≮b≯c≰d≱e",
+                "a≮b≯c".len(),
+                None,
+            ),
+            Some((1, 14))
+        );
     }
 }

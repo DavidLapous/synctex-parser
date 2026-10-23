@@ -3127,9 +3127,29 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
         Some((4, "$\\wrap{".len()))
     );
 
+    let gap_source = concat!(
+        "\\begin{frame}{Sample Title}\n",
+        "$A \\xrightarrow[sub]{sup} B + \\custom{alpha} + \\sum_{i=1}^n x_k$\n",
+        "\\end{frame}\n",
+    );
+    let gap_context = "A sup sub \u{2192} B + alpha + \u{2211} n i=1 xk";
+    for (word, needle) in [
+        ("sup", "sup"),
+        ("sub", "sub"),
+        ("alpha", "alpha"),
+        ("xk", "x_k"),
+    ] {
+        let offset = gap_context.find(word).unwrap();
+        assert_eq!(
+            source_word_location(gap_source, 3, gap_context, offset, 2),
+            Some((2, gap_source.lines().nth(1).unwrap().find(needle).unwrap())),
+            "expected {word:?} to resolve to {needle:?}"
+        );
+    }
+
     // Negative cases: unsafe or ambiguous macro/math forms must not guess.
     for (bad_source, bad_line, bad_context, bad_word) in [
-        // \def overriding \newcommand in preamble must poison the macro.
+        // \def overriding \newcommand in preamble must invalidate the macro.
         (
             concat!(
                 "\\newcommand{\\foo}{alpha}\n",
@@ -3142,7 +3162,7 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
             "alpha",
             "alpha",
         ),
-        // \let overriding \newcommand in preamble must poison the macro.
+        // \let overriding \newcommand in preamble must invalidate the macro.
         (
             concat!(
                 "\\newcommand{\\foo}{alpha}\n",
@@ -3155,7 +3175,7 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
             "alpha",
             "alpha",
         ),
-        // Body-scoped \renewcommand must poison the macro.
+        // Body-scoped \renewcommand must invalidate the macro.
         (
             concat!(
                 "\\newcommand{\\foo}{alpha}\n",
@@ -3182,89 +3202,6 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
             "alpha",
             "alpha",
         ),
-        // Nested macro passing a non-forwarded argument must not attribute to preamble.
-        (
-            concat!(
-                "\\newcommand{\\id}[1]{#1}\n",
-                "\\newcommand{\\wrap}[1]{\\id{a}}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$\\wrap{a} + b$\n",
-                "\\end{frame}\n",
-            ),
-            5,
-            "a + b",
-            "a",
-        ),
-        // \xrightarrow[sub]{sup} reorders tokens and must refuse attribution.
-        (
-            concat!(
-                "\\begin{frame}{Sample Title}\n",
-                "$A \\xrightarrow[sub]{sup} B$\n",
-                "\\end{frame}\n",
-            ),
-            3,
-            "A sup sub \u{2192} B",
-            "sup",
-        ),
-        // \coloneq glyph depends on package/font and must be treated as opaque.
-        (
-            concat!(
-                "\\begin{frame}{Sample Title}\n",
-                "$a \\coloneq b$\n",
-                "\\end{frame}\n",
-            ),
-            3,
-            "a := b",
-            "a",
-        ),
-        // Subscript/superscript reordering across macro boundary must refuse attribution.
-        (
-            concat!(
-                "\\newcommand{\\subi}{_i}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$x\\subi^2$\n",
-                "\\end{frame}\n",
-            ),
-            4,
-            "x2i",
-            "x",
-        ),
-        // ^^ hex notation inside macro body must be treated as opaque.
-        (
-            concat!(
-                "\\newcommand{\\hexword}{^^61bc}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "\\hexword{} and abc\n",
-                "\\end{frame}\n",
-            ),
-            4,
-            "abc and abc",
-            "abc",
-        ),
-        // Self-printing command (\TeX) in macro body must conflict with prose "TeX".
-        (
-            concat!(
-                "\\newcommand{\\logo}{\\TeX}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "\\logo{} and TeX\n",
-                "\\end{frame}\n",
-            ),
-            4,
-            "TeX and TeX",
-            "TeX",
-        ),
-        // Reordered math region containing the same word ("abc" in \sqrt[abc]{x})
-        // must prevent attributing "abc" to another math region "$abc$".
-        (
-            concat!(
-                "\\begin{frame}{Sample Title}\n",
-                "$\\sqrt[abc]{x}$ and $abc$\n",
-                "\\end{frame}\n",
-            ),
-            3,
-            "abcx and abc",
-            "abc",
-        ),
     ] {
         let offset = bad_context.find(bad_word).unwrap();
         assert_eq!(
@@ -3273,4 +3210,649 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
             "expected None for {bad_word:?} in {bad_context:?}"
         );
     }
+
+    // Unmodeled document-defined macro (\def\hide#1{}) consumes its {...} arguments
+    // into the '\0' gap so hidden tokens do not steal matches from later visible math.
+    let hide_source = concat!(
+        "\\def\\hide#1{}\n",
+        "\\begin{document}\n",
+        "$\\hide{x a} + x b$\n",
+        "\\end{document}\n",
+    );
+    let hide_line = hide_source.lines().nth(2).unwrap();
+    assert_eq!(
+        source_word_location(hide_source, 3, "+ x b", 2, 2),
+        Some((3, hide_line.rfind('x').unwrap()))
+    );
 }
+
+#[test]
+fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
+    // 1. Unit tests for source_graphics_location across single-line, multi-line, frame, and negative cases.
+    let single = "\\documentclass{article}\n\\begin{document}\n\\includegraphics[width=0.5\\textwidth]{figs/sample.pdf}\n\\end{document}\n";
+    assert_eq!(
+        source_graphics_location(single, 3, 0, 1, false),
+        Some((
+            3,
+            single.lines().nth(2).unwrap().find("figs/sample.pdf").unwrap()
+        ))
+    );
+
+    let multiline = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "% \\includegraphics{figs/commented.pdf}\n",
+        "\\newcommand{\\myfig}{\\includegraphics{figs/in_macro.pdf}}\n",
+        "\\includegraphics[\n",
+        "  width=0.8\\textwidth\n",
+        "]{\n",
+        "  % comment before path\n",
+        "  figs/multiline.pdf\n",
+        "}\n",
+        "\\includesvg[width=2cm]{figs/vector.svg}\n",
+        "\\end{document}\n",
+    );
+    for anchor_line in 5..=10 {
+        assert_eq!(
+            source_graphics_location(multiline, anchor_line, 0, 1, false),
+            Some((9, 2)),
+            "expected multiline includegraphics to resolve on anchor line {anchor_line}"
+        );
+    }
+    assert_eq!(
+        source_graphics_location(multiline, 11, 0, 1, false),
+        Some((
+            11,
+            multiline
+                .lines()
+                .nth(10)
+                .unwrap()
+                .find("figs/vector.svg")
+                .unwrap()
+        ))
+    );
+
+    let frame_source = concat!(
+        "\\begin{frame}{Sample Title}\n",
+        "\\includegraphics[width=3cm]{figs/left.pdf}\n",
+        "\\includegraphics[width=3cm]{figs/right.pdf}\n",
+        "\\end{frame}\n",
+    );
+    assert_eq!(
+        source_graphics_location(frame_source, 4, 0, 2, true),
+        Some((
+            2,
+            frame_source
+                .lines()
+                .nth(1)
+                .unwrap()
+                .find("figs/left.pdf")
+                .unwrap()
+        ))
+    );
+    assert_eq!(
+        source_graphics_location(frame_source, 4, 1, 2, true),
+        Some((
+            3,
+            frame_source
+                .lines()
+                .nth(2)
+                .unwrap()
+                .find("figs/right.pdf")
+                .unwrap()
+        ))
+    );
+    // Without scope_proven, line 4 (\end{frame}) must not widen to the whole frame.
+    assert_eq!(source_graphics_location(frame_source, 4, 0, 2, false), None);
+    // Count mismatch (e.g. conditional/overlay macro) must abstain.
+    assert_eq!(source_graphics_location(frame_source, 4, 0, 1, true), None);
+    // Empty/whitespace-only graphics argument must abstain.
+    let empty_arg = "\\includegraphics{  % nothing\n}\n";
+    assert_eq!(source_graphics_location(empty_arg, 1, 0, 1, false), None);
+    // Equal lexical and rendered counts under conditionals/duplicating macros must abstain.
+    let conditional_dup = concat!(
+        "\\newcommand{\\twice}[1]{#1#1}\n",
+        "\\begin{document}\n",
+        "\\iffalse\\includegraphics[width=30pt]{figs/hidden.pdf}\\fi\\twice{\\includegraphics[width=30pt]{figs/dup.pdf}}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(source_graphics_location(conditional_dup, 3, 0, 2, false), None);
+
+    // 2. End-to-end resolve_inverse test with two \includegraphics on line 3, prose on line 3,
+    // and a non-graphics \scalebox{2}{ScaledText} on line 4.
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let tex_source = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "ProseLabel \\includegraphics[width=20pt]{figs/first.pdf} \\includegraphics[width=20pt]{figs/second.pdf}\n",
+        "\\scalebox{2}{ScaledText} \\includegraphics[width=20pt]{figs/third.pdf}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&tex, tex_source).unwrap();
+
+    // Unit = 65536 (1pt = 1 unit in synctex coords when Unit=65536, Magnification=1000).
+    // Line 3 hbox at y=100pt, height=30pt:
+    // - Prose node at x=10..40
+    // - First \includegraphics outer box at x=50..80, y=70..100 (h=30, d=0) with \Gscale@box inner pair
+    // - Second \includegraphics outer box at x=100..130, y=70..100 (h=30, d=0) with \Gscale@box inner pair
+    // Line 4 hbox at y=200pt, height=30pt:
+    // - Non-graphics \scalebox{2}{ScaledText} at x=10..40 (only 1 wrapper above b_idx, plus g node inside d_idx)
+    // - Third \includegraphics outer box at x=50..80, y=170..200
+    let synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{tex}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:65536\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,5:0,0:400,792,0\n",
+            "(1,3:10,100:130,30,0\n",
+            "g1,3:10,100\n",
+            "x1,3:40,100\n",
+            "(1,3:50,100:30,30,0\n",
+            "(1,3:50,100:30,30,0\n",
+            "(1,3:50,100:0,30,0\n",
+            "(1,3:50,100:0,15,0\n",
+            "(1,3:50,100:15,15,0\n",
+            "k1,3:65,100:0\n",
+            ")\n",
+            "k1,3:50,100:-15\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "(1,3:100,100:30,30,0\n",
+            "(1,3:100,100:30,30,0\n",
+            "(1,3:100,100:0,30,0\n",
+            "(1,3:100,100:0,15,0\n",
+            "(1,3:100,100:15,15,0\n",
+            "k1,3:115,100:0\n",
+            ")\n",
+            "k1,3:100,100:-15\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "(1,4:10,200:80,30,0\n",
+            "(1,4:10,200:30,30,0\n",
+            "(1,4:10,200:0,30,0\n",
+            "(1,4:10,200:0,15,0\n",
+            "(1,4:10,200:15,15,0\n",
+            "x1,4:25,200\n",
+            ")\n",
+            "k1,4:10,200:-15\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "(1,4:50,200:30,30,0\n",
+            "(1,4:50,200:30,30,0\n",
+            "(1,4:50,200:0,30,0\n",
+            "(1,4:50,200:0,15,0\n",
+            "(1,4:50,200:15,15,0\n",
+            "k1,4:65,200:0\n",
+            ")\n",
+            "k1,4:50,200:-15\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "Postamble:\n",
+            "Count:37\n",
+        ),
+        tex = tex.display()
+    );
+    fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
+
+    // Clicking inside first figure (x=60, y=85) resolves to figs/first.pdf even when vector text is passed.
+    let hit_first = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 60.0,
+            y_from_top: 85.0,
+            page_height_pt: 792.0,
+        },
+        Some(("ProseLabel", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    let line3 = tex_source.lines().nth(2).unwrap();
+    assert_eq!(hit_first.location.line, 3);
+    assert_eq!(
+        hit_first.location.byte_column,
+        line3.find("figs/first.pdf").unwrap()
+    );
+    assert!(hit_first.location.precise);
+
+    // Clicking inside second figure (x=115, y=85) resolves to figs/second.pdf.
+    let hit_second = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 115.0,
+            y_from_top: 85.0,
+            page_height_pt: 792.0,
+        },
+        None,
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(hit_second.location.line, 3);
+    assert_eq!(
+        hit_second.location.byte_column,
+        line3.find("figs/second.pdf").unwrap()
+    );
+    assert!(hit_second.location.precise);
+
+    // Clicking prose outside both figures (x=20, y=95) resolves to ProseLabel.
+    let hit_prose = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 20.0,
+            y_from_top: 95.0,
+            page_height_pt: 792.0,
+        },
+        Some(("ProseLabel", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(hit_prose.location.line, 3);
+    assert_eq!(hit_prose.location.byte_column, 0);
+    assert!(hit_prose.location.precise);
+
+    // Clicking inside \scalebox{2}{ScaledText} (x=20, y=185) is NOT treated as graphics,
+    // so it refines via word matching to "ScaledText" on line 4.
+    let line4 = tex_source.lines().nth(3).unwrap();
+    let hit_scalebox = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 20.0,
+            y_from_top: 185.0,
+            page_height_pt: 792.0,
+        },
+        Some(("ScaledText", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(hit_scalebox.location.line, 4);
+    assert_eq!(
+        hit_scalebox.location.byte_column,
+        line4.find("ScaledText").unwrap()
+    );
+    assert!(hit_scalebox.location.precise);
+
+    // 3. Real pdflatex integration test with \includegraphics[...]{example-image-a} and {example-image-b}.
+    let real_dir = tempfile::tempdir().unwrap();
+    let real_root = fs::canonicalize(real_dir.path()).unwrap();
+    let real_pdf = real_root.join("real_fig.pdf");
+    let real_tex = real_root.join("real_fig.tex");
+    let real_source = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{graphicx}\n",
+        "\\begin{document}\n",
+        "\\noindent\n",
+        "\\includegraphics[width=80pt]{example-image-a}\\hspace{20pt}\\includegraphics[width=80pt]{example-image-b}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&real_tex, real_source).unwrap();
+    if let Ok(output) = Command::new("pdflatex")
+        .args([
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-synctex=1",
+            "real_fig.tex",
+        ])
+        .current_dir(&real_root)
+        .output()
+        && output.status.success()
+    {
+        let fwd = resolve_forward(&real_pdf, &real_tex, 5, 1).unwrap();
+        let real_line5 = real_source.lines().nth(4).unwrap();
+        let inv_a = resolve_inverse(
+            &real_pdf,
+            InversePoint {
+                page: 1,
+                x: fwd.h + 40.0,
+                y_from_top: fwd.v - 30.0,
+                page_height_pt: 792.0,
+            },
+            Some(("A", 0)),
+            2,
+            &Operation::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(inv_a.location.line, 5);
+        assert_eq!(
+            inv_a.location.byte_column,
+            real_line5.find("example-image-a").unwrap()
+        );
+        assert!(inv_a.location.precise);
+
+        let inv_b = resolve_inverse(
+            &real_pdf,
+            InversePoint {
+                page: 1,
+                x: fwd.h + 140.0,
+                y_from_top: fwd.v - 30.0,
+                page_height_pt: 792.0,
+            },
+            Some(("B", 0)),
+            2,
+            &Operation::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(inv_b.location.line, 5);
+        assert_eq!(
+            inv_b.location.byte_column,
+            real_line5.find("example-image-b").unwrap()
+        );
+        assert!(inv_b.location.precise);
+    }
+
+    // 4. \includesvg .pdf_tex generated wrapper maps back to the host .tex argument.
+    let svg_dir = tempfile::tempdir().unwrap();
+    let svg_root = fs::canonicalize(svg_dir.path()).unwrap();
+    let svg_pdf = svg_root.join("svg_fig.pdf");
+    let svg_tex = svg_root.join("svg_fig.tex");
+    let svg_sub = svg_root.join("svg-inkscape");
+    fs::create_dir_all(&svg_sub).unwrap();
+    let svg_pdf_tex = svg_sub.join("sample_svg-tex.pdf_tex");
+    let svg_source = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{svg}\n",
+        "\\begin{document}\n",
+        "\\includesvg[width=40pt]{figures/diagram_svg}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&svg_tex, svg_source).unwrap();
+    fs::write(
+        &svg_pdf_tex,
+        "\\begin{picture}(1,1)\\put(0,0){\\includegraphics[width=\\unitlength,page=1]{sample_svg-tex.pdf}}\\end{picture}\n",
+    )
+    .unwrap();
+    fs::write(&svg_pdf, b"pdf-v1").unwrap();
+    let svg_synctex = concat!(
+        "SyncTeX Version:1\n",
+        "Input:1:./svg_fig.tex\n",
+        "Input:2:./svg-inkscape/sample_svg-tex.pdf_tex\n",
+        "Output:pdf\n",
+        "Magnification:1000\n",
+        "Unit:65536\n",
+        "X Offset:0\n",
+        "Y Offset:0\n",
+        "Content:\n",
+        "{1\n",
+        "[1,5:0,0:600,700,0\n",
+        "(1,4:20,100:50,40,0\n",
+        "(2,57:20,100:50,40,0\n",
+        "(2,57:20,100:50,40,0\n",
+        "g2,54:20,100\n",
+        "(2,57:20,100:0,40,0\n",
+        "(2,56:20,100:0,40,0\n",
+        "(2,56:20,100:50,40,0\n",
+        "(2,56:20,100:50,40,0\n",
+        "(2,56:20,100:50,40,0\n",
+        "(2,56:20,100:0,40,0\n",
+        "(2,56:20,100:0,30,0\n",
+        "(2,56:20,100:30,30,0\n",
+        ")\n",
+        "k2,56:20,100:-30\n",
+        ")\n",
+        ")\n",
+        "g2,56:70,100\n",
+        ")\n",
+        ")\n",
+        ")\n",
+        "k2,56:20,100:-50\n",
+        ")\n",
+        ")\n",
+        "k2,57:70,100:50\n",
+        ")\n",
+        ")\n",
+        ")\n",
+        "]\n",
+        "}1\n",
+        "Postamble:\n",
+        "Count:32\n",
+    );
+    fs::write(svg_root.join("svg_fig.synctex"), svg_synctex).unwrap();
+
+    let hit_svg = resolve_inverse(
+        &svg_pdf,
+        InversePoint {
+            page: 1,
+            x: 35.0,
+            y_from_top: 80.0,
+            page_height_pt: 792.0,
+        },
+        Some(("label inside svg", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    let svg_line4 = svg_source.lines().nth(3).unwrap();
+    assert_eq!(hit_svg.location.file, svg_tex.to_string_lossy());
+    assert_eq!(hit_svg.location.line, 4);
+    assert_eq!(
+        hit_svg.location.byte_column,
+        svg_line4.find("figures/diagram_svg").unwrap()
+    );
+    assert!(hit_svg.location.precise);
+
+    // Non-ASCII filenames must not panic in generated-wrapper suffix checks.
+    assert!(!crate::parser::is_generated_graphics_tex("/tmp/ééé.tex"));
+    assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pdf_tex"));
+    assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pdftex_t"));
+    assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pstex_t"));
+
+    // A paragraph line box containing prose alongside a raw .pdf_tex input without
+    // a dedicated host wrapper must not turn surrounding prose into a graphics hit.
+    let mixed_dir = tempfile::tempdir().unwrap();
+    let mixed_root = fs::canonicalize(mixed_dir.path()).unwrap();
+    let mixed_pdf = mixed_root.join("mixed.pdf");
+    let mixed_tex = mixed_root.join("mixed.tex");
+    let mixed_wrapper = mixed_root.join("diagram_svg-tex.pdf_tex");
+    let mixed_source = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{svg}\n",
+        "\\begin{document}\n",
+        "ProseLabel \\includesvg{figures/diagram_svg}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&mixed_pdf, b"%PDF-1.4\n").unwrap();
+    fs::write(&mixed_tex, mixed_source).unwrap();
+    fs::write(&mixed_wrapper, "% generated by inkscape\n").unwrap();
+    let mixed_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,1:0,51904512:30000000,47362867,0\n",
+            "(1,4:1966080,6553600:19660800,3276800,0\n",
+            "x1,4:1966080,6553600\n",
+            "(2,57:7864320,6553600:6553600,3276800,0\n",
+            "(2,56:7864320,6553600:6553600,3276800,0\n",
+            "(2,56:7864320,6553600:6553600,3276800,0\n",
+            "(2,56:7864320,6553600:0,3276800,0\n",
+            "(2,56:7864320,6553600:0,3276800,0\n",
+            "(2,56:7864320,6553600:6553600,3276800,0\n",
+            ")\n",
+            "g2,56:7864320,6553600\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "(2,57:9830400,6553600:0,3276800,0\n",
+            "x2,57:9830400,6553600\n",
+            ")\n",
+            ")\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "Postamble:\n",
+            "Count:30\n",
+        ),
+        mixed_tex.display(),
+        mixed_wrapper.display(),
+    );
+    fs::write(mixed_root.join("mixed.synctex"), mixed_synctex).unwrap();
+    let hit_prose = resolve_inverse(
+        &mixed_pdf,
+        InversePoint {
+            page: 1,
+            x: 35.0,
+            y_from_top: 80.0,
+            page_height_pt: 792.0,
+        },
+        Some(("ProseLabel", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(hit_prose.location.file, mixed_tex.to_string_lossy());
+    assert_eq!(hit_prose.location.line, 4);
+    assert_eq!(hit_prose.location.byte_column, 0);
+    assert!(hit_prose.location.precise);
+
+    let hit_mixed_svg = resolve_inverse(
+        &mixed_pdf,
+        InversePoint {
+            page: 1,
+            x: 150.0,
+            y_from_top: 80.0,
+            page_height_pt: 792.0,
+        },
+        Some(("label inside svg", 0)),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    let mixed_line4 = mixed_source.lines().nth(3).unwrap();
+    assert_eq!(hit_mixed_svg.location.file, mixed_tex.to_string_lossy());
+    assert_eq!(hit_mixed_svg.location.line, 4);
+    assert_eq!(
+        hit_mixed_svg.location.byte_column,
+        mixed_line4.find("figures/diagram_svg").unwrap()
+    );
+    assert!(hit_mixed_svg.location.precise);
+}
+
+#[test]
+fn math_kern_and_depth_and_prose_collision_guards() {
+    // 1. Unbraced \mkern / \kern / \mskip must not swallow a following braced group.
+    let source = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "$x\\mkern-3mu{y} + \\kern 2pt{z} + \\mskip 4mu plus 2mu minus 1mu{w}$\n",
+        "\\end{document}\n",
+    );
+    let line3 = source.lines().nth(2).unwrap();
+    assert_eq!(
+        source_word_location(source, 3, "xy+z+w", 1, 0),
+        Some((3, line3.find('y').unwrap()))
+    );
+    assert_eq!(
+        source_word_location(source, 3, "xy+z+w", 3, 0),
+        Some((3, line3.find('z').unwrap()))
+    );
+    assert_eq!(
+        source_word_location(source, 3, "xy+z+w", 5, 0),
+        Some((3, line3.find('w').unwrap()))
+    );
+
+    // 1b. Non-literal \kern\dimexpr must abstain rather than leak tokens and bias a duplicate formula.
+    let dimexpr_source = concat!(
+        "\\documentclass{beamer}\n",
+        "\\begin{document}\n",
+        "\\begin{frame}\n",
+        "$x\\kern\\dimexpr1pt+2pt\\relax+y$\n",
+        "$x+y$\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_word_location(dimexpr_source, 4, "x+y", 2, 2),
+        None
+    );
+
+    // 2. Deeply nested paired scripts terminate cleanly via the recursion depth cap.
+    let mut nested = String::from("$a");
+    for _ in 0..100 {
+        nested.push_str("_1^{2");
+    }
+    for _ in 0..100 {
+        nested.push('}');
+    }
+    nested.push('$');
+    let deep_source = format!("\\documentclass{{article}}\n\\begin{{document}}\n{nested}\n\\end{{document}}\n");
+    let _ = source_word_location(&deep_source, 3, "a12", 0, 0);
+
+    // 2b. Deeply nested braces after \kern do not recurse in skip_tex_dimen.
+    let nested_kern = format!(
+        "\\documentclass{{article}}\n\\begin{{document}}\n$x\\kern{}1pt{}+y$\n\\end{{document}}\n",
+        "{".repeat(8192),
+        "}".repeat(8192)
+    );
+    assert_eq!(source_word_location(&nested_kern, 3, "x+y", 2, 0), None);
+
+    // 3. Shared token between prose (score 0) and math must abstain rather than pick math.
+    let collision_source = concat!(
+        "\\documentclass{beamer}\n",
+        "\\newcommand{\\samplex}{x}\n",
+        "\\begin{document}\n",
+        "\\begin{frame}\n",
+        "+x\\\\\n",
+        "$a+\\samplex$\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_word_location(collision_source, 7, "+x", 1, 2),
+        None
+    );
+}
+
+

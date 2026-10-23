@@ -1219,6 +1219,7 @@ pub fn inverse_failure(error: &io::Error) -> Option<&InverseFailure> {
 struct InverseAnchor {
     target: SourceLocation,
     compiler_column: Option<usize>,
+    graphics: Option<GraphicsHit>,
     generated: bool,
     warning: Option<String>,
     source_map: Option<io::Result<Rc<SourceMap>>>,
@@ -1465,6 +1466,7 @@ impl InverseQuery<'_> {
                 precise: false,
             },
             compiler_column: (!generated).then_some(raw.compiler_column).flatten(),
+            graphics: raw.graphics,
             generated,
             warning,
             source_map,
@@ -1627,13 +1629,25 @@ impl InverseQuery<'_> {
     ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
         let InverseAnchor {
             mut target,
+            graphics,
             generated,
             mut warning,
             mut source_map,
             ..
         } = anchor;
-        let anchor = (self.sources.best_guess && self.word.is_some()).then(|| target.clone());
-        if let Some((context, offset)) = self.word {
+        let is_generated_graphics = crate::parser::is_generated_graphics_tex(&target.file);
+        let anchor = (self.sources.best_guess
+            && !is_generated_graphics
+            && (self.word.is_some() || graphics.is_some()))
+        .then(|| target.clone());
+        let refine_graphics = match graphics {
+            Some(GraphicsHit::Unique { index, count }) => Some((index, count)),
+            Some(GraphicsHit::Ambiguous) => None,
+            None => None,
+        };
+        if !is_generated_graphics
+            && (refine_graphics.is_some() || (graphics.is_none() && self.word.is_some()))
+        {
             let mut target_frame = source_frame_range(&source, target.line);
             let fragile_frame = target_frame
                 .as_ref()
@@ -1684,17 +1698,23 @@ impl InverseQuery<'_> {
                     }),
                 _ => true,
             };
-            let mut location = if scope_proven {
-                source_word_location(&source, target.line, context, offset, self.radius)
+            let mut location = if let Some((index, count)) = refine_graphics {
+                source_graphics_location(&source, target.line, index, count, scope_proven)
+            } else if let Some((context, offset)) = self.word {
+                if scope_proven {
+                    source_word_location(&source, target.line, context, offset, self.radius)
+                } else {
+                    source_word_location_in_range(
+                        &source,
+                        target.line,
+                        context,
+                        offset,
+                        target.line.saturating_sub(1) as usize..target.line as usize,
+                        false,
+                    )
+                }
             } else {
-                source_word_location_in_range(
-                    &source,
-                    target.line,
-                    context,
-                    offset,
-                    target.line.saturating_sub(1) as usize..target.line as usize,
-                    false,
-                )
+                None
             };
             if location.is_none() && !generated {
                 if fragile_frame.is_none()
@@ -1718,14 +1738,21 @@ impl InverseQuery<'_> {
                 {
                     match original_source_from_verbatim(map, &mut self.sources, self.operation) {
                         Ok((file, original, anchor)) => {
-                            if self.sources.warning(Path::new(&file)).is_none()
-                                && let Some(candidate) = source_word_location(
+                            let candidate = if let Some((index, count)) = refine_graphics {
+                                source_graphics_location(&original, anchor, index, count, true)
+                            } else if let Some((context, offset)) = self.word {
+                                source_word_location(
                                     &original,
                                     anchor,
                                     context,
                                     offset,
                                     self.radius,
                                 )
+                            } else {
+                                None
+                            };
+                            if self.sources.warning(Path::new(&file)).is_none()
+                                && let Some(candidate) = candidate
                             {
                                 target.file = file;
                                 target.line = anchor;
@@ -1750,7 +1777,9 @@ impl InverseQuery<'_> {
                 self.operation.check()?;
                 warning = Some(format!("source-map refinement unavailable: {error}"));
             }
-            if !generated
+            if refine_graphics.is_none()
+                && let Some((context, offset)) = self.word
+                && !generated
                 && let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok())
                 && if location.is_some() {
                     target_frame.is_some()
@@ -2740,11 +2769,18 @@ fn document_metadata_word_location(
     Ok(Some((file.to_owned(), source, line, byte, score)))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphicsHit {
+    Unique { index: usize, count: usize },
+    Ambiguous,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RawInverseCandidate {
     pub file: String,
     pub line: u32,
     pub compiler_column: Option<usize>,
+    pub graphics: Option<GraphicsHit>,
 }
 
 pub(crate) fn apply_compiler_column(
@@ -2842,6 +2878,7 @@ pub(crate) fn parse_synctex_edit_candidates(stdout: &str) -> Vec<RawInverseCandi
                     file: file.to_owned(),
                     line,
                     compiler_column: None,
+                    graphics: None,
                 });
                 active = true;
             }
@@ -3265,10 +3302,6 @@ fn source_word_location_in_range(
         within_scope,
         &hidden,
     );
-    let selected_norm = {
-        let pdf = words(context);
-        word_index_at(context, &pdf, offset).map(|idx| normalized_word(pdf[idx].1))
-    };
     math::source_location(
         source,
         line,
@@ -3292,16 +3325,6 @@ fn source_word_location_in_range(
         }
         if !within_scope && row != line && crosses_paragraph_boundary(source, line, row) {
             return None;
-        }
-        if let Some(ref target_word) = selected_norm {
-            let check_lines = if within_scope && is_fragile_frame(source, &lines) {
-                lines.start.saturating_add(1)..lines.end
-            } else {
-                lines.clone()
-            };
-            if defined_macro_conflict(source, check_lines, &hidden, target_word) {
-                return None;
-            }
         }
         ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
     })
@@ -3335,163 +3358,6 @@ fn crosses_paragraph_boundary(source: &str, line: u32, row: u32) -> bool {
         if idx > start && idx < end && text.trim().is_empty() {
             return true;
         }
-    }
-    false
-}
-
-fn defined_macro_conflict(
-    source: &str,
-    lines: std::ops::Range<usize>,
-    hidden: &[std::ops::Range<usize>],
-    target_word: &str,
-) -> bool {
-    if target_word.is_empty() {
-        return false;
-    }
-    let mut macros = Vec::<(&str, &str)>::new();
-    for (start, span) in nonprinting_source_spans(source) {
-        if source.as_bytes().get(start) != Some(&b'\\') {
-            continue;
-        }
-        let (command, end) = math::command(source, start);
-        let mut at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
-        let name = if matches!(command, "def" | "gdef" | "edef" | "xdef") {
-            at = skip_source_space(source, at);
-            if source.as_bytes().get(at) != Some(&b'\\') {
-                continue;
-            }
-            let (name, next) = math::command(source, at);
-            at = next;
-            while at < span.end && source.as_bytes()[at] != b'{' {
-                if source.as_bytes()[at] == b'\\' {
-                    at += 1;
-                    at += source[at..].chars().next().map_or(0, char::len_utf8);
-                } else if source.as_bytes()[at] == b'%' {
-                    at = skip_source_space(source, at);
-                } else {
-                    at += source[at..].chars().next().map_or(1, char::len_utf8);
-                }
-            }
-            name
-        } else if matches!(
-            command,
-            "newcommand"
-                | "renewcommand"
-                | "providecommand"
-                | "DeclareRobustCommand"
-                | "DeclareMathOperator"
-                | "NewDocumentCommand"
-                | "RenewDocumentCommand"
-                | "ProvideDocumentCommand"
-                | "DeclareDocumentCommand"
-        ) {
-            let Some((name, next)) = math::macro_target_name(source, at) else {
-                continue;
-            };
-            at = next;
-            while let Some(opt_end) = optional_argument_end(source, at) {
-                at = opt_end;
-            }
-            if command.contains("Document") {
-                let Some((_, spec_end)) = math::group(source, skip_source_space(source, at)) else {
-                    continue;
-                };
-                at = spec_end;
-            }
-            name
-        } else {
-            continue;
-        };
-        let body_start = skip_source_space(source, at);
-        if !name.is_empty()
-            && let Some((body, _)) = math::group(source, body_start)
-        {
-            macros.push((name, &source[body]));
-        }
-    }
-    let matching_macros: Vec<&str> = macros
-        .into_iter()
-        .filter_map(|(name, body)| macro_body_has_word(body, target_word).then_some(name))
-        .collect();
-    if matching_macros.is_empty() {
-        return false;
-    }
-    let mut line_start = 0usize;
-    for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
-        if index >= lines.start {
-            let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
-            let mut offset = 0usize;
-            while let Some(pos) = text[offset..].find('\\') {
-                let slash = offset + pos;
-                let abs = line_start + slash;
-                let (cmd_name, next) = math::command(text, slash);
-                if !cmd_name.is_empty()
-                    && !hidden.iter().any(|range| range.contains(&abs))
-                    && matching_macros.contains(&cmd_name)
-                    && !math::resolves_macro_at(source, abs, cmd_name)
-                {
-                    return true;
-                }
-                offset = next.max(slash + 1);
-            }
-        }
-        line_start += raw_row.len();
-    }
-    false
-}
-
-fn macro_body_has_word(body: &str, target_word: &str) -> bool {
-    if body.contains("^^") {
-        return true;
-    }
-    let hidden: Vec<_> = nonprinting_source_spans(body)
-        .map(|(_, range)| range)
-        .collect();
-    let mut line_start = 0usize;
-    for raw_row in body.split_inclusive('\n') {
-        let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
-        for (byte, _, word) in source_words(text) {
-            let is_nonprinting_cmd = byte > 0
-                && text.as_bytes()[byte - 1] == b'\\'
-                && matches!(
-                    word.as_str(),
-                    "textcolor"
-                        | "color"
-                        | "textbf"
-                        | "textit"
-                        | "texttt"
-                        | "textrm"
-                        | "textsf"
-                        | "textsc"
-                        | "emph"
-                        | "underline"
-                        | "text"
-                        | "mbox"
-                        | "hbox"
-                        | "mathrm"
-                        | "mathbf"
-                        | "mathit"
-                        | "mathsf"
-                        | "mathtt"
-                        | "mathcal"
-                        | "mathbb"
-                        | "mathfrak"
-                        | "mathscr"
-                        | "boldsymbol"
-                        | "bm"
-                        | "operatorname"
-                );
-            if (byte == 0 || text.as_bytes()[byte - 1] != b'#')
-                && !is_nonprinting_cmd
-                && !hidden
-                    .iter()
-                    .any(|range| range.contains(&(line_start + byte)))
-                && word == target_word
-            {
-                return true;
-            }
-        }
-        line_start += raw_row.len();
     }
     false
 }
@@ -3566,13 +3432,163 @@ fn overlay_argument_end(source: &str, start: usize) -> Option<usize> {
 /// ordinary formatting/caption arguments and href display text remain literal.
 fn nonprinting_source_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
     nonprinting_source_spans(source)
-        .map(|(_, body)| body)
+        .map(|(_, range, _)| range)
         .collect()
+}
+
+fn source_graphics_location(
+    source: &str,
+    line: u32,
+    index: usize,
+    count: usize,
+    scope_proven: bool,
+) -> Option<(u32, usize)> {
+    if count == 0 || index >= count {
+        return None;
+    }
+    let anchor = usize::try_from(line.checked_sub(1)?).ok()?;
+    let scope = scope_proven
+        .then(|| {
+            source_frame_range(source, line)
+                .or_else(|| source_tabularx_range(source, line))
+                .filter(|range| line == range.end as u32)
+        })
+        .flatten();
+    let mut matched = Vec::new();
+    let mut masked = Vec::new();
+    for (start, full, graphics_body) in nonprinting_source_spans(source) {
+        let Some(body) = graphics_body else {
+            masked.push(start..full.end);
+            continue;
+        };
+        let start_line = source[..full.start].bytes().filter(|&ch| ch == b'\n').count();
+        let end_line = source[..full.end].bytes().filter(|&ch| ch == b'\n').count();
+        let in_scope = match &scope {
+            Some(range) => range.contains(&start_line) && range.contains(&end_line),
+            None => (start_line..=end_line).contains(&anchor),
+        };
+        if in_scope {
+            matched.push((full, body, start_line, end_line));
+        }
+    }
+    if matched.len() != count {
+        return None;
+    }
+    let check_lines = scope.unwrap_or_else(|| {
+        let min_line = matched.iter().map(|m| m.2).min().unwrap_or(anchor);
+        let max_line = matched.iter().map(|m| m.3).max().unwrap_or(anchor);
+        min_line..max_line + 1
+    });
+    let scope_start: usize = source
+        .split_inclusive('\n')
+        .take(check_lines.start)
+        .map(str::len)
+        .sum();
+    let scope_end: usize = scope_start
+        + source[scope_start..]
+            .split_inclusive('\n')
+            .take(check_lines.end.saturating_sub(check_lines.start))
+            .map(str::len)
+            .sum::<usize>();
+    let macros = math::macros(source);
+    let mut if_depth = 0usize;
+    let mut at = 0usize;
+    while at < scope_end {
+        if at >= scope_start && if_depth > 0 {
+            return None;
+        }
+        if let Some(r) = masked.iter().find(|r| r.contains(&at)) {
+            at = r.end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            }
+            b'\\' => {
+                let in_scope = at >= scope_start;
+                let (cmd, next) = math::command(source, at);
+                at = next;
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, at) {
+                    at = opaque_end;
+                    continue;
+                }
+                if (cmd.starts_with("if") && cmd != "iff") || matches!(cmd, "else" | "fi") {
+                    if in_scope {
+                        return None;
+                    }
+                    if cmd == "fi" {
+                        if_depth = if_depth.saturating_sub(1);
+                    } else if cmd != "else" {
+                        if_depth += 1;
+                    }
+                    continue;
+                }
+                if !in_scope {
+                    continue;
+                }
+                if matches!(
+                    cmd,
+                    "csname"
+                        | "savebox"
+                        | "sbox"
+                        | "setbox"
+                        | "usebox"
+                        | "phantom"
+                        | "hphantom"
+                        | "vphantom"
+                        | "multiput"
+                        | "foreach"
+                ) || (cmd == "begin"
+                    && math::group(source, at).is_some_and(|(env, _)| &source[env] == "lrbox"))
+                {
+                    return None;
+                }
+                if let Some(macro_entry) = macros.get(cmd) {
+                    let mut arg_end = at;
+                    while let Some(end) = optional_argument_end(source, arg_end)
+                        .or_else(|| overlay_argument_end(source, arg_end))
+                        .or_else(|| math::group(source, arg_end).map(|(_, e)| e))
+                    {
+                        arg_end = end;
+                    }
+                    if matched
+                        .iter()
+                        .any(|(full, _, _, _)| full.start < arg_end && full.end > at)
+                        || macro_entry.is_none_or(|def| {
+                            def.body.contains("include")
+                                || macros.keys().any(|k| has_control_word(def.body, k))
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                at += 1;
+            }
+        }
+    }
+    let (_, body, _, _) = matched.get(index)?;
+    let path_start = skip_source_space(source, body.start);
+    if path_start >= body.end {
+        return None;
+    }
+    let prefix = &source[..path_start];
+    let target_line = u32::try_from(prefix.bytes().filter(|&ch| ch == b'\n').count()).ok()? + 1;
+    let line_start = prefix.rfind('\n').map_or(0, |pos| pos + 1);
+    Some((target_line, path_start - line_start))
 }
 
 fn nonprinting_source_spans(
     source: &str,
-) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_ {
+) -> impl Iterator<
+    Item = (
+        usize,
+        std::ops::Range<usize>,
+        Option<std::ops::Range<usize>>,
+    ),
+> + '_ {
     let mut at = 0;
     std::iter::from_fn(move || {
         loop {
@@ -3588,7 +3604,7 @@ fn nonprinting_source_spans(
                 let start = at;
                 if let Some(end) = overlay_argument_end(source, at) {
                     at = end;
-                    return Some((start, start..end));
+                    return Some((start, start..end, None));
                 }
                 at += 1;
             } else if source.as_bytes()[at] == b'\\' {
@@ -3607,7 +3623,7 @@ fn nonprinting_source_spans(
                 if let Some((end, nonprinting)) = math::opaque_command_end(source, command, end) {
                     at = end;
                     if nonprinting {
-                        return Some((start, start..end));
+                        return Some((start, start..end, None));
                     }
                     continue;
                 }
@@ -3627,7 +3643,7 @@ fn nonprinting_source_spans(
                     } else if at < source.len() {
                         at += source[at..].chars().next().map_or(1, char::len_utf8);
                     }
-                    return Some((start, start..at));
+                    return Some((start, start..at, None));
                 }
                 at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
                 let definition = matches!(
@@ -3683,7 +3699,7 @@ fn nonprinting_source_spans(
                         if source.as_bytes().get(body_start) == Some(&b'{') {
                             let end = source.len();
                             at = end;
-                            return Some((start, start..end));
+                            return Some((start, start..end, None));
                         }
                         at = body_start;
                         continue;
@@ -3694,7 +3710,7 @@ fn nonprinting_source_spans(
                     {
                         at = end;
                     }
-                    return Some((start, start..at));
+                    return Some((start, start..at, None));
                 } else if matches!(
                     command,
                     "label"
@@ -3729,16 +3745,15 @@ fn nonprinting_source_spans(
                     }
                     if let Some((body, end)) = math::group(source, skip_source_space(source, at)) {
                         at = end;
+                        let is_graphics = matches!(command, "includegraphics" | "includesvg");
                         return Some((
                             start,
-                            if matches!(
-                                command,
-                                "includegraphics" | "includesvg" | "textcolor" | "color"
-                            ) {
+                            if is_graphics || matches!(command, "textcolor" | "color") {
                                 start..end
                             } else {
-                                body
+                                body.clone()
                             },
+                            is_graphics.then_some(body),
                         ));
                     }
                 } else if matches!(command, "begin" | "end")
@@ -3771,10 +3786,10 @@ fn nonprinting_source_spans(
                         }
                     }
                     at = group_end;
-                    return Some((start, body.start..group_end));
+                    return Some((start, body.start..group_end, None));
                 } else if let Some(overlay_end) = overlay_argument_end(source, at) {
                     at = overlay_end;
-                    return Some((start, end..overlay_end));
+                    return Some((start, end..overlay_end, None));
                 }
             } else {
                 at += source.as_bytes()[at + 1..]
