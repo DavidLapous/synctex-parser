@@ -330,7 +330,8 @@ fn inverse_title_word_survives_unrelated_opaque_math() {
             0,
             0..6,
             true,
-            &nonprinting_source_ranges(source)
+            &nonprinting_source_ranges(source),
+            None,
         )
         .map(|(row, byte, _)| (row, byte)),
         Some((1, 23))
@@ -883,7 +884,8 @@ fn inverse_identical_running_title_uses_click_height_for_tie() {
             offset,
             1..3,
             true,
-            &nonprinting_source_ranges(source)
+            &nonprinting_source_ranges(source),
+            None,
         )
         .unwrap()
         .2
@@ -3234,7 +3236,12 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
         source_graphics_location(single, 3, 0, 1, false),
         Some((
             3,
-            single.lines().nth(2).unwrap().find("figs/sample.pdf").unwrap()
+            single
+                .lines()
+                .nth(2)
+                .unwrap()
+                .find("figs/sample.pdf")
+                .unwrap()
         ))
     );
 
@@ -3316,7 +3323,10 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
         "\\iffalse\\includegraphics[width=30pt]{figs/hidden.pdf}\\fi\\twice{\\includegraphics[width=30pt]{figs/dup.pdf}}\n",
         "\\end{document}\n",
     );
-    assert_eq!(source_graphics_location(conditional_dup, 3, 0, 2, false), None);
+    assert_eq!(
+        source_graphics_location(conditional_dup, 3, 0, 2, false),
+        None
+    );
 
     // 2. End-to-end resolve_inverse test with two \includegraphics on line 3, prose on line 3,
     // and a non-graphics \scalebox{2}{ScaledText} on line 4.
@@ -3674,7 +3684,9 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     // Non-ASCII filenames must not panic in generated-wrapper suffix checks.
     assert!(!crate::parser::is_generated_graphics_tex("/tmp/ééé.tex"));
     assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pdf_tex"));
-    assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pdftex_t"));
+    assert!(crate::parser::is_generated_graphics_tex(
+        "/tmp/ééé.pdftex_t"
+    ));
     assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pstex_t"));
 
     // A paragraph line box containing prose alongside a raw .pdf_tex input without
@@ -3813,10 +3825,7 @@ fn math_kern_and_depth_and_prose_collision_guards() {
         "\\end{frame}\n",
         "\\end{document}\n",
     );
-    assert_eq!(
-        source_word_location(dimexpr_source, 4, "x+y", 2, 2),
-        None
-    );
+    assert_eq!(source_word_location(dimexpr_source, 4, "x+y", 2, 2), None);
 
     // 2. Deeply nested paired scripts terminate cleanly via the recursion depth cap.
     let mut nested = String::from("$a");
@@ -3827,7 +3836,8 @@ fn math_kern_and_depth_and_prose_collision_guards() {
         nested.push('}');
     }
     nested.push('$');
-    let deep_source = format!("\\documentclass{{article}}\n\\begin{{document}}\n{nested}\n\\end{{document}}\n");
+    let deep_source =
+        format!("\\documentclass{{article}}\n\\begin{{document}}\n{nested}\n\\end{{document}}\n");
     let _ = source_word_location(&deep_source, 3, "a12", 0, 0);
 
     // 2b. Deeply nested braces after \kern do not recurse in skip_tex_dimen.
@@ -3849,10 +3859,7 @@ fn math_kern_and_depth_and_prose_collision_guards() {
         "\\end{frame}\n",
         "\\end{document}\n",
     );
-    assert_eq!(
-        source_word_location(collision_source, 7, "+x", 1, 2),
-        None
-    );
+    assert_eq!(source_word_location(collision_source, 7, "+x", 1, 2), None);
 }
 
 #[test]
@@ -3903,7 +3910,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     let align_ctx = "\u{03b1}1 + \u{03b2}1 = \u{03b3}1";
     assert_eq!(
         source_word_location(math_source, 7, align_ctx, 0, 0),
-        Some((5, math_source.lines().nth(4).unwrap().find("\\alpha_1").unwrap()))
+        Some((
+            5,
+            math_source
+                .lines()
+                .nth(4)
+                .unwrap()
+                .find("\\alpha_1")
+                .unwrap()
+        ))
     );
     let align_ctx2 = "\u{03b4}2 + \u{03b5}2 = \u{03b6}2";
     assert_eq!(
@@ -3914,14 +3929,25 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             align_ctx2.find("\u{03b6}2").unwrap(),
             0
         ),
-        Some((6, math_source.lines().nth(5).unwrap().find("\\zeta_2").unwrap()))
+        Some((
+            6,
+            math_source
+                .lines()
+                .nth(5)
+                .unwrap()
+                .find("\\zeta_2")
+                .unwrap()
+        ))
     );
 
     // gather* closing line is 11; line 9 has \eta_1, line 10 has \kappa_2
     let gather_ctx = "\u{03b7}1 + \u{03b8}1";
     assert_eq!(
         source_word_location(math_source, 11, gather_ctx, 0, 0),
-        Some((9, math_source.lines().nth(8).unwrap().find("\\eta_1").unwrap()))
+        Some((
+            9,
+            math_source.lines().nth(8).unwrap().find("\\eta_1").unwrap()
+        ))
     );
 
     // multline closing line is 15; line 13 has \lambda_1, line 14 has \xi_2
@@ -3934,7 +3960,10 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             multline_ctx.find("\u{03be}2").unwrap(),
             0
         ),
-        Some((14, math_source.lines().nth(13).unwrap().find("\\xi_2").unwrap()))
+        Some((
+            14,
+            math_source.lines().nth(13).unwrap().find("\\xi_2").unwrap()
+        ))
     );
 
     // equation + split: SyncTeX reports line 20 (\end{split}) or 21 (\end{equation})
@@ -3942,7 +3971,10 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     for closing in [20, 21] {
         assert_eq!(
             source_word_location(math_source, closing, split_ctx, 0, 0),
-            Some((18, math_source.lines().nth(17).unwrap().find("\\pi_1").unwrap()))
+            Some((
+                18,
+                math_source.lines().nth(17).unwrap().find("\\pi_1").unwrap()
+            ))
         );
     }
 
@@ -3957,7 +3989,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
                 aligned_ctx.find("\u{03c8}2").unwrap(),
                 0
             ),
-            Some((25, math_source.lines().nth(24).unwrap().find("\\psi_2").unwrap()))
+            Some((
+                25,
+                math_source
+                    .lines()
+                    .nth(24)
+                    .unwrap()
+                    .find("\\psi_2")
+                    .unwrap()
+            ))
         );
     }
 
@@ -3972,14 +4012,20 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
                 matrix_ctx.find("a22").unwrap(),
                 0
             ),
-            Some((31, math_source.lines().nth(30).unwrap().find("a_{22}").unwrap()))
+            Some((
+                31,
+                math_source.lines().nth(30).unwrap().find("a_{22}").unwrap()
+            ))
         );
     }
     let dcases_ctx = "b2 x \u{2264} 0";
     for closing in [35, 36] {
         assert_eq!(
             source_word_location(math_source, closing, dcases_ctx, 0, 0),
-            Some((34, math_source.lines().nth(33).unwrap().find("b_2").unwrap()))
+            Some((
+                34,
+                math_source.lines().nth(33).unwrap().find("b_2").unwrap()
+            ))
         );
     }
 
@@ -4023,7 +4069,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             cap_ctx.find("AlphaWord").unwrap(),
             0
         ),
-        Some((5, caption_source.lines().nth(4).unwrap().find("AlphaWord").unwrap()))
+        Some((
+            5,
+            caption_source
+                .lines()
+                .nth(4)
+                .unwrap()
+                .find("AlphaWord")
+                .unwrap()
+        ))
     );
     assert_eq!(
         source_word_location(
@@ -4033,7 +4087,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             cap_ctx.find("\u{03c9}2").unwrap(),
             0
         ),
-        Some((6, caption_source.lines().nth(5).unwrap().find("\\omega_2").unwrap()))
+        Some((
+            6,
+            caption_source
+                .lines()
+                .nth(5)
+                .unwrap()
+                .find("\\omega_2")
+                .unwrap()
+        ))
     );
 
     // \captionof{figure}[GammaWord delta]{...} closes on line 11:
@@ -4048,7 +4110,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             capof_ctx.find("figure").unwrap(),
             0
         ),
-        Some((9, caption_source.lines().nth(8).unwrap().find("figure").unwrap()))
+        Some((
+            9,
+            caption_source
+                .lines()
+                .nth(8)
+                .unwrap()
+                .find("figure")
+                .unwrap()
+        ))
     );
     assert_eq!(
         source_word_location(
@@ -4058,7 +4128,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             capof_ctx.find("GammaWord").unwrap(),
             0
         ),
-        Some((10, caption_source.lines().nth(9).unwrap().find("GammaWord").unwrap()))
+        Some((
+            10,
+            caption_source
+                .lines()
+                .nth(9)
+                .unwrap()
+                .find("GammaWord")
+                .unwrap()
+        ))
     );
 
     // \subcaptionbox closes on line 16:
@@ -4073,7 +4151,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             subbox_ctx.find("EtaWord").unwrap(),
             0
         ),
-        Some((13, caption_source.lines().nth(12).unwrap().find("EtaWord").unwrap()))
+        Some((
+            13,
+            caption_source
+                .lines()
+                .nth(12)
+                .unwrap()
+                .find("EtaWord")
+                .unwrap()
+        ))
     );
     assert_eq!(
         source_graphics_location(caption_source, 16, 0, 1, true),
@@ -4100,7 +4186,15 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
             subfloat_ctx.find("KappaWord").unwrap(),
             0
         ),
-        Some((18, caption_source.lines().nth(17).unwrap().find("KappaWord").unwrap()))
+        Some((
+            18,
+            caption_source
+                .lines()
+                .nth(17)
+                .unwrap()
+                .find("KappaWord")
+                .unwrap()
+        ))
     );
     assert_eq!(
         source_graphics_location(caption_source, 21, 0, 1, true),
@@ -4289,7 +4383,107 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         source_graphics_location(unsafe_transitive_gfx, 8, 0, 1, true),
         None
     );
+
+    // 8. Display math immediately following inline or single-line display math
+    //    (`$x$\begin{equation}`, `$x$$$...$$`, `\[z\]\[...\]`) is recognized.
+    let inline_then_display = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "$x$\\begin{equation}\n",
+        "  a = b\n",
+        "\\end{equation}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_lines(inline_then_display, 5), Some(2..5));
+    assert_eq!(math::math_closing_line(inline_then_display, 3, 2), None);
+    assert_eq!(math::math_closing_line(inline_then_display, 3, 4), Some(5));
+    assert_eq!(math::math_closing_line(inline_then_display, 4, 3), Some(5));
+    let dollar_adjacent = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "Prefix $x$$$\n",
+        " a=b\n",
+        "$$\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(dollar_adjacent, 3, 11), Some(5));
+    let two_displays_one_line = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\[z\\]\\[\n",
+        " a=b\n",
+        "\\]\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(two_displays_one_line, 3, 1), None);
+    assert_eq!(
+        math::math_closing_line(two_displays_one_line, 3, 6),
+        Some(5)
+    );
+
+    // 9. eqnarray opening line with row 1 content stays on the opening line, while
+    //    nonprinting header tokens (\label, \nonumber, \notag, \relax) and split \begin
+    //    remap the opening line to the following line.
+    let eqnarray_row1_on_open = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\begin{eqnarray} a &=& b \\\\\n",
+        "  c &=& d\n",
+        "\\end{eqnarray}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(eqnarray_row1_on_open, 3, 18), None);
+    let eqnarray_label_open = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\begin{eqnarray}\\nonumber\\label\n",
+        "  {eq:one}\\relax\n",
+        "  a &=& b\n",
+        "\\end{eqnarray}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(eqnarray_label_open, 3, 1), Some(4));
+    let eqnarray_split_begin = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "Prefix \\begin\n",
+        "{eqnarray} a &=& b \\\\\n",
+        "  c &=& d\n",
+        "\\end{eqnarray}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(math::math_closing_line(eqnarray_split_begin, 3, 8), Some(4));
+
+    // 10. Opaque @-named macros inside wrappers or on the line block graphics refinement.
+    let at_macro_gfx = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{graphicx}\n",
+        "\\makeatletter\n",
+        "\\newcommand{\\my@figure}{\\includegraphics[width=30pt]{actual.pdf}}\n",
+        "\\newcommand{\\my@discard}[1]{}\n",
+        "\\newcommand{\\unused}{\\csname my@figure\\endcsname}\n",
+        "\\newcommand{\\wrapper}{\\my@figure}\n",
+        "\\begin{document}\n",
+        "\\wrapper \\my@discard{\\includegraphics{decoy.pdf}}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(source_graphics_location(at_macro_gfx, 9, 0, 1, false), None);
+
+    // 11. Unsupported glue after `plus`/`minus` or malformed `#` in a script abstains
+    //     when disambiguating duplicate math atoms.
+    let unsupported_glue = "$x + \\mskip 5mu plus \\stretch{1} x$\n";
+    assert_eq!(
+        source_word_location(unsupported_glue, 1, "x + x", 4, 0),
+        None
+    );
+    let malformed_script_hash = "$x_#é$\n";
+    assert_eq!(
+        source_word_location(malformed_script_hash, 1, "x", 0, 0),
+        None
+    );
+    let malformed_simultaneous_script_hash = "$x_#é^y$\n";
+    assert_eq!(
+        source_word_location(malformed_simultaneous_script_hash, 1, "x", 0, 0),
+        None
+    );
 }
-
-
-

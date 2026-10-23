@@ -282,6 +282,23 @@ pub(crate) fn parse_synctex_document(reader: impl BufRead) -> io::Result<ParsedS
     parse_synctex_document_with_options(reader, false, None, None)
 }
 
+pub(crate) fn synctex_unit_scale(unit: &str) -> Option<f64> {
+    match unit {
+        "in" => Some(72.27 * 65536.0),
+        "cm" => Some(72.27 * 65536.0 / 2.54),
+        "mm" => Some(72.27 * 65536.0 / 25.4),
+        "pt" => Some(65536.0),
+        "bp" => Some(72.27 / 72.0 * 65536.0),
+        "pc" => Some(12.0 * 65536.0),
+        "sp" => Some(1.0),
+        "dd" => Some(1238.0 / 1157.0 * 65536.0),
+        "cc" => Some(14856.0 / 1157.0 * 65536.0),
+        "nd" => Some(685.0 / 642.0 * 65536.0),
+        "nc" => Some(1370.0 / 107.0 * 65536.0),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_synctex_document_with_options(
     reader: impl BufRead,
     fix_cross_file_tags: bool,
@@ -426,21 +443,7 @@ pub(crate) fn parse_synctex_document_with_options(
             .parse::<f64>()
             .ok()
             .filter(|n| n.is_finite())?;
-        let scale = match s.get(unit_start..)? {
-            "in" => 72.27 * 65536.0,
-            "cm" => 72.27 * 65536.0 / 2.54,
-            "mm" => 72.27 * 65536.0 / 25.4,
-            "pt" => 65536.0,
-            "bp" => 72.27 / 72.0 * 65536.0,
-            "pc" => 12.0 * 65536.0,
-            "sp" => 1.0,
-            "dd" => 1238.0 / 1157.0 * 65536.0,
-            "cc" => 14856.0 / 1157.0 * 65536.0,
-            "nd" => 685.0 / 642.0 * 65536.0,
-            "nc" => 1370.0 / 107.0 * 65536.0,
-            _ => return None,
-        };
-        Some(num * scale)
+        Some(num * synctex_unit_scale(s.get(unit_start..)?)?)
     };
 
     let mut row = String::new();
@@ -1787,9 +1790,7 @@ pub(crate) fn is_generated_graphics_tex(path: &str) -> bool {
     let p = path.trim().as_bytes();
     [b".pdf_tex".as_slice(), b".pdftex_t", b".pstex_t"]
         .iter()
-        .any(|ext| {
-            p.len() >= ext.len() && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext)
-        })
+        .any(|ext| p.len() >= ext.len() && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext))
 }
 
 fn tag_is_generated_graphics_tex(inputs: &[(u32, String)], tag: u32) -> bool {
@@ -1888,10 +1889,7 @@ fn graphics_outer_box(
         let gen_tag = nodes[outer].tag;
         while let Some(p_idx) = nodes[cur].parent {
             let p = &nodes[p_idx];
-            if !matches!(p.kind, b'(' | b'[')
-                || p.target.is_some()
-                || p.tag != gen_tag
-            {
+            if !matches!(p.kind, b'(' | b'[') || p.target.is_some() || p.tag != gen_tag {
                 break;
             }
             cur = p_idx;
@@ -1932,10 +1930,9 @@ fn sheet_graphics_boxes(
     let mut stack = vec![root];
     while let Some(idx) = stack.pop() {
         if let Some(g) = graphics_outer_box(nodes, inputs, fix_cross_file_tags, idx) {
-            if !out
-                .iter()
-                .any(|existing: &GraphicsBox| existing.box_idx == g.box_idx && existing.host_idx == g.host_idx)
-            {
+            if !out.iter().any(|existing: &GraphicsBox| {
+                existing.box_idx == g.box_idx && existing.host_idx == g.host_idx
+            }) {
                 out.push(g);
             }
             continue;

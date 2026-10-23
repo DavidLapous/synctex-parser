@@ -367,7 +367,10 @@ fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
         match ch {
             '%' => i += source[i..].find('\n').unwrap_or(source.len() - i),
             '$' => {
-                let delimiter = if source[i..].starts_with('$') {
+                let delimiter = if (open.is_none()
+                    || open.is_some_and(|(expected, _)| expected == "$$"))
+                    && source[i..].starts_with('$')
+                {
                     i += 1;
                     "$$"
                 } else {
@@ -421,18 +424,71 @@ fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     result
 }
 
-fn display_region_bounds(source: &str, range: &Range<usize>) -> Option<(usize, usize)> {
-    if source[..range.start].ends_with("\\(")
-        || (source[..range.start].ends_with('$') && !source[..range.start].ends_with("$$"))
-    {
-        return None;
-    }
-    let start = if source[..range.start].ends_with("\\[") || source[..range.start].ends_with("$$") {
-        range.start - 2
-    } else {
-        range.start
-    };
-    Some((start, range.end))
+struct DisplayRegion<'a> {
+    range: Range<usize>,
+    start: usize,
+    first: usize,
+    last: usize,
+    env: Option<(&'a str, usize)>,
+}
+
+fn display_regions(source: &str) -> impl Iterator<Item = DisplayRegion<'_>> {
+    let mut counted_to = 0;
+    let mut counted_lines = 0;
+    regions(source, source.len())
+        .into_iter()
+        .filter_map(move |range| {
+            let (start, end, close_end, env) = if (source[counted_to..range.start].ends_with("\\[")
+                && source[range.end..].starts_with("\\]"))
+                || (source[counted_to..range.start].ends_with("$$")
+                    && source[range.end..].starts_with("$$"))
+            {
+                (range.start - 2, range.end, range.end + 2, None)
+            } else if source[range.end..].starts_with("\\end")
+                && let Some(rest) = source[range.start..].strip_prefix("\\begin")
+                && let Some((span, end)) = group(rest, 0)
+            {
+                let env = rest[span].trim_end_matches('*');
+                if env == "math" {
+                    let close_end = range.end.min(source.len());
+                    counted_lines += source[counted_to..close_end]
+                        .bytes()
+                        .filter(|c| *c == b'\n')
+                        .count();
+                    counted_to = close_end;
+                    return None;
+                }
+                (
+                    range.start,
+                    range.end,
+                    range.end,
+                    Some((env, range.start + "\\begin".len() + end)),
+                )
+            } else {
+                let close_end = (range.end + 1).min(source.len());
+                counted_lines += source[counted_to..close_end]
+                    .bytes()
+                    .filter(|c| *c == b'\n')
+                    .count();
+                counted_to = close_end;
+                return None;
+            };
+            let first = counted_lines
+                + source[counted_to..start]
+                    .bytes()
+                    .filter(|c| *c == b'\n')
+                    .count();
+            let last = first + source[start..end].bytes().filter(|c| *c == b'\n').count();
+            counted_to = close_end.min(source.len());
+            counted_lines = last;
+            Some(DisplayRegion {
+                range,
+                start,
+                first,
+                last,
+                env,
+            })
+        })
 }
 
 fn inner_halign_contains_line(
@@ -524,36 +580,15 @@ fn inner_halign_contains_line(
 /// for every interior token. Restrict inverse refinement to the full math region.
 pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
     let target = line.checked_sub(1)? as usize;
-    let mut counted_to = 0;
-    let mut counted_lines = 0;
-    for range in regions(source, source.len()) {
-        let Some((start, end)) = display_region_bounds(source, &range) else {
-            continue;
-        };
-        let first = counted_lines
-            + source[counted_to..start]
-                .bytes()
-                .filter(|c| *c == b'\n')
-                .count();
-        let last = first
-            + source[start..end]
-                .bytes()
-                .filter(|c| *c == b'\n')
-                .count();
-        counted_to = end;
-        counted_lines = last;
-        if (first..=last).contains(&target) {
-            if first == last {
+    for region in display_regions(source) {
+        if (region.first..=region.last).contains(&target) {
+            if region.first == region.last {
+                continue;
+            }
+            if region.env.is_some_and(|(env, _)| env == "eqnarray") {
                 return None;
             }
-            let env = source[range.start..]
-                .strip_prefix("\\begin")
-                .and_then(|rest| group(rest, 0).map(|(span, _)| &rest[span]))
-                .map(|name| name.trim_end_matches('*'));
-            if env == Some("eqnarray") {
-                return None;
-            }
-            let closes_inner_env = target < last
+            let closes_inner_env = target < region.last
                 && source
                     .lines()
                     .nth(target)
@@ -561,12 +596,12 @@ pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
                     .and_then(|row| row.trim_start().strip_prefix("\\end"))
                     .and_then(|rest| group(rest, 0).map(|(span, _)| math_environment(&rest[span])))
                     .unwrap_or(false);
-            if target < last && !closes_inner_env {
+            if target < region.last && !closes_inner_env {
                 return None;
             }
-            return Some(first..last + 1);
+            return Some(region.first..region.last + 1);
         }
-        if first > target {
+        if region.first > target {
             return None;
         }
     }
@@ -577,50 +612,63 @@ pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
 /// box records to the closing math line while preserving inner `\halign` rows.
 pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
     let target = line.checked_sub(1)? as usize;
-    let mut counted_to = 0;
-    let mut counted_lines = 0;
-    for range in regions(source, source.len()) {
-        let Some((start, end)) = display_region_bounds(source, &range) else {
-            continue;
-        };
-        let first = counted_lines
-            + source[counted_to..start]
-                .bytes()
-                .filter(|c| *c == b'\n')
-                .count();
-        let last = first
-            + source[start..end]
-                .bytes()
-                .filter(|c| *c == b'\n')
-                .count();
-        counted_to = end;
-        counted_lines = last;
-        if (first..=last).contains(&target) {
-            if first == last {
-                return None;
+    for region in display_regions(source) {
+        if (region.first..=region.last).contains(&target) {
+            if region.first == region.last {
+                continue;
             }
-            if target == first {
-                let line_start = source[..start].rfind('\n').map_or(0, |pos| pos + 1);
-                if !source[line_start..start].trim().is_empty() {
+            if target == region.first {
+                let line_start = source[..region.start].rfind('\n').map_or(0, |pos| pos + 1);
+                if !source[line_start..region.start].trim().is_empty() {
                     let col_idx = column.saturating_sub(1) as usize;
                     let col_byte = source[line_start..]
                         .char_indices()
                         .nth(col_idx)
                         .map_or(source.len() - line_start, |(idx, _)| idx);
-                    if line_start + col_byte < start {
+                    if line_start + col_byte < region.start {
                         continue;
                     }
                 }
             }
-            let env = source[range.start..]
-                .strip_prefix("\\begin")
-                .and_then(|rest| group(rest, 0).map(|(span, _)| &rest[span]))
-                .map(|name| name.trim_end_matches('*'));
-            if env == Some("eqnarray") {
-                return (target == first).then_some((first + 1) as u32 + 1);
+            if let Some(("eqnarray", begin_end)) = region.env {
+                if target != region.first {
+                    return None;
+                }
+                let line_end = source[region.start..]
+                    .find('\n')
+                    .map_or(source.len(), |pos| region.start + pos);
+                let mut cursor = begin_end;
+                while cursor < line_end {
+                    cursor = super::skip_source_space(source, cursor).min(line_end);
+                    if cursor >= line_end || source.as_bytes()[cursor] == b'%' {
+                        cursor = line_end;
+                        break;
+                    }
+                    if source.as_bytes()[cursor] != b'\\' {
+                        break;
+                    }
+                    let (cmd, mut next) = command(source, cursor);
+                    if matches!(cmd, "nonumber" | "notag" | "relax") {
+                        cursor = next;
+                        continue;
+                    }
+                    if cmd == "label" {
+                        while let Some(opt_end) = super::optional_argument_end(source, next) {
+                            next = opt_end;
+                        }
+                        if let Some((_, grp_end)) =
+                            group(source, super::skip_source_space(source, next))
+                        {
+                            cursor = grp_end;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                return (cursor >= line_end).then_some((region.first + 1) as u32 + 1);
             }
             let collected = matches!(
-                env,
+                region.env.map(|(env, _)| env),
                 Some(
                     "align"
                         | "gather"
@@ -632,12 +680,13 @@ pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<
                         | "split"
                 )
             );
-            if !collected && inner_halign_contains_line(source, range, first, target) {
+            if !collected && inner_halign_contains_line(source, region.range, region.first, target)
+            {
                 return None;
             }
-            return Some(last as u32 + 1);
+            return Some(region.last as u32 + 1);
         }
-        if first > target {
+        if region.first > target {
             return None;
         }
     }
@@ -679,11 +728,7 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
                         .bytes()
                         .filter(|c| *c == b'\n')
                         .count();
-                let last = first
-                    + source[start..end]
-                        .bytes()
-                        .filter(|c| *c == b'\n')
-                        .count();
+                let last = first + source[start..end].bytes().filter(|c| *c == b'\n').count();
                 counted_to = end;
                 counted_lines = last;
                 if (first..=last).contains(&target) {
@@ -1095,7 +1140,8 @@ fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
         {
             let unit_end = pos + unit.len();
             if let Some(end) = group_end {
-                return (super::skip_source_space(source, unit_end).min(parse_limit) == parse_limit)
+                return (super::skip_source_space(source, unit_end).min(parse_limit)
+                    == parse_limit)
                     .then_some(end);
             }
             return Some(unit_end);
@@ -1124,13 +1170,16 @@ fn atoms_with_macros<'a>(
     let mut prev_alnum_end = None;
     let script_arg = |pos: usize| -> Option<(Range<usize>, usize)> {
         let pos = super::skip_source_space(source, pos).min(range.end);
-        match *source[..range.end].as_bytes().get(pos)? {
+        match *source.as_bytes()[..range.end].get(pos)? {
             b'{' => group(source, pos).filter(|(_, end)| *end <= range.end),
             b'\\' => {
                 let (_, end) = command(source, pos);
                 (end <= range.end).then_some((pos..end, end))
             }
-            b'#' => (pos + 2 <= range.end).then_some((pos..pos + 2, pos + 2)),
+            b'#' => source.as_bytes()[..range.end]
+                .get(pos + 1)
+                .is_some_and(|b| matches!(b, b'1'..=b'9'))
+                .then_some((pos..pos + 2, pos + 2)),
             _ => source[pos..range.end]
                 .chars()
                 .next()
@@ -1184,7 +1233,10 @@ fn atoms_with_macros<'a>(
                     i += if hex == 2 {
                         2
                     } else {
-                        source[i..range.end].chars().next().map_or(0, char::len_utf8)
+                        source[i..range.end]
+                            .chars()
+                            .next()
+                            .map_or(0, char::len_utf8)
                     };
                     *has_unknown = true;
                     append(&mut result, '\0', emit_span(start..i));
@@ -1193,6 +1245,7 @@ fn atoms_with_macros<'a>(
                 // Simultaneous scripts on the same base can extract in visual
                 // rather than source order; isolate them with '\0' boundaries.
                 let Some((arg1, end1)) = script_arg(i) else {
+                    *has_unknown = true;
                     append(&mut result, '\0', emit_span(start..i));
                     continue;
                 };
@@ -1218,6 +1271,7 @@ fn atoms_with_macros<'a>(
                     {
                         append(&mut result, '\0', emit_span(i..i + 1));
                         let Some((arg_next, end_next)) = script_arg(i + 1) else {
+                            *has_unknown = true;
                             i += 1;
                             break;
                         };
@@ -1485,11 +1539,7 @@ fn atoms_with_macros<'a>(
                                 } else {
                                     break;
                                 };
-                                let Some(next_end) = skip_tex_dimen(source, kw_end, range.end)
-                                else {
-                                    break;
-                                };
-                                dim_end = next_end;
+                                dim_end = skip_tex_dimen(source, kw_end, range.end)?;
                             }
                         }
                         i = dim_end;
@@ -1498,9 +1548,7 @@ fn atoms_with_macros<'a>(
                         emit_gap,
                         trailing_opt,
                     } => {
-                        i += usize::from(
-                            i < range.end && source.as_bytes().get(i) == Some(&b'*'),
-                        );
+                        i += usize::from(i < range.end && source.as_bytes().get(i) == Some(&b'*'));
                         while let Some(opt_end) = super::optional_argument_end(source, i)
                             .or_else(|| super::overlay_argument_end(source, i))
                             .filter(|e| *e <= range.end)
@@ -1644,6 +1692,15 @@ pub(super) fn source_location(
             word.end += 1;
         }
     }
+    let scope_start = *starts.get(lines.start).unwrap_or(&source.len());
+    let scope_end = *starts.get(lines.end).unwrap_or(&source.len());
+    let active_regions: Vec<_> = regions
+        .into_iter()
+        .filter(|range| range.start < scope_end && range.end > scope_start)
+        .collect();
+    if active_regions.is_empty() {
+        return prose.map(|(row, byte, _)| (row, byte));
+    }
     let macros = macros(source);
     let mut best = None;
     let mut tied = false;
@@ -1651,12 +1708,7 @@ pub(super) fn source_location(
     let mut line_unknown = false;
     let line_start = *starts.get(line as usize - 1).unwrap_or(&source.len());
     let line_end = *starts.get(line as usize).unwrap_or(&source.len());
-    for range in regions {
-        if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
-            || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
-        {
-            continue;
-        }
+    for range in active_regions {
         let mut region_unknown = false;
         let atoms = atoms_with_macros(
             source,

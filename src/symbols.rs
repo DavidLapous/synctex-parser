@@ -64,7 +64,7 @@ pub(crate) fn negated_symbol(name: &str) -> Option<char> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MathCommand {
+pub(crate) enum MathCommand<'a> {
     /// Formatting/style wrapper, font switch, spacing, or accent whose argument
     /// (if any) keeps its underlying character identity.
     Transparent,
@@ -85,169 +85,37 @@ pub(crate) enum MathCommand {
     /// Multi-character symbol sequence (`\coloneqq`, `\idotsint`, etc.).
     MultiSymbol(&'static [char]),
     /// Named operator or function rendered as one or more words (`\sin`, `\lim inf`, etc.).
-    Words(&'static str),
+    Words(&'a str),
     /// Unmodeled command: consumes optional/overlay arguments and emits a `'\0'` gap atom.
     Unknown,
 }
 
-pub(crate) fn classify_command(name: &str) -> MathCommand {
+pub(crate) fn classify_command(name: &str) -> MathCommand<'_> {
     match name {
         // Font/style wrappers, switches, accents, fractions, binomials, and spacing no-ops
-        "mathcal"
-        | "mathbb"
-        | "mathbbm"
-        | "mathbbb"
-        | "mathds"
-        | "mathfrak"
-        | "mathscr"
-        | "mathrm"
-        | "mathbf"
-        | "mathbfit"
-        | "mathsf"
-        | "mathsfit"
-        | "mathbfsfit"
-        | "mathbfcal"
-        | "mathbfscr"
-        | "mathtt"
-        | "mathit"
-        | "mathnormal"
-        | "mathbold"
-        | "symrm"
-        | "symit"
-        | "symsf"
-        | "symtt"
-        | "symbb"
-        | "symcal"
-        | "symscr"
-        | "symfrak"
-        | "symnormal"
-        | "symbf"
-        | "symbfit"
-        | "symbfsfit"
-        | "symsfit"
-        | "symbfcal"
-        | "symbffrak"
-        | "symbfscr"
-        | "symbfsf"
-        | "symbftt"
-        | "text"
-        | "textbf"
-        | "textit"
-        | "textrm"
-        | "textsf"
-        | "texttt"
-        | "textup"
-        | "textnormal"
-        | "textsc"
-        | "textsl"
-        | "textmd"
-        | "textlf"
-        | "textulc"
-        | "normalfont"
-        | "rmfamily"
-        | "sffamily"
-        | "ttfamily"
-        | "bfseries"
-        | "mdseries"
-        | "lfseries"
-        | "itshape"
-        | "slshape"
-        | "scshape"
-        | "upshape"
-        | "rm"
-        | "bf"
-        | "it"
-        | "sl"
-        | "sf"
-        | "tt"
-        | "sc"
-        | "cal"
-        | "mit"
-        | "oldstylenums"
-        | "emph"
-        | "bm"
-        | "boldsymbol"
-        | "boxed"
-        | "displaystyle"
-        | "textstyle"
-        | "scriptstyle"
-        | "scriptscriptstyle"
-        | "limits"
-        | "nolimits"
-        | "mathrel"
-        | "mathbin"
-        | "mathord"
-        | "mathop"
-        | "mathopen"
-        | "mathclose"
-        | "mathpunct"
-        | "mathinner"
-        | "quad"
-        | "qquad"
-        | "enspace"
-        | "thinspace"
-        | "medspace"
-        | "thickspace"
-        | "negthinspace"
-        | "negmedspace"
-        | "negthickspace"
-        | ","
-        | ":"
-        | ";"
-        | "!"
-        | ">"
-        | "/"
-        | " "
-        | "\t"
-        | "\n"
-        | "\r"
-        | "\\"
-        | "dot"
-        | "ddot"
-        | "bar"
-        | "hat"
-        | "check"
-        | "breve"
-        | "acute"
-        | "grave"
-        | "tilde"
-        | "vec"
-        | "widetilde"
-        | "widehat"
-        | "overline"
-        | "underline"
-        | "overrightarrow"
-        | "overleftarrow"
-        | "frac"
-        | "dfrac"
-        | "tfrac"
-        | "cfrac"
-        | "binom"
-        | "tbinom"
-        | "dbinom"
-        | "substack"
-        | "mbox"
-        | "hbox"
-        | "mathclap"
-        | "mathllap"
-        | "mathrlap"
-        | "operatorname"
-        | "bigl"
-        | "bigr"
-        | "Bigl"
-        | "Bigr"
-        | "biggl"
-        | "biggr"
-        | "Biggl"
-        | "Biggr"
-        | "bigm"
-        | "Bigm"
-        | "biggm"
-        | "Biggm"
-        | "big"
-        | "Big"
-        | "bigg"
-        | "Bigg" => MathCommand::Transparent,
+        "mathcal" | "mathbb" | "mathbbm" | "mathbbb" | "mathds" | "mathfrak" | "mathscr"
+        | "mathrm" | "mathbf" | "mathbfit" | "mathsf" | "mathsfit" | "mathbfsfit" | "mathbfcal"
+        | "mathbfscr" | "mathtt" | "mathit" | "mathnormal" | "mathbold" | "symrm" | "symit"
+        | "symsf" | "symtt" | "symbb" | "symcal" | "symscr" | "symfrak" | "symnormal" | "symbf"
+        | "symbfit" | "symbfsfit" | "symsfit" | "symbfcal" | "symbffrak" | "symbfscr"
+        | "symbfsf" | "symbftt" | "text" | "textbf" | "textit" | "textrm" | "textsf" | "texttt"
+        | "textup" | "textnormal" | "textsc" | "textsl" | "textmd" | "textlf" | "textulc"
+        | "normalfont" | "rmfamily" | "sffamily" | "ttfamily" | "bfseries" | "mdseries"
+        | "lfseries" | "itshape" | "slshape" | "scshape" | "upshape" | "rm" | "bf" | "it"
+        | "sl" | "sf" | "tt" | "sc" | "cal" | "mit" | "oldstylenums" | "emph" | "bm"
+        | "boldsymbol" | "boxed" | "displaystyle" | "textstyle" | "scriptstyle"
+        | "scriptscriptstyle" | "limits" | "nolimits" | "mathrel" | "mathbin" | "mathord"
+        | "mathop" | "mathopen" | "mathclose" | "mathpunct" | "mathinner" | "quad" | "qquad"
+        | "enspace" | "thinspace" | "medspace" | "thickspace" | "negthinspace" | "negmedspace"
+        | "negthickspace" | "," | ":" | ";" | "!" | ">" | "/" | " " | "\t" | "\n" | "\r" | "\\"
+        | "dot" | "ddot" | "bar" | "hat" | "check" | "breve" | "acute" | "grave" | "tilde"
+        | "vec" | "widetilde" | "widehat" | "overline" | "underline" | "overrightarrow"
+        | "overleftarrow" | "frac" | "dfrac" | "tfrac" | "cfrac" | "binom" | "tbinom"
+        | "dbinom" | "substack" | "mbox" | "hbox" | "mathclap" | "mathllap" | "mathrlap"
+        | "operatorname" | "bigl" | "bigr" | "Bigl" | "Bigr" | "biggl" | "biggr" | "Biggl"
+        | "Biggr" | "bigm" | "Bigm" | "biggm" | "Biggm" | "big" | "Big" | "bigg" | "Bigg" => {
+            MathCommand::Transparent
+        }
 
         // Variable-size delimiter prefixes that can take a `.` null delimiter
         "left" | "right" | "middle" => MathCommand::DelimiterPrefix,
@@ -279,51 +147,12 @@ pub(crate) fn classify_command(name: &str) -> MathCommand {
         "xleftarrow" => MathCommand::ExtensibleArrow('←'),
 
         // Named operators and functions
-        "sin" | "cos" | "tan" | "csc" | "sec" | "cot" | "arcsin" | "arccos" | "arctan"
-        | "sinh" | "cosh" | "tanh" | "coth" | "arcsinh" | "arccosh" | "arctanh" | "csch"
-        | "sech" | "exp" | "ln" | "log" | "lg" | "erf" | "erfc" | "arg" | "ker" | "dim"
-        | "det" | "Pr" | "gcd" | "deg" | "hom" | "mod" | "lim" | "min" | "max" | "inf"
-        | "sup" => MathCommand::Words( match name {
-            "sin" => "sin",
-            "cos" => "cos",
-            "tan" => "tan",
-            "csc" => "csc",
-            "sec" => "sec",
-            "cot" => "cot",
-            "arcsin" => "arcsin",
-            "arccos" => "arccos",
-            "arctan" => "arctan",
-            "sinh" => "sinh",
-            "cosh" => "cosh",
-            "tanh" => "tanh",
-            "coth" => "coth",
-            "arcsinh" => "arcsinh",
-            "arccosh" => "arccosh",
-            "arctanh" => "arctanh",
-            "csch" => "csch",
-            "sech" => "sech",
-            "exp" => "exp",
-            "ln" => "ln",
-            "log" => "log",
-            "lg" => "lg",
-            "erf" => "erf",
-            "erfc" => "erfc",
-            "arg" => "arg",
-            "ker" => "ker",
-            "dim" => "dim",
-            "det" => "det",
-            "Pr" => "Pr",
-            "gcd" => "gcd",
-            "deg" => "deg",
-            "hom" => "hom",
-            "mod" => "mod",
-            "lim" => "lim",
-            "min" => "min",
-            "max" => "max",
-            "inf" => "inf",
-            "sup" => "sup",
-            _ => unreachable!(),
-        }),
+        "sin" | "cos" | "tan" | "csc" | "sec" | "cot" | "arcsin" | "arccos" | "arctan" | "sinh"
+        | "cosh" | "tanh" | "coth" | "arcsinh" | "arccosh" | "arctanh" | "csch" | "sech"
+        | "exp" | "ln" | "log" | "lg" | "erf" | "erfc" | "arg" | "ker" | "dim" | "det" | "Pr"
+        | "gcd" | "deg" | "hom" | "mod" | "lim" | "min" | "max" | "inf" | "sup" => {
+            MathCommand::Words(name)
+        }
         "liminf" => MathCommand::Words("lim inf"),
         "limsup" => MathCommand::Words("lim sup"),
         "argmin" => MathCommand::Words("arg min"),
@@ -538,8 +367,9 @@ pub(crate) fn classify_command(name: &str) -> MathCommand {
         "pm" => MathCommand::Symbol('±'),
         "mp" => MathCommand::Symbol('∓'),
         "cdot" | "centerdot" => MathCommand::Symbol('⋅'),
-        "cdots" | "ldots" | "dots" | "dotsb" | "dotsc" | "dotsi" | "dotsm" | "dotso"
-        | "hdots" => MathCommand::Symbol('…'),
+        "cdots" | "ldots" | "dots" | "dotsb" | "dotsc" | "dotsi" | "dotsm" | "dotso" | "hdots" => {
+            MathCommand::Symbol('…')
+        }
         "vdots" => MathCommand::Symbol('⋮'),
         "ddots" => MathCommand::Symbol('⋱'),
         "circ" => MathCommand::Symbol('∘'),
