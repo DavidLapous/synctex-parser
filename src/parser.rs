@@ -1809,7 +1809,8 @@ struct GraphicsBox {
 
 /// Detect the outer bounding horizontal box of an `\includegraphics` /
 /// `\includesvg` construct from its `\Gscale@box` zero-width hbox pair and its
-/// enclosing `\Ginclude@...` / `\Gin@setfile` wrappers.
+/// enclosing `\Ginclude@...` / `\Gin@setfile` wrappers (`graphics.sty` routes
+/// both scaled and unscaled `\includegraphics` through `\Gscale@box`).
 fn graphics_outer_box(
     nodes: &[ForwardNode],
     inputs: &[(u32, String)],

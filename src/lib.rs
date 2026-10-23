@@ -3457,13 +3457,29 @@ fn source_graphics_location(
         .flatten();
     let mut matched = Vec::new();
     let mut masked = Vec::new();
+    let mut line_cursor = 0usize;
+    let mut line_count = 0usize;
     for (start, full, graphics_body) in nonprinting_source_spans(source) {
         let Some(body) = graphics_body else {
             masked.push(start..full.end);
             continue;
         };
-        let start_line = source[..full.start].bytes().filter(|&ch| ch == b'\n').count();
-        let end_line = source[..full.end].bytes().filter(|&ch| ch == b'\n').count();
+        if full.start >= line_cursor {
+            line_count += source[line_cursor..full.start]
+                .bytes()
+                .filter(|&ch| ch == b'\n')
+                .count();
+            line_cursor = full.start;
+        }
+        let start_line = line_count;
+        if full.end >= line_cursor {
+            line_count += source[line_cursor..full.end]
+                .bytes()
+                .filter(|&ch| ch == b'\n')
+                .count();
+            line_cursor = full.end;
+        }
+        let end_line = line_count;
         let in_scope = match &scope {
             Some(range) => range.contains(&start_line) && range.contains(&end_line),
             None => (start_line..=end_line).contains(&anchor),
@@ -3492,13 +3508,17 @@ fn source_graphics_location(
             .map(str::len)
             .sum::<usize>();
     let macros = math::macros(source);
+    let mut masked = masked.into_iter().peekable();
     let mut if_depth = 0usize;
     let mut at = 0usize;
     while at < scope_end {
         if at >= scope_start && if_depth > 0 {
             return None;
         }
-        if let Some(r) = masked.iter().find(|r| r.contains(&at)) {
+        while masked.peek().is_some_and(|r| r.end <= at) {
+            masked.next();
+        }
+        if let Some(r) = masked.peek().filter(|r| r.contains(&at)) {
             at = r.end;
             continue;
         }
@@ -3556,9 +3576,9 @@ fn source_graphics_location(
                     if matched
                         .iter()
                         .any(|(full, _, _, _)| full.start < arg_end && full.end > at)
-                        || macro_entry.is_none_or(|def| {
-                            def.body.contains("include")
-                                || macros.keys().any(|k| has_control_word(def.body, k))
+                        || macro_entry.and_then(|def| def.body).is_none_or(|body| {
+                            body.contains("include")
+                                || macros.keys().any(|k| has_control_word(body, k))
                         })
                     {
                         return None;
@@ -3566,7 +3586,13 @@ fn source_graphics_location(
                 }
             }
             _ => {
-                at += 1;
+                let next_mask_end = masked.peek().map_or(scope_end, |r| r.start.min(scope_end));
+                let rest = &source.as_bytes()[at + 1..next_mask_end];
+                let step = rest
+                    .iter()
+                    .position(|&b| matches!(b, b'%' | b'\\'))
+                    .map_or(rest.len() + 1, |p| p + 1);
+                at += step;
             }
         }
     }

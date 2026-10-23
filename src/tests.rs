@@ -3517,7 +3517,7 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
         "\\usepackage{graphicx}\n",
         "\\begin{document}\n",
         "\\noindent\n",
-        "\\includegraphics[width=80pt]{example-image-a}\\hspace{20pt}\\includegraphics[width=80pt]{example-image-b}\n",
+        "\\includegraphics[width=80pt]{example-image-a}\\hspace{20pt}\\includegraphics{example-image-b}\n",
         "\\end{document}\n",
     );
     fs::write(&real_tex, real_source).unwrap();

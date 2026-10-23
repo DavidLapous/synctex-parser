@@ -257,21 +257,21 @@ pub(crate) fn classify_command(name: &str) -> MathCommand {
         "mskip" | "hskip" | "vskip" => MathCommand::Dimension { allow_glue: true },
 
         // Metadata / invisible argument consumers
-        "textcolor" | "color" | "phantom" | "hphantom" | "vphantom" | "hspace" | "vspace" => {
-            MathCommand::DiscardArg {
-                emit_gap: false,
-                trailing_opt: false,
-            }
-        }
+        "textcolor" | "color" | "phantom" | "hphantom" | "vphantom" | "hspace" | "vspace"
+        | "nocite" => MathCommand::DiscardArg {
+            emit_gap: false,
+            trailing_opt: false,
+        },
         "raisebox" => MathCommand::DiscardArg {
             emit_gap: false,
             trailing_opt: true,
         },
-        "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref" | "cite" | "citep" | "citet"
-        | "nocite" => MathCommand::DiscardArg {
-            emit_gap: true,
-            trailing_opt: false,
-        },
+        "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref" | "cite" | "citep" | "citet" => {
+            MathCommand::DiscardArg {
+                emit_gap: true,
+                trailing_opt: false,
+            }
+        }
 
         // Structural math commands with optional [...] arguments
         "sqrt" => MathCommand::Sqrt,

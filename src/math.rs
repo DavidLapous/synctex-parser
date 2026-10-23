@@ -6,7 +6,7 @@ use std::ops::Range;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MacroDef<'a> {
     pub(super) arity: u8,
-    pub(super) body: &'a str,
+    pub(super) body: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -626,9 +626,7 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                 at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
                 if matches!(
                     cmd,
-                    "def"
-                        | "gdef"
-                        | "edef"
+                    "edef"
                         | "xdef"
                         | "NewDocumentCommand"
                         | "RenewDocumentCommand"
@@ -640,7 +638,33 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                     }
                     continue;
                 }
-                let (name, arity) = if cmd == "DeclareMathOperator" {
+                let (name, arity) = if matches!(cmd, "def" | "gdef") {
+                    let Some((name, mut next)) = macro_target_name(source, at) else {
+                        continue;
+                    };
+                    let mut arity = Some(0u8);
+                    loop {
+                        next = super::skip_source_space(source, next);
+                        if source.as_bytes().get(next) == Some(&b'{') {
+                            break;
+                        }
+                        let Some(expected) = arity.and_then(|a| (a < 9).then_some(b'1' + a)) else {
+                            arity = None;
+                            break;
+                        };
+                        if source.as_bytes().get(next) == Some(&b'#')
+                            && source.as_bytes().get(next + 1) == Some(&expected)
+                        {
+                            arity = arity.map(|a| a + 1);
+                            next += 2;
+                        } else {
+                            arity = None;
+                            break;
+                        }
+                    }
+                    at = next;
+                    (name, arity)
+                } else if cmd == "DeclareMathOperator" {
                     let Some((name, next)) = macro_target_name(source, at) else {
                         continue;
                     };
@@ -700,12 +724,12 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                     }
                     seen_params |= 1 << d;
                 }
-                let Some(def) = valid.then_some(MacroDef { arity, body }) else {
-                    table.insert(name, None);
-                    continue;
+                let def = MacroDef {
+                    arity,
+                    body: valid.then_some(body),
                 };
                 match table.get(name) {
-                    Some(Some(existing)) if *existing == def => {}
+                    Some(Some(existing)) if *existing == def && def.body.is_some() => {}
                     Some(_) => {
                         table.insert(name, None);
                     }
@@ -715,7 +739,12 @@ pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
                 }
             }
             _ => {
-                at += source[at..].chars().next().map_or(1, char::len_utf8);
+                let rest = &source.as_bytes()[at + 1..];
+                let step = rest
+                    .iter()
+                    .position(|&b| matches!(b, b'%' | b'{' | b'}' | b'$' | b'\\'))
+                    .map_or(rest.len() + 1, |p| p + 1);
+                at += step;
             }
         }
     }
@@ -754,10 +783,6 @@ fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
     if source[pos..parse_limit]
         .get(..4)
         .is_some_and(|s| s.eq_ignore_ascii_case("true"))
-        && !source
-            .as_bytes()
-            .get(pos + 4)
-            .is_some_and(u8::is_ascii_alphabetic)
     {
         pos = super::skip_source_space(source, pos + 4).min(parse_limit);
     }
@@ -768,10 +793,6 @@ fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
         if source[pos..parse_limit]
             .get(..unit.len())
             .is_some_and(|s| s.eq_ignore_ascii_case(unit))
-            && !source
-                .as_bytes()
-                .get(pos + unit.len())
-                .is_some_and(u8::is_ascii_alphabetic)
         {
             let unit_end = pos + unit.len();
             if let Some(end) = group_end {
@@ -794,6 +815,7 @@ fn atoms_with_macros<'a>(
     depth: u8,
     span_override: Option<Range<usize>>,
     args: &[(&'a str, Range<usize>)],
+    has_unknown: &mut bool,
 ) -> Option<Vec<Atom>> {
     if depth >= 64 {
         return None;
@@ -803,7 +825,7 @@ fn atoms_with_macros<'a>(
     let mut prev_alnum_end = None;
     let script_arg = |pos: usize| -> Option<(Range<usize>, usize)> {
         let pos = super::skip_source_space(source, pos).min(range.end);
-        match *source.as_bytes().get(pos)? {
+        match *source[..range.end].as_bytes().get(pos)? {
             b'{' => group(source, pos).filter(|(_, end)| *end <= range.end),
             b'\\' => {
                 let (_, end) = command(source, pos);
@@ -834,13 +856,21 @@ fn atoms_with_macros<'a>(
                     .and_then(|b| args.get(usize::from(b - b'1')))
                 {
                     i += 1;
-                    let sub =
-                        atoms_with_macros(arg_src, arg_rng.clone(), macros, depth + 1, None, &[])?;
+                    let sub = atoms_with_macros(
+                        arg_src,
+                        arg_rng.clone(),
+                        macros,
+                        depth + 1,
+                        None,
+                        &[],
+                        has_unknown,
+                    )?;
                     result.extend(sub);
                 } else {
                     i += usize::from(
                         i < range.end && source.as_bytes().get(i).is_some_and(u8::is_ascii_digit),
                     );
+                    *has_unknown = true;
                     append(&mut result, '\0', emit_span(start..i));
                 }
             }
@@ -857,6 +887,7 @@ fn atoms_with_macros<'a>(
                     } else {
                         source[i..range.end].chars().next().map_or(0, char::len_utf8)
                     };
+                    *has_unknown = true;
                     append(&mut result, '\0', emit_span(start..i));
                     continue;
                 }
@@ -878,6 +909,7 @@ fn atoms_with_macros<'a>(
                         depth + 1,
                         span_override.clone(),
                         args,
+                        has_unknown,
                     )?;
                     result.extend(sub);
                     i = after1;
@@ -897,6 +929,7 @@ fn atoms_with_macros<'a>(
                             depth + 1,
                             span_override.clone(),
                             args,
+                            has_unknown,
                         )?;
                         result.extend(sub);
                         i = super::skip_source_space(source, end_next).min(range.end);
@@ -908,13 +941,45 @@ fn atoms_with_macros<'a>(
                 let (name, end) = command(source, start);
                 i = end;
                 let span = emit_span(start..end);
+                if (name.starts_with("if") && name != "iff")
+                    || matches!(
+                        name,
+                        "else"
+                            | "or"
+                            | "fi"
+                            | "mathchoice"
+                            | "char"
+                            | "mathchar"
+                            | "Umathchar"
+                            | "Umathcodenum"
+                            | "Uchar"
+                            | "delimiter"
+                            | "Udelimiter"
+                            | "radical"
+                            | "Uradical"
+                            | "mathaccent"
+                            | "Umathaccent"
+                            | "accent"
+                            | "csname"
+                            | "endcsname"
+                            | "expandafter"
+                            | "noexpand"
+                            | "string"
+                            | "meaning"
+                            | "romannumeral"
+                            | "number"
+                            | "the"
+                    )
+                {
+                    return None;
+                }
                 if name == "label" {
                     while let Some(opt_end) =
                         super::optional_argument_end(source, i).filter(|e| *e <= range.end)
                     {
                         i = opt_end;
                     }
-                    if let Some((_, grp_end)) = group(source, i).filter(|(_, e)| *e <= range.end) {
+                    if let Some((_, grp_end)) = script_arg(i) {
                         i = grp_end;
                     }
                     continue;
@@ -950,6 +1015,7 @@ fn atoms_with_macros<'a>(
                             end = e;
                         }
                     } else if !math_environment(environment) {
+                        *has_unknown = true;
                         append(&mut result, '\0', span);
                     }
                     i = end;
@@ -967,9 +1033,7 @@ fn atoms_with_macros<'a>(
                         let mut call_args = Vec::with_capacity(usize::from(def.arity));
                         let mut arg_cursor = i;
                         for _ in 0..def.arity {
-                            let Some((arg_rng, arg_end)) =
-                                group(source, arg_cursor).filter(|(_, end)| *end <= range.end)
-                            else {
+                            let Some((arg_rng, arg_end)) = script_arg(arg_cursor) else {
                                 break;
                             };
                             arg_cursor = arg_end;
@@ -990,28 +1054,34 @@ fn atoms_with_macros<'a>(
                         }
                         if call_args.len() == usize::from(def.arity) {
                             i = arg_cursor;
-                            let after = super::skip_source_space(source, i).min(range.end);
-                            let boundary_script = def.body.contains(['_', '^', '\\'])
-                                && (source[after..range.end].starts_with(['_', '^'])
-                                    || (def.body.contains(['_', '^'])
-                                        && call_args.iter().any(|(src, rng)| {
-                                            src[rng.clone()].contains(['_', '^'])
-                                        })));
-                            if boundary_script {
-                                append(&mut result, '\0', span.clone());
+                            if let Some(body) = def.body {
+                                let after = super::skip_source_space(source, i).min(range.end);
+                                let boundary_script = body.contains(['_', '^', '\\'])
+                                    && (source[after..range.end].starts_with(['_', '^'])
+                                        || (body.contains(['_', '^'])
+                                            && call_args.iter().any(|(src, rng)| {
+                                                src[rng.clone()].contains(['_', '^'])
+                                            })));
+                                if boundary_script {
+                                    append(&mut result, '\0', span.clone());
+                                }
+                                let sub = atoms_with_macros(
+                                    body,
+                                    0..body.len(),
+                                    macros,
+                                    depth + 16,
+                                    Some(span.clone()),
+                                    &call_args,
+                                    has_unknown,
+                                )?;
+                                result.extend(sub);
+                                if boundary_script {
+                                    append(&mut result, '\0', span);
+                                }
+                                continue;
                             }
-                            let sub = atoms_with_macros(
-                                def.body,
-                                0..def.body.len(),
-                                macros,
-                                depth + 16,
-                                Some(span.clone()),
-                                &call_args,
-                            )?;
-                            result.extend(sub);
-                            if boundary_script {
-                                append(&mut result, '\0', span);
-                            }
+                            *has_unknown = true;
+                            append(&mut result, '\0', span);
                             continue;
                         }
                         i = arg_cursor;
@@ -1023,6 +1093,7 @@ fn atoms_with_macros<'a>(
                     {
                         i = end;
                     }
+                    *has_unknown = true;
                     append(&mut result, '\0', span);
                     continue;
                 }
@@ -1051,7 +1122,7 @@ fn atoms_with_macros<'a>(
                         i = next_end;
                         append(&mut result, c, emit_span(start..i));
                     } else {
-                        return None;
+                        append(&mut result, '\0', span);
                     }
                     continue;
                 }
@@ -1081,14 +1152,11 @@ fn atoms_with_macros<'a>(
                                 } else {
                                     break;
                                 };
-                                if source
-                                    .as_bytes()
-                                    .get(kw_end)
-                                    .is_some_and(u8::is_ascii_alphabetic)
-                                {
+                                let Some(next_end) = skip_tex_dimen(source, kw_end, range.end)
+                                else {
                                     break;
-                                }
-                                dim_end = skip_tex_dimen(source, kw_end, range.end)?;
+                                };
+                                dim_end = next_end;
                             }
                         }
                         i = dim_end;
@@ -1106,9 +1174,7 @@ fn atoms_with_macros<'a>(
                         {
                             i = opt_end;
                         }
-                        if let Some((_, grp_end)) =
-                            group(source, i).filter(|(_, e)| *e <= range.end)
-                        {
+                        if let Some((_, grp_end)) = script_arg(i) {
                             i = grp_end;
                         }
                         while trailing_opt
@@ -1118,6 +1184,7 @@ fn atoms_with_macros<'a>(
                             i = opt_end;
                         }
                         if emit_gap {
+                            *has_unknown = true;
                             append(&mut result, '\0', span);
                         }
                     }
@@ -1134,6 +1201,7 @@ fn atoms_with_macros<'a>(
                                 depth + 1,
                                 span_override.clone(),
                                 args,
+                                has_unknown,
                             )?;
                             result.extend(sub);
                             append(&mut result, '\0', span.clone());
@@ -1154,6 +1222,7 @@ fn atoms_with_macros<'a>(
                                 depth + 1,
                                 span_override.clone(),
                                 args,
+                                has_unknown,
                             )?;
                             result.extend(sub);
                             append(&mut result, '\0', span.clone());
@@ -1176,6 +1245,7 @@ fn atoms_with_macros<'a>(
                         {
                             i = end;
                         }
+                        *has_unknown = true;
                         append(&mut result, '\0', span);
                     }
                 }
@@ -1247,13 +1317,22 @@ pub(super) fn source_location(
     let macros = macros(source);
     let mut best = None;
     let mut tied = false;
+    let mut has_unknown = false;
     for range in regions {
         if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
             || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
         {
             continue;
         }
-        let atoms = atoms_with_macros(source, range.clone(), &macros, 0, None, &[])?;
+        let atoms = atoms_with_macros(
+            source,
+            range.clone(),
+            &macros,
+            0,
+            None,
+            &[],
+            &mut has_unknown,
+        )?;
         let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
             if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
@@ -1350,16 +1429,18 @@ pub(super) fn source_location(
             }
         }
     }
-    let mathematical = best.filter(|_| !tied).map(|(_, location)| location);
+    let mathematical = best
+        .filter(|((score, ..), _)| !tied && (!has_unknown || word.len() > 1 || *score > 0))
+        .map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
         return prose.map(|(row, byte, _)| (row, byte));
     }
-    match (prose, mathematical) {
-        (Some(_), Some(_)) => None,
-        (prose, mathematical) => prose.map(|(row, byte, _)| (row, byte)).or(mathematical),
+    if prose.is_some() && best.is_some() {
+        return None;
     }
+    prose.map(|(row, byte, _)| (row, byte)).or(mathematical)
 }
 
 #[cfg(test)]
@@ -1518,8 +1599,10 @@ mod tests {
             Some((2, 2))
         );
         let source = "$\\alpha\\custom{z}$\n$\\beta$";
+        assert_eq!(source_location(source, 2, 0..2, true, "β", 0, None), None);
+        let source = "$\\alpha\\custom{z}$\n$\\beta+1$";
         assert_eq!(
-            source_location(source, 2, 0..2, true, "β", 0, None),
+            source_location(source, 2, 0..2, true, "β+1", 0, None),
             Some((2, 1))
         );
         let source = "$\\custom{z}$\nA. Box in 2020";
@@ -1538,6 +1621,29 @@ mod tests {
                 Some((2, 10, 3))
             ),
             Some((2, 10))
+        );
+        for (bad_source, context) in [
+            ("$\\mathchoice{x+a}{\\char120+a}{z+c}{w+d}$", "x+a"),
+            ("$\\iffalse x+a\\else\\char120+a\\fi$", "x+a"),
+            ("$\\phantom x+a$\n$\\char120+a$", "x+a"),
+            ("\\def\\hide#1{}\n$\\hide x+a$\n$\\char120+a$", "x+a"),
+            ("$\\sqrt[\\char110]{x}$\n$n$", "n"),
+            ("$\\sqrt[\\custom]{x}$\n$n$", "n"),
+        ] {
+            let line_count = bad_source.lines().count();
+            assert_eq!(
+                source_location(bad_source, 1, 0..line_count, true, context, 0, None),
+                None,
+                "{bad_source}"
+            );
+        }
+        assert_eq!(
+            source_location("$x\\kern1pty$", 1, 0..1, false, "xy", 1, None),
+            Some((1, 10))
+        );
+        assert_eq!(
+            source_location("$x\\kern1truept y$", 1, 0..1, false, "xy", 1, None),
+            Some((1, 15))
         );
     }
 
@@ -1777,6 +1883,19 @@ caption}";
                 None,
             ),
             Some((1, 14))
+        );
+        let not_ll = "Frame prose\n$x\\not\\ll y + z$\n$\\hspace{0.5\\textwidth}w$";
+        assert_eq!(
+            source_location(not_ll, 2, 0..3, true, "x/≪y + z", "x/".len(), None),
+            Some((2, 6))
+        );
+        assert_eq!(
+            source_location(not_ll, 3, 0..3, true, "w", 0, None),
+            Some((3, 23))
+        );
+        assert_eq!(
+            source_location(not_ll, 3, 0..3, true, "prose", 0, Some((1, 6, 5))),
+            Some((1, 6))
         );
     }
 }

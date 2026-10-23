@@ -474,7 +474,7 @@ def opaque_command_end(text: str, command: str, at: int) -> tuple[int, bool] | N
     return (len(text) if close < 0 else close + len(env) + 6, False)
 
 
-def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
+def nonprinting_ranges(text: str, graphics_starts: set[int] | None = None) -> list[tuple[int, int]]:
     definitions = {
         "newcommand", "renewcommand", "providecommand", "DeclareRobustCommand",
         "NewDocumentCommand", "RenewDocumentCommand", "ProvideDocumentCommand",
@@ -565,6 +565,8 @@ def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
             body = tex_space_end(text, at)
             end = tex_group_end(text, body)
             if end is not None:
+                if command in {"includegraphics", "includesvg"} and graphics_starts is not None:
+                    graphics_starts.add(body + 1)
                 hidden.append((start if command in {"includegraphics", "includesvg"} else body, end))
                 at = end
         elif command in {"begin", "end"}:
@@ -870,7 +872,15 @@ def inverse(
             for row in text.splitlines(keepends=True):
                 starts.append(at)
                 at += len(row)
-            sources[path] = (text, text.splitlines(), nonprinting_ranges(text), starts, metadata_spans(text))
+            graphics_starts: set[int] = set()
+            sources[path] = (
+                text,
+                text.splitlines(),
+                nonprinting_ranges(text, graphics_starts),
+                starts,
+                metadata_spans(text),
+                graphics_starts,
+            )
         return sources[path]
 
     def candidate_anchor(page: int, raw: tuple[int, str]):
@@ -887,7 +897,7 @@ def inverse(
             )
             if origin and generated_on_page and origin[0] in source_map["inputs"]:
                 original = source_map["inputs"][origin[0]]
-                original_text, original_lines, _, original_starts, _ = source_info(original)
+                original_text, original_lines, _, original_starts, *_ = source_info(original)
                 original_bounds = frame_bounds(original_text, origin[1])
                 if raw_file.suffix != ".vrb":
                     if 1 <= origin[1] <= len(original_lines):
@@ -908,7 +918,7 @@ def inverse(
                 for tag in source_map["page_inputs"].get(page, set())
             )
             if origin and vrb_on_page and source_map["inputs"].get(origin[0]) == raw_file:
-                original_text, original_lines, _, original_starts, _ = source_info(raw_file)
+                original_text, original_lines, _, original_starts, *_ = source_info(raw_file)
                 original_bounds = frame_bounds(original_text, origin[1])
                 if (
                     original_bounds
@@ -1048,7 +1058,7 @@ def inverse(
             entry["error"] = "inverse result selected a file absent from the source map"
             yield entry
             continue
-        _, resolved_lines, hidden, starts, meta_spans = source_info(resolved_file)
+        _, resolved_lines, hidden, starts, meta_spans, graphics_starts = source_info(resolved_file)
         if not 1 <= resolved_line <= len(resolved_lines):
             entry["error"] = "SyncTeX source line is invalid"
             yield entry
@@ -1066,7 +1076,7 @@ def inverse(
             yield entry
             continue
         absolute_column = starts[resolved_line - 1] + len(prefix)
-        if any(start <= absolute_column < end for start, end in hidden):
+        if any(start <= absolute_column < end for start, end in hidden) and absolute_column not in graphics_starts:
             entry["error"] = "precise inverse result selected a known nonprinting argument or definition"
             yield entry
             continue
@@ -1108,6 +1118,8 @@ def inverse(
         entry["mapping_ok"] = True
         if warning:
             entry.update(abstained=True, reason="resolver_warning")
+        elif absolute_column in graphics_starts:
+            entry.update(ok=True, match="graphics_argument")
         elif not pdf_word:
             entry.update(abstained=True, reason="pdfium_selected_no_word")
         elif normalized_words(pdf_word) != normalized_words(word):
