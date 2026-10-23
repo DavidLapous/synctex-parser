@@ -614,7 +614,7 @@ def line_has_word(line: str, word: str) -> bool:
     hidden = nonprinting_ranges(text)
     text = "".join(" " if any(start <= at < end for start, end in hidden) else char for at, char in enumerate(text))
     text = strip_tex_accents(text)
-    text = re.sub(r"\\[A-Za-z@]+\*?", " ", text)
+    text = re.sub(r"\\[A-Za-z@]+\*?|_+", " ", text)
     needle = normalized_words(word)
     return len(needle) == 1 and needle[0] in normalized_words(text)
 

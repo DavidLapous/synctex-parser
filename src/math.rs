@@ -467,9 +467,12 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
         }
         cursor = nl;
     }
-    let mut result = Vec::with_capacity(atoms.len() + 16);
+    let mut result: Vec<Atom> = Vec::with_capacity(atoms.len() + 16);
     for (i, c) in prefix.into_iter().rev() {
-        append(&mut result, c, i..i + c.len_utf8());
+        let join = result
+            .last()
+            .is_some_and(|prev| prev.value.is_alphanumeric() && prev.span.end == i);
+        append_joined(&mut result, c, i..i + c.len_utf8(), join);
     }
     result.extend(atoms);
     let mut suffix_count = 0;
@@ -486,7 +489,11 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
                 break 'forward;
             }
             if !c.is_whitespace() {
-                append(&mut result, c, cursor + i..cursor + i + c.len_utf8());
+                let start = cursor + i;
+                let join = result
+                    .last()
+                    .is_some_and(|prev| prev.value.is_alphanumeric() && prev.span.end == start);
+                append_joined(&mut result, c, start..start + c.len_utf8(), join);
                 suffix_count += 1;
                 if suffix_count == 8 {
                     break 'forward;
@@ -1289,7 +1296,10 @@ pub(super) fn source_location(
     });
     let mut pdf = Vec::new();
     for (i, c) in context.char_indices() {
-        append(&mut pdf, c, i..i + c.len_utf8());
+        let join = pdf
+            .last()
+            .is_some_and(|prev: &Atom| prev.value.is_alphanumeric() && prev.span.end == i);
+        append_joined(&mut pdf, c, i..i + c.len_utf8(), join);
     }
     let Some(selected) = pdf.iter().position(|atom| atom.span.contains(&offset)) else {
         return prose.map(|(row, byte, _)| (row, byte));
@@ -1301,29 +1311,27 @@ pub(super) fn source_location(
     // nearby single-letter variable with the same spelling.
     let mut word = selected..selected + 1;
     if pdf[selected].value.is_alphanumeric() {
-        while word.start > 0
-            && pdf[word.start - 1].value.is_alphanumeric()
-            && pdf[word.start - 1].span.end == pdf[word.start].span.start
-        {
+        while word.start > 0 && pdf[word.start].word_join {
             word.start -= 1;
         }
-        while word.end < pdf.len()
-            && pdf[word.end].value.is_alphanumeric()
-            && pdf[word.end - 1].span.end == pdf[word.end].span.start
-        {
+        while word.end < pdf.len() && pdf[word.end].word_join {
             word.end += 1;
         }
     }
     let macros = macros(source);
     let mut best = None;
     let mut tied = false;
-    let mut has_unknown = false;
+    let mut any_unknown = false;
+    let mut line_unknown = false;
+    let line_start = *starts.get(line as usize - 1).unwrap_or(&source.len());
+    let line_end = *starts.get(line as usize).unwrap_or(&source.len());
     for range in regions {
         if range.start >= *starts.get(lines.end).unwrap_or(&source.len())
             || range.end <= *starts.get(lines.start).unwrap_or(&source.len())
         {
             continue;
         }
+        let mut region_unknown = false;
         let atoms = atoms_with_macros(
             source,
             range.clone(),
@@ -1331,8 +1339,12 @@ pub(super) fn source_location(
             0,
             None,
             &[],
-            &mut has_unknown,
+            &mut region_unknown,
         )?;
+        any_unknown |= region_unknown;
+        if range.start < line_end && range.end > line_start {
+            line_unknown |= region_unknown;
+        }
         let atoms = inline_context(source, &range, atoms);
         for (index, atom) in atoms.iter().enumerate() {
             if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
@@ -1370,6 +1382,13 @@ pub(super) fn source_location(
             let mut score = 0;
             let mut lexical_score = 0;
             let mut contradictions = 0usize;
+            let joined = |slice: &[Atom], prev: usize, direction: isize| {
+                if direction < 0 {
+                    slice[prev].word_join
+                } else {
+                    slice.get(prev + 1).is_some_and(|next| next.word_join)
+                }
+            };
             for direction in [-1isize, 1] {
                 let source_edge = if direction < 0 {
                     begin
@@ -1381,15 +1400,44 @@ pub(super) fn source_location(
                 } else {
                     word.end - 1
                 };
+                let mut committed = (score, lexical_score);
+                let mut word_start = 1;
                 for distance in 1..=8 {
                     let delta = direction * distance;
+                    let in_word = if distance > 1 {
+                        let prev_src = source_edge
+                            .checked_add_signed(direction * (distance - 1))
+                            .unwrap();
+                        let prev_pdf = pdf_edge
+                            .checked_add_signed(direction * (distance - 1))
+                            .unwrap();
+                        let join_a = joined(&atoms, prev_src, direction);
+                        let join_b = joined(&pdf, prev_pdf, direction);
+                        if !join_a && !join_b {
+                            committed = (score, lexical_score);
+                            word_start = distance;
+                        }
+                        join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                    } else {
+                        false
+                    };
                     match (
                         source_edge
                             .checked_add_signed(delta)
                             .and_then(|i| atoms.get(i)),
                         pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
                     ) {
-                        (Some(a), Some(b)) if a.value == b.value => {
+                        (Some(a), Some(b))
+                            if a.value == b.value
+                                && (!in_word
+                                    || joined(
+                                        &pdf,
+                                        pdf_edge
+                                            .checked_add_signed(direction * (distance - 1))
+                                            .unwrap(),
+                                        direction,
+                                    )) =>
+                        {
                             score += 9 - distance;
                             lexical_score += usize::from(a.value.is_alphanumeric());
                         }
@@ -1397,7 +1445,15 @@ pub(super) fn source_location(
                             contradictions += 1;
                             break;
                         }
-                        _ => break,
+                        _ => {
+                            if in_word {
+                                (score, lexical_score) = committed;
+                                if word_start == 1 {
+                                    contradictions += 1;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -1430,7 +1486,14 @@ pub(super) fn source_location(
         }
     }
     let mathematical = best
-        .filter(|((score, ..), _)| !tied && (!has_unknown || word.len() > 1 || *score > 0))
+        .filter(|((score, ..), location)| {
+            let has_unknown = if within_frame || location.0 != line {
+                any_unknown
+            } else {
+                line_unknown
+            };
+            !tied && (!has_unknown || word.len() > 1 || *score > 0)
+        })
         .map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
@@ -1643,6 +1706,23 @@ mod tests {
         );
         assert_eq!(
             source_location("$x\\kern1truept y$", 1, 0..1, false, "xy", 1, None),
+            Some((1, 15))
+        );
+        assert_eq!(
+            source_location("$A_\\custom$\n$x$", 2, 0..2, false, "x", 0, None),
+            Some((2, 1))
+        );
+        let shared_suffix = "\\emph{sample} $M$:\n\\item a local state $M_x = y$";
+        assert_eq!(
+            source_location(
+                shared_suffix,
+                1,
+                0..2,
+                true,
+                "sample M: a local state",
+                "sample ".len(),
+                None,
+            ),
             Some((1, 15))
         );
     }
