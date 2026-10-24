@@ -106,12 +106,36 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
                 false,
             ))
         }
+        "lstinline" => {
+            if let Some(opt_end) = super::optional_argument_end(source, at) {
+                at = opt_end;
+            }
+            let at = super::skip_source_space(source, at);
+            if source.as_bytes().get(at) == Some(&b'{') {
+                return group(source, at).map(|(_, end)| (end, false));
+            }
+            let delimiter = source[at..].chars().next()?;
+            let after = at + delimiter.len_utf8();
+            Some((
+                after
+                    + source[after..]
+                        .find(delimiter)
+                        .map_or(source.len() - after, |n| n + delimiter.len_utf8()),
+                false,
+            ))
+        }
         "begin" => {
             let (body, end) = group(source, super::skip_source_space(source, at))?;
             let environment = &source[body];
             if !matches!(
                 environment.trim_end_matches('*'),
-                "verbatim" | "Verbatim" | "lstlisting" | "minted" | "comment"
+                "verbatim"
+                    | "Verbatim"
+                    | "BVerbatim"
+                    | "LVerbatim"
+                    | "lstlisting"
+                    | "minted"
+                    | "comment"
             ) {
                 return None;
             }
@@ -139,7 +163,10 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
                 }
                 return Some((source.len(), true));
             }
-            if matches!(environment.trim_end_matches('*'), "Verbatim" | "minted") {
+            if matches!(
+                environment.trim_end_matches('*'),
+                "Verbatim" | "BVerbatim" | "LVerbatim" | "minted"
+            ) {
                 // Fancyvrb checks only the first \end{ marker on each subsequent line.
                 let Some(newline) = source[end..].find('\n') else {
                     return Some((source.len(), false));
@@ -865,230 +892,236 @@ fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
     }
 }
 
-pub(super) fn macros(source: &str) -> BTreeMap<&str, Option<MacroDef<'_>>> {
-    let mut table = BTreeMap::<&str, Option<MacroDef<'_>>>::new();
-    let mut in_preamble = true;
-    let mut brace_depth = 0usize;
-    let mut group_depth = 0usize;
-    let mut if_depth = 0usize;
-    let mut at = 0usize;
-    while at < source.len() {
-        match source.as_bytes()[at] {
-            b'%' => {
-                at += source[at..].find('\n').unwrap_or(source.len() - at);
-            }
-            b'{' => {
-                brace_depth += 1;
-                at += 1;
-            }
-            b'}' => {
-                brace_depth = brace_depth.saturating_sub(1);
-                at += 1;
-            }
-            b'$' => {
-                if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
-                    in_preamble = false;
+pub(crate) fn macros_from_sources<'a>(
+    sources: &[&'a str],
+) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
+    let mut table = BTreeMap::<&'a str, Option<MacroDef<'a>>>::new();
+    for &source in sources {
+        let mut in_preamble = true;
+        let mut brace_depth = 0usize;
+        let mut group_depth = 0usize;
+        let mut if_depth = 0usize;
+        let mut at = 0usize;
+        while at < source.len() {
+            match source.as_bytes()[at] {
+                b'%' => {
+                    at += source[at..].find('\n').unwrap_or(source.len() - at);
                 }
-                at += 1;
-            }
-            b'\\' => {
-                let (cmd, end) = command(source, at);
-                at = end;
-                if let Some((opaque_end, _)) = opaque_command_end(source, cmd, at) {
-                    at = opaque_end;
-                    continue;
+                b'{' => {
+                    brace_depth += 1;
+                    at += 1;
                 }
-                if matches!(cmd, "(" | "[") {
+                b'}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    at += 1;
+                }
+                b'$' => {
                     if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
                         in_preamble = false;
                     }
-                    continue;
+                    at += 1;
                 }
-                if matches!(cmd, "begingroup" | "bgroup") {
-                    group_depth += 1;
-                    continue;
-                }
-                if matches!(cmd, "endgroup" | "egroup") {
-                    group_depth = group_depth.saturating_sub(1);
-                    continue;
-                }
-                if cmd.starts_with("if") && cmd != "iff" {
-                    if_depth += 1;
-                    continue;
-                }
-                if cmd == "fi" {
-                    if_depth = if_depth.saturating_sub(1);
-                    continue;
-                }
-                if cmd == "begin" {
-                    if let Some((env, next)) = group(source, at) {
-                        if &source[env] == "document"
-                            || (brace_depth == 0 && group_depth == 0 && if_depth == 0)
-                        {
+                b'\\' => {
+                    let (cmd, end) = command(source, at);
+                    at = end;
+                    if let Some((opaque_end, _)) = opaque_command_end(source, cmd, at) {
+                        at = opaque_end;
+                        continue;
+                    }
+                    if matches!(cmd, "(" | "[") {
+                        if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
                             in_preamble = false;
                         }
-                        at = next;
+                        continue;
                     }
-                    group_depth += 1;
-                    continue;
-                }
-                if cmd == "end" {
-                    group_depth = group_depth.saturating_sub(1);
-                    if let Some((_, next)) = group(source, at) {
-                        at = next;
+                    if matches!(cmd, "begingroup" | "bgroup") {
+                        group_depth += 1;
+                        continue;
                     }
-                    continue;
-                }
-                if cmd == "csname" {
-                    if let Some(pos) = source[at..].find("\\endcsname") {
-                        let name = source[at..at + pos].trim();
-                        if !name.is_empty() {
+                    if matches!(cmd, "endgroup" | "egroup") {
+                        group_depth = group_depth.saturating_sub(1);
+                        continue;
+                    }
+                    if cmd.starts_with("if") && cmd != "iff" {
+                        if_depth += 1;
+                        continue;
+                    }
+                    if cmd == "fi" {
+                        if_depth = if_depth.saturating_sub(1);
+                        continue;
+                    }
+                    if cmd == "begin" {
+                        if let Some((env, next)) = group(source, at) {
+                            if &source[env] == "document"
+                                || (brace_depth == 0 && group_depth == 0 && if_depth == 0)
+                            {
+                                in_preamble = false;
+                            }
+                            at = next;
+                        }
+                        group_depth += 1;
+                        continue;
+                    }
+                    if cmd == "end" {
+                        group_depth = group_depth.saturating_sub(1);
+                        if let Some((_, next)) = group(source, at) {
+                            at = next;
+                        }
+                        continue;
+                    }
+                    if cmd == "csname" {
+                        if let Some(pos) = source[at..].find("\\endcsname") {
+                            let name = source[at..at + pos].trim();
+                            if !name.is_empty() {
+                                table.insert(name, None);
+                            }
+                            at += pos + "\\endcsname".len();
+                        }
+                        continue;
+                    }
+                    if matches!(cmd, "let" | "futurelet") {
+                        if let Some((name, mut next)) = macro_target_name(source, at) {
+                            table.insert(name, None);
+                            next = super::skip_source_space(source, next);
+                            if cmd == "let" && source.as_bytes().get(next) == Some(&b'=') {
+                                next = super::skip_source_space(source, next + 1);
+                            }
+                            if source.as_bytes().get(next) == Some(&b'\\') {
+                                next = command(source, next).1;
+                            } else if next < source.len() {
+                                next += source[next..].chars().next().map_or(1, char::len_utf8);
+                            }
+                            at = next;
+                        }
+                        continue;
+                    }
+                    let top_level =
+                        in_preamble && brace_depth == 0 && group_depth == 0 && if_depth == 0;
+                    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    if matches!(
+                        cmd,
+                        "edef"
+                            | "xdef"
+                            | "NewDocumentCommand"
+                            | "RenewDocumentCommand"
+                            | "ProvideDocumentCommand"
+                            | "DeclareDocumentCommand"
+                    ) {
+                        if let Some((name, _)) = macro_target_name(source, at) {
                             table.insert(name, None);
                         }
-                        at += pos + "\\endcsname".len();
+                        continue;
                     }
-                    continue;
-                }
-                if matches!(cmd, "let" | "futurelet") {
-                    if let Some((name, mut next)) = macro_target_name(source, at) {
-                        table.insert(name, None);
-                        next = super::skip_source_space(source, next);
-                        if cmd == "let" && source.as_bytes().get(next) == Some(&b'=') {
-                            next = super::skip_source_space(source, next + 1);
-                        }
-                        if source.as_bytes().get(next) == Some(&b'\\') {
-                            next = command(source, next).1;
-                        } else if next < source.len() {
-                            next += source[next..].chars().next().map_or(1, char::len_utf8);
+                    let (name, arity) = if matches!(cmd, "def" | "gdef") {
+                        let Some((name, mut next)) = macro_target_name(source, at) else {
+                            continue;
+                        };
+                        let mut arity = Some(0u8);
+                        loop {
+                            next = super::skip_source_space(source, next);
+                            if source.as_bytes().get(next) == Some(&b'{') {
+                                break;
+                            }
+                            let Some(expected) = arity.and_then(|a| (a < 9).then_some(b'1' + a))
+                            else {
+                                arity = None;
+                                break;
+                            };
+                            if source.as_bytes().get(next) == Some(&b'#')
+                                && source.as_bytes().get(next + 1) == Some(&expected)
+                            {
+                                arity = arity.map(|a| a + 1);
+                                next += 2;
+                            } else {
+                                arity = None;
+                                break;
+                            }
                         }
                         at = next;
-                    }
-                    continue;
-                }
-                let top_level =
-                    in_preamble && brace_depth == 0 && group_depth == 0 && if_depth == 0;
-                at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                if matches!(
-                    cmd,
-                    "edef"
-                        | "xdef"
-                        | "NewDocumentCommand"
-                        | "RenewDocumentCommand"
-                        | "ProvideDocumentCommand"
-                        | "DeclareDocumentCommand"
-                ) {
-                    if let Some((name, _)) = macro_target_name(source, at) {
-                        table.insert(name, None);
-                    }
-                    continue;
-                }
-                let (name, arity) = if matches!(cmd, "def" | "gdef") {
-                    let Some((name, mut next)) = macro_target_name(source, at) else {
+                        (name, arity)
+                    } else if cmd == "DeclareMathOperator" {
+                        let Some((name, next)) = macro_target_name(source, at) else {
+                            continue;
+                        };
+                        at = next;
+                        (name, Some(0u8))
+                    } else if matches!(
+                        cmd,
+                        "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand"
+                    ) {
+                        let Some((name, mut next)) = macro_target_name(source, at) else {
+                            continue;
+                        };
+                        let mut arity = (cmd != "providecommand").then_some(0u8);
+                        if let Some(opt_end) = super::optional_argument_end(source, next) {
+                            let opt = source
+                                [super::skip_source_space(source, next) + 1..opt_end - 1]
+                                .trim();
+                            arity = arity
+                                .filter(|_| opt.len() == 1 && opt.as_bytes()[0].is_ascii_digit())
+                                .map(|_| opt.as_bytes()[0] - b'0');
+                            next = opt_end;
+                            while let Some(extra_end) = super::optional_argument_end(source, next) {
+                                arity = None;
+                                next = extra_end;
+                            }
+                        }
+                        at = next;
+                        (name, arity)
+                    } else {
                         continue;
                     };
-                    let mut arity = Some(0u8);
-                    loop {
-                        next = super::skip_source_space(source, next);
-                        if source.as_bytes().get(next) == Some(&b'{') {
-                            break;
-                        }
-                        let Some(expected) = arity.and_then(|a| (a < 9).then_some(b'1' + a)) else {
-                            arity = None;
+                    let body_open = super::skip_source_space(source, at);
+                    let Some((body_range, _)) = group(source, body_open) else {
+                        table.insert(name, None);
+                        continue;
+                    };
+                    at = body_open;
+                    let Some(arity) = arity.filter(|_| top_level) else {
+                        table.insert(name, None);
+                        continue;
+                    };
+                    let body = &source[body_range];
+                    let mut valid = !body.contains('$') && !body.contains("^^");
+                    let mut seen_params = 0u16;
+                    for (idx, _) in body.match_indices('#') {
+                        let Some(d) = body
+                            .as_bytes()
+                            .get(idx + 1)
+                            .filter(|b| (b'1'..=b'0' + arity).contains(b))
+                            .map(|b| b - b'1')
+                        else {
+                            valid = false;
                             break;
                         };
-                        if source.as_bytes().get(next) == Some(&b'#')
-                            && source.as_bytes().get(next + 1) == Some(&expected)
-                        {
-                            arity = arity.map(|a| a + 1);
-                            next += 2;
-                        } else {
-                            arity = None;
+                        if (seen_params >> d) != 0 {
+                            valid = false;
                             break;
                         }
+                        seen_params |= 1 << d;
                     }
-                    at = next;
-                    (name, arity)
-                } else if cmd == "DeclareMathOperator" {
-                    let Some((name, next)) = macro_target_name(source, at) else {
-                        continue;
+                    let def = MacroDef {
+                        arity,
+                        body: valid.then_some(body),
                     };
-                    at = next;
-                    (name, Some(0u8))
-                } else if matches!(
-                    cmd,
-                    "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand"
-                ) {
-                    let Some((name, mut next)) = macro_target_name(source, at) else {
-                        continue;
-                    };
-                    let mut arity = (cmd != "providecommand").then_some(0u8);
-                    if let Some(opt_end) = super::optional_argument_end(source, next) {
-                        let opt =
-                            source[super::skip_source_space(source, next) + 1..opt_end - 1].trim();
-                        arity = arity
-                            .filter(|_| opt.len() == 1 && opt.as_bytes()[0].is_ascii_digit())
-                            .map(|_| opt.as_bytes()[0] - b'0');
-                        next = opt_end;
-                        while let Some(extra_end) = super::optional_argument_end(source, next) {
-                            arity = None;
-                            next = extra_end;
+                    match table.get(name) {
+                        Some(Some(existing)) if *existing == def && def.body.is_some() => {}
+                        Some(_) => {
+                            table.insert(name, None);
+                        }
+                        None => {
+                            table.insert(name, Some(def));
                         }
                     }
-                    at = next;
-                    (name, arity)
-                } else {
-                    continue;
-                };
-                let body_open = super::skip_source_space(source, at);
-                let Some((body_range, _)) = group(source, body_open) else {
-                    table.insert(name, None);
-                    continue;
-                };
-                at = body_open;
-                let Some(arity) = arity.filter(|_| top_level) else {
-                    table.insert(name, None);
-                    continue;
-                };
-                let body = &source[body_range];
-                let mut valid = !body.contains('$') && !body.contains("^^");
-                let mut seen_params = 0u16;
-                for (idx, _) in body.match_indices('#') {
-                    let Some(d) = body
-                        .as_bytes()
-                        .get(idx + 1)
-                        .filter(|b| (b'1'..=b'0' + arity).contains(b))
-                        .map(|b| b - b'1')
-                    else {
-                        valid = false;
-                        break;
-                    };
-                    if (seen_params >> d) != 0 {
-                        valid = false;
-                        break;
-                    }
-                    seen_params |= 1 << d;
                 }
-                let def = MacroDef {
-                    arity,
-                    body: valid.then_some(body),
-                };
-                match table.get(name) {
-                    Some(Some(existing)) if *existing == def && def.body.is_some() => {}
-                    Some(_) => {
-                        table.insert(name, None);
-                    }
-                    None => {
-                        table.insert(name, Some(def));
-                    }
+                _ => {
+                    let rest = &source.as_bytes()[at + 1..];
+                    let step = rest
+                        .iter()
+                        .position(|&b| matches!(b, b'%' | b'{' | b'}' | b'$' | b'\\'))
+                        .map_or(rest.len() + 1, |p| p + 1);
+                    at += step;
                 }
-            }
-            _ => {
-                let rest = &source.as_bytes()[at + 1..];
-                let step = rest
-                    .iter()
-                    .position(|&b| matches!(b, b'%' | b'{' | b'}' | b'$' | b'\\'))
-                    .map_or(rest.len() + 1, |p| p + 1);
-                at += step;
             }
         }
     }
@@ -1645,6 +1678,7 @@ fn private_use(c: char) -> bool {
     matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
 }
 
+#[cfg(test)]
 pub(super) fn source_location(
     source: &str,
     line: u32,
@@ -1653,6 +1687,31 @@ pub(super) fn source_location(
     context: &str,
     offset: usize,
     prose: Option<(u32, usize, isize)>,
+) -> Option<(u32, usize)> {
+    source_location_with_context(
+        source,
+        line,
+        lines,
+        within_frame,
+        context,
+        offset,
+        prose,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_location_with_context(
+    source: &str,
+    line: u32,
+    lines: Range<usize>,
+    within_frame: bool,
+    context: &str,
+    offset: usize,
+    prose: Option<(u32, usize, isize)>,
+    extra_sources: &[&str],
+    foreach_loops: &[crate::tex::ForeachLoop<'_>],
 ) -> Option<(u32, usize)> {
     let starts: Vec<_> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
@@ -1701,7 +1760,10 @@ pub(super) fn source_location(
     if active_regions.is_empty() {
         return prose.map(|(row, byte, _)| (row, byte));
     }
-    let macros = macros(source);
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let macros = macros_from_sources(&macro_sources);
     let mut best = None;
     let mut tied = false;
     let mut any_unknown = false;
@@ -1709,156 +1771,186 @@ pub(super) fn source_location(
     let line_start = *starts.get(line as usize - 1).unwrap_or(&source.len());
     let line_end = *starts.get(line as usize).unwrap_or(&source.len());
     for range in active_regions {
+        let bindings = crate::tex::foreach_bindings_for_range(foreach_loops, &range)?;
         let mut region_unknown = false;
-        let atoms = atoms_with_macros(
-            source,
-            range.clone(),
-            &macros,
-            0,
-            None,
-            &[],
-            &mut region_unknown,
-        )?;
+        let mut passes = Vec::with_capacity(bindings.len().max(1));
+        if bindings.is_empty() {
+            passes.push(atoms_with_macros(
+                source,
+                range.clone(),
+                &macros,
+                0,
+                None,
+                &[],
+                &mut region_unknown,
+            )?);
+        } else {
+            for binding in &bindings {
+                let mut local_macros = macros.clone();
+                for &(var, val) in binding {
+                    local_macros.insert(
+                        var,
+                        Some(MacroDef {
+                            arity: 0,
+                            body: Some(val),
+                        }),
+                    );
+                }
+                let mut pass_unknown = false;
+                passes.push(atoms_with_macros(
+                    source,
+                    range.clone(),
+                    &local_macros,
+                    0,
+                    None,
+                    &[],
+                    &mut pass_unknown,
+                )?);
+                region_unknown |= pass_unknown;
+            }
+        }
         any_unknown |= region_unknown;
         if range.start < line_end && range.end > line_start {
             line_unknown |= region_unknown;
         }
-        let atoms = inline_context(source, &range, atoms);
-        for (index, atom) in atoms.iter().enumerate() {
-            if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
-                continue;
-            }
-            let row = starts.partition_point(|start| *start <= atom.span.start);
-            if !lines.contains(&(row - 1)) {
-                continue;
-            }
-            let Some(begin) = index.checked_sub(selected - word.start) else {
-                continue;
-            };
-            if atoms
-                .get(begin..begin + word.len())
-                .is_none_or(|source_word| {
-                    !source_word
-                        .iter()
-                        .zip(&pdf[word.clone()])
-                        .all(|(a, b)| a.value == b.value)
-                })
-            {
-                continue;
-            }
-            // A PDF word cannot be a substring of a longer source word.
-            if pdf[selected].value.is_alphanumeric()
-                && (atoms[begin].word_join
-                    || atoms
-                        .get(begin + word.len())
-                        .is_some_and(|next| next.word_join))
-            {
-                continue;
-            }
-            // Stop at the first mismatch and at this expression's boundary.
-            // Context from a different formula must not break an ambiguity tie.
-            let mut score = 0;
-            let mut lexical_score = 0;
-            let mut contradictions = 0usize;
-            let joined = |slice: &[Atom], prev: usize, direction: isize| {
-                if direction < 0 {
-                    slice[prev].word_join
-                } else {
-                    slice.get(prev + 1).is_some_and(|next| next.word_join)
+        for atoms in passes {
+            let atoms = inline_context(source, &range, atoms);
+            for (index, atom) in atoms.iter().enumerate() {
+                if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
+                    continue;
                 }
-            };
-            for direction in [-1isize, 1] {
-                let source_edge = if direction < 0 {
-                    begin
-                } else {
-                    begin + word.len() - 1
+                let row = starts.partition_point(|start| *start <= atom.span.start);
+                if !lines.contains(&(row - 1)) {
+                    continue;
+                }
+                let Some(begin) = index.checked_sub(selected - word.start) else {
+                    continue;
                 };
-                let pdf_edge = if direction < 0 {
-                    word.start
-                } else {
-                    word.end - 1
-                };
-                let mut committed = (score, lexical_score);
-                let mut word_start = 1;
-                for distance in 1..=8 {
-                    let delta = direction * distance;
-                    let in_word = if distance > 1 {
-                        let prev_src = source_edge
-                            .checked_add_signed(direction * (distance - 1))
-                            .unwrap();
-                        let prev_pdf = pdf_edge
-                            .checked_add_signed(direction * (distance - 1))
-                            .unwrap();
-                        let join_a = joined(&atoms, prev_src, direction);
-                        let join_b = joined(&pdf, prev_pdf, direction);
-                        if !join_a && !join_b {
-                            committed = (score, lexical_score);
-                            word_start = distance;
-                        }
-                        join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                if atoms
+                    .get(begin..begin + word.len())
+                    .is_none_or(|source_word| {
+                        !source_word
+                            .iter()
+                            .zip(&pdf[word.clone()])
+                            .all(|(a, b)| a.value == b.value)
+                    })
+                {
+                    continue;
+                }
+                // A PDF word cannot be a substring of a longer source word.
+                if pdf[selected].value.is_alphanumeric()
+                    && (atoms[begin].word_join
+                        || atoms
+                            .get(begin + word.len())
+                            .is_some_and(|next| next.word_join))
+                {
+                    continue;
+                }
+                // Stop at the first mismatch and at this expression's boundary.
+                // Context from a different formula must not break an ambiguity tie.
+                let mut score = 0;
+                let mut lexical_score = 0;
+                let mut contradictions = 0usize;
+                let joined = |slice: &[Atom], prev: usize, direction: isize| {
+                    if direction < 0 {
+                        slice[prev].word_join
                     } else {
-                        false
+                        slice.get(prev + 1).is_some_and(|next| next.word_join)
+                    }
+                };
+                for direction in [-1isize, 1] {
+                    let source_edge = if direction < 0 {
+                        begin
+                    } else {
+                        begin + word.len() - 1
                     };
-                    match (
-                        source_edge
-                            .checked_add_signed(delta)
-                            .and_then(|i| atoms.get(i)),
-                        pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
-                    ) {
-                        (Some(a), Some(b))
-                            if a.value == b.value
-                                && (!in_word
-                                    || joined(
-                                        &pdf,
-                                        pdf_edge
-                                            .checked_add_signed(direction * (distance - 1))
-                                            .unwrap(),
-                                        direction,
-                                    )) =>
-                        {
-                            score += 9 - distance;
-                            lexical_score += usize::from(a.value.is_alphanumeric());
-                        }
-                        (Some(a), Some(_)) if a.value != '\0' && distance == 1 => {
-                            contradictions += 1;
-                            break;
-                        }
-                        _ => {
-                            if in_word {
-                                (score, lexical_score) = committed;
-                                if word_start == 1 {
-                                    contradictions += 1;
-                                }
+                    let pdf_edge = if direction < 0 {
+                        word.start
+                    } else {
+                        word.end - 1
+                    };
+                    let mut committed = (score, lexical_score);
+                    let mut word_start = 1;
+                    for distance in 1..=8 {
+                        let delta = direction * distance;
+                        let in_word = if distance > 1 {
+                            let prev_src = source_edge
+                                .checked_add_signed(direction * (distance - 1))
+                                .unwrap();
+                            let prev_pdf = pdf_edge
+                                .checked_add_signed(direction * (distance - 1))
+                                .unwrap();
+                            let join_a = joined(&atoms, prev_src, direction);
+                            let join_b = joined(&pdf, prev_pdf, direction);
+                            if !join_a && !join_b {
+                                committed = (score, lexical_score);
+                                word_start = distance;
                             }
-                            break;
+                            join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                        } else {
+                            false
+                        };
+                        match (
+                            source_edge
+                                .checked_add_signed(delta)
+                                .and_then(|i| atoms.get(i)),
+                            pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
+                        ) {
+                            (Some(a), Some(b))
+                                if a.value == b.value
+                                    && (!in_word
+                                        || joined(
+                                            &pdf,
+                                            pdf_edge
+                                                .checked_add_signed(direction * (distance - 1))
+                                                .unwrap(),
+                                            direction,
+                                        )) =>
+                            {
+                                score += 9 - distance;
+                                lexical_score += usize::from(a.value.is_alphanumeric());
+                            }
+                            (Some(a), Some(_)) if a.value != '\0' && distance == 1 => {
+                                contradictions += 1;
+                                break;
+                            }
+                            _ => {
+                                if in_word {
+                                    (score, lexical_score) = committed;
+                                    if word_start == 1 {
+                                        contradictions += 1;
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            // A standalone punctuation match is not evidence that the clicked
-            // glyph belongs to this formula rather than nearby prose.
-            if !pdf[selected].value.is_alphanumeric() && score == 0 {
-                continue;
-            }
-            let location = (row as u32, atom.span.start - starts[row - 1]);
-            let proximity = if within_frame || score == 0 {
-                0
-            } else {
-                location.0.abs_diff(line)
-            };
-            let rank = (
-                score,
-                lexical_score > 0,
-                std::cmp::Reverse(contradictions),
-                std::cmp::Reverse(proximity),
-                lexical_score,
-            );
-            match best {
-                Some((old, _)) if rank < old => {}
-                Some((old, previous)) if rank == old => tied |= previous != location,
-                _ => {
-                    best = Some((rank, location));
-                    tied = false;
+                // A standalone punctuation match is not evidence that the clicked
+                // glyph belongs to this formula rather than nearby prose.
+                if !pdf[selected].value.is_alphanumeric() && score == 0 {
+                    continue;
+                }
+                let location = (row as u32, atom.span.start - starts[row - 1]);
+                let proximity = if within_frame || score == 0 {
+                    0
+                } else {
+                    location.0.abs_diff(line)
+                };
+                let rank = (
+                    score,
+                    lexical_score > 0,
+                    std::cmp::Reverse(contradictions),
+                    std::cmp::Reverse(proximity),
+                    lexical_score,
+                );
+                match best {
+                    Some((old, _)) if rank < old => {}
+                    Some((old, previous)) if rank == old => tied |= previous != location,
+                    _ => {
+                        best = Some((rank, location));
+                        tied = false;
+                    }
                 }
             }
         }

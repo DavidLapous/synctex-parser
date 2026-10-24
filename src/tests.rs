@@ -4347,11 +4347,11 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     //    whereas a macro that transitively expands to \includegraphics still abstains.
     let frame_macro_gfx = concat!(
         "\\documentclass{beamer}\n",
-        "\\newcommand{\\basefield}{\\Bbbk}\n",
-        "\\newcommand{\\indmod}[1]{\\basefield_{#1}}\n",
+        "\\newcommand{\\innersym}{\\alpha}\n",
+        "\\newcommand{\\outersym}[1]{\\innersym_{#1}}\n",
         "\\begin{document}\n",
         "\\begin{frame}{Sample Title}\n",
-        "  $\\indmod{a}$\n",
+        "  $\\outersym{a}$\n",
         "  \\includegraphics[height=.5\\textheight]{figs/sample_grid.png}\n",
         "\\end{frame}\n",
         "\\end{document}\n",
@@ -4484,6 +4484,506 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     let malformed_simultaneous_script_hash = "$x_#é^y$\n";
     assert_eq!(
         source_word_location(malformed_simultaneous_script_hash, 1, "x", 0, 0),
+        None
+    );
+}
+
+#[test]
+fn tikzpicture_scope_and_foreach_loop_bindings_refine_nodes() {
+    let source = concat!(
+        "\\begin{frame}{Sample Diagram}\n",
+        "Decoy Alpha in frame prose.\n",
+        "\\centering\n",
+        "\\resizebox{0.8\\linewidth}{!}{%\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node at (0,0) {Alpha};\n",
+        "  \\foreach \\i in {1,...,4} {\n",
+        "    \\node at (\\i,0) {$S_{\\i}$};\n",
+        "  }\n",
+        "  \\foreach \\x/\\tag in {1/FirstTag, 2/SecondTag}\n",
+        "    \\node at (\\x,1) {\\tag};\n",
+        "\\end{tikzpicture}%\n",
+        "}\n",
+        "\\end{frame}\n",
+    );
+    // SyncTeX anchor on \end{tikzpicture} (line 12) or wrapper \centering (line 3)
+    // scopes to the tikzpicture (lines 5..12) before falling back to the whole frame,
+    // avoiding the frame-level "Alpha" decoy on line 2.
+    assert_eq!(
+        source_word_location(source, 12, "Alpha", 0, 2),
+        Some((6, "  \\node at (0,0) {".len()))
+    );
+    assert_eq!(
+        source_word_location(source, 3, "Alpha", 0, 2),
+        Some((6, "  \\node at (0,0) {".len()))
+    );
+    // \foreach \i in {1,...,4} binds \i = 3 to match rendered "S₃" on line 8.
+    assert_eq!(
+        source_word_location(source, 12, "S\u{2083}", 0, 2),
+        Some((8, "    \\node at (\\i,0) {$".len()))
+    );
+    assert_eq!(
+        source_word_location(source, 12, "S\u{2083}", "S".len(), 2),
+        Some((8, "    \\node at (\\i,0) {$S_{".len()))
+    );
+    // Multi-variable \foreach \x/\tag with semicolon-terminated body binds \tag = SecondTag.
+    assert_eq!(
+        source_word_location(source, 12, "SecondTag", 0, 2),
+        Some((11, "    \\node at (\\x,1) {".len()))
+    );
+}
+
+#[test]
+fn cross_file_preamble_macros_and_redefinition_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("main.pdf");
+    let main_tex = root.join("main.tex");
+    let preamble_tex = root.join("preamble.tex");
+    let sub_tex = root.join("section.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &preamble_tex,
+        "\\newcommand{\\PreambleSym}{\\Omega}\n\\newcommand{\\ClashSym}{\\alpha}\n",
+    )
+    .unwrap();
+    fs::write(
+        &main_tex,
+        concat!(
+            "\\documentclass{article}\n",
+            "\\input{preamble}\n",
+            "\\newcommand{\\RootWrapper}[1]{\\textbf{#1}}\n",
+            "\\begin{document}\n",
+            "\\input{section}\n",
+            "\\end{document}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &sub_tex,
+        concat!(
+            "\\renewcommand{\\ClashSym}{\\beta}\n",
+            "We study $\\PreambleSym$ and \\RootWrapper{TargetWord} here.\n",
+        ),
+    )
+    .unwrap();
+
+    // Redefined macro across sources is conservatively invalidated.
+    let table = crate::math::macros_from_sources(&[
+        "\\newcommand{\\ClashSym}{\\alpha}\n",
+        "\\renewcommand{\\ClashSym}{\\beta}\n",
+    ]);
+    assert_eq!(table.get("ClashSym"), Some(&None));
+
+    let synctex = format!(
+        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        main_tex.display(),
+        sub_tex.display(),
+    );
+    fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
+
+    let math_hit = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 20.0,
+            y_from_top: 100.0,
+            page_height_pt: 792.0,
+        },
+        Some(("We study \u{03a9} and TargetWord here.", "We study ".len())),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(math_hit.location.line, 2);
+    assert_eq!(math_hit.location.byte_column, "We study $".len());
+
+    let prose_hit = resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 20.0,
+            y_from_top: 100.0,
+            page_height_pt: 792.0,
+        },
+        Some((
+            "We study \u{03a9} and TargetWord here.",
+            "We study \u{03a9} and ".len(),
+        )),
+        2,
+        &Operation::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(prose_hit.location.line, 2);
+    assert_eq!(
+        prose_hit.location.byte_column,
+        "We study $\\PreambleSym$ and \\RootWrapper{".len()
+    );
+}
+
+#[test]
+fn beamer_only_overlay_graphics_disambiguates_by_frame_slide() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("slides.pdf");
+    let tex = root.join("slides.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    let source = concat!(
+        "\\documentclass{beamer}\n",
+        "\\begin{document}\n",
+        "\\begin{frame}{Overlay Figures}\n",
+        "  \\only<1>{\\includegraphics{slide_one.pdf}}\n",
+        "  \\only<2>{\\includegraphics{slide_two.pdf}}\n",
+        "  \\only<3>{\\includegraphics{slide_three.pdf}}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&tex, source).unwrap();
+
+    // Three slides generated from the same frame closing line (line 7), each with 1 rendered figure box.
+    let page_box = concat!(
+        "[1,7:0,792:612,792,0\n",
+        "(1,7:10,200:200,120,0\n",
+        "(1,7:50,200:30,30,0\n",
+        "(1,7:50,200:30,30,0\n",
+        "(1,7:50,200:0,30,0\n",
+        "(1,7:50,200:0,15,0\n",
+        "(1,7:50,200:15,15,0\n",
+        "k1,7:65,200:0\n",
+        ")\n",
+        "k1,7:50,200:-15\n",
+        ")\n",
+        ")\n",
+        ")\n",
+        ")\n",
+        ")\n",
+        "]\n",
+    );
+    let synctex = format!(
+        "SyncTeX Version:1\nInput:1:{0}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n{1}}}1\n{{2\n{1}}}2\n{{3\n{1}}}3\nPostamble:\nCount:30\n",
+        tex.display(),
+        page_box,
+    );
+    fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
+
+    for (page, expected_line, expected_fig) in [
+        (1, 4, "slide_one.pdf"),
+        (2, 5, "slide_two.pdf"),
+        (3, 6, "slide_three.pdf"),
+    ] {
+        let hit = resolve_inverse(
+            &pdf,
+            InversePoint {
+                page,
+                x: 60.0,
+                y_from_top: 185.0,
+                page_height_pt: 792.0,
+            },
+            None,
+            2,
+            &Operation::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hit.location.line, expected_line, "failed on slide {page}");
+        let row = source.lines().nth(expected_line as usize - 1).unwrap();
+        assert_eq!(hit.location.byte_column, row.find(expected_fig).unwrap());
+    }
+}
+
+#[test]
+fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
+    // 1. Wrapper lines that also contain prose or close before \begin{tikzpicture} must not
+    //    hijack the anchor into the following tikzpicture.
+    let inline_prose_after_centering = concat!(
+        "\\centering Alpha\\\\\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(inline_prose_after_centering, 1),
+        None
+    );
+
+    let closed_makebox = concat!(
+        "\\makebox[0pt][l]{Alpha}\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(closed_makebox, 1),
+        None
+    );
+
+    let blank_line_before_tikz = concat!(
+        "Alpha\n",
+        "\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(blank_line_before_tikz, 2),
+        None
+    );
+
+    // 2. \foreach starting before the target line (non-tikzpicture scope) is still discovered.
+    let mid_loop_prose = concat!(
+        "\\foreach \\tag in {FirstWord, SecondWord} {\n",
+        "  Item \\tag here.\n",
+        "}\n",
+    );
+    assert_eq!(
+        source_word_location(mid_loop_prose, 2, "Item SecondWord here.", 5, 0),
+        Some((2, "  Item ".len()))
+    );
+
+    // 3. Comment inside \foreach item list is stripped.
+    let comment_item = concat!(
+        "\\begin{tikzpicture}\n",
+        "\\foreach \\tag in {\n",
+        "  Alpha % trailing comment\n",
+        "} {\n",
+        "  \\node {\\tag};\n",
+        "}\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(
+        source_word_location(comment_item, 7, "Alpha", 0, 2),
+        Some((5, "  \\node {".len()))
+    );
+
+    // 4. Ambiguous \foreach constructs must abstain (return None) rather than guess a decoy.
+    for ambiguous in [
+        // Macro list (\mylist)
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\tag in \\mylist { \\node {\\tag}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Options ([evaluate=...], [count=...], [remember=...], [parse=true])
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach [count=\\i] \\tag in {Alpha, Beta} { \\node {\\tag}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Fractional step / non-integer "..."
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\x in {0, 0.5, ..., 2} { \\node {\\x}; }\n",
+            "\\node {0.5};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Prefix/suffix "..." pattern
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\x in {a1, ..., a3} { \\node {\\x}; }\n",
+            "\\node {a2};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Zero step or i32 overflow in "..."
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\x in {-2000000000, 2000000000, ..., 0} { \\node {\\x}; }\n",
+            "\\node {0};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Stepped alphabetic range
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\x in {a, c, ..., g} { \\node {\\x}; }\n",
+            "\\node {c};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Braced slash in multi-var item
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\a/\\b in {{Alpha/Beta}/Gamma} { \\node {\\a}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Empty item in list
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\tag in {,Alpha} { \\node {\\tag}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Formatting macro inside item
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\tag in {\\textbf{Alpha}} { \\node {\\tag}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // >4 loop variables
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\a/\\b/\\c/\\d/\\e in {1/2/3/4/Alpha} { \\node {\\e}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // >2 loops in scope
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\a in {1,2} { \\node {\\a}; }\n",
+            "\\foreach \\b in {3,4} { \\node {\\b}; }\n",
+            "\\foreach \\c in {Alpha,Beta} { \\node {\\c}; }\n",
+            "\\node {Alpha};\n",
+            "\\end{tikzpicture}\n",
+        ),
+        // Cartesian product > 32
+        concat!(
+            "\\begin{tikzpicture}\n",
+            "\\foreach \\a in {1,...,8} {\n",
+            "  \\foreach \\b in {1,...,8} {\n",
+            "    \\node {\\a};\n",
+            "  }\n",
+            "}\n",
+            "\\end{tikzpicture}\n",
+        ),
+    ] {
+        let last_line = ambiguous.lines().count() as u32;
+        assert_eq!(
+            source_word_location(ambiguous, last_line, "Alpha", 0, 2),
+            None,
+            "expected None for:\n{ambiguous}"
+        );
+    }
+
+    // 5. Non-path single-token body (\relax) does not swallow a following \node.
+    let relax_body = concat!(
+        "\\begin{tikzpicture}\n",
+        "\\foreach \\tag in {Alpha, Beta} \\relax\n",
+        "\\node {\\tag};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(source_word_location(relax_body, 4, "Alpha", 0, 2), None);
+}
+
+#[test]
+fn recursive_preamble_splicing_and_beamer_overlay_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("main.pdf");
+    let main_tex = root.join("main.tex");
+    let sub_a = root.join("sub_a.tex");
+    let sub_b = root.join("sub_b.tex");
+    let grouped_tex = root.join("grouped.tex");
+    let dead_tex = root.join("dead.tex");
+    let pkg_sty = root.join("localdefs.sty");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&sub_a, "\\input{sub_b}\n").unwrap();
+    fs::write(&sub_b, "\\newcommand{\\DeepSym}{\\Lambda}\n").unwrap();
+    fs::write(&grouped_tex, "\\newcommand{\\GroupedSym}{\\Gamma}\n").unwrap();
+    fs::write(&dead_tex, "\\renewcommand{\\DeepSym}{\\Omega}\n").unwrap();
+    fs::write(&pkg_sty, "\\newcommand{\\PkgSym}{\\Delta}\n").unwrap();
+    fs::write(
+        &main_tex,
+        concat!(
+            "\\documentclass{article}\n",
+            "\\usepackage{localdefs}\n",
+            "\\input{sub_a}\n",
+            "{\\input{grouped}}\n",
+            "\\iffalse\n",
+            "\\input{dead}\n",
+            "\\fi\n",
+            "\\begin{document}\n",
+            "$\\DeepSym + \\PkgSym$\n",
+            "\\end{document}\n",
+        ),
+    )
+    .unwrap();
+
+    let mut sources = crate::QuerySources::default();
+    let spliced = crate::macro_preamble_source(&main_tex, &mut sources, &Operation::default())
+        .unwrap()
+        .unwrap();
+    let table = crate::math::macros_from_sources(&[spliced.as_str()]);
+    assert!(table.get("DeepSym").is_some_and(Option::is_some));
+    assert!(table.get("PkgSym").is_some_and(Option::is_some));
+    assert_eq!(table.get("GroupedSym"), Some(&None));
+
+    // Postfix \only{...}<2> resolves, whereas frame-level [label=...], [1-2], \againframe, or \note abstains.
+    let postfix_only = concat!(
+        "\\begin{frame}{Figures}\n",
+        "  \\only{\\includegraphics{fig1.pdf}}<1>\n",
+        "  \\only{\\includegraphics{fig2.pdf}}<2>\n",
+        "\\end{frame}\n",
+    );
+    assert_eq!(
+        crate::tex::source_graphics_location_with_context(
+            postfix_only,
+            4,
+            0,
+            1,
+            true,
+            Some(2),
+            &[],
+        ),
+        Some((3, "  \\only{\\includegraphics{".len()))
+    );
+
+    for unsafe_frame in [
+        concat!(
+            "\\begin{frame}[fragile]<2->{Figures}\n",
+            "  \\only<1>{\\includegraphics{fig1.pdf}}\n",
+            "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
+            "\\end{frame}\n",
+        ),
+        concat!(
+            "\\begin{frame}[1-2]{Figures}\n",
+            "  \\only<1>{\\includegraphics{fig1.pdf}}\n",
+            "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
+            "\\end{frame}\n",
+        ),
+        concat!(
+            "\\begin{frame}[label=myframe]{Figures}\n",
+            "  \\only<1>{\\includegraphics{fig1.pdf}}\n",
+            "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
+            "\\end{frame}\n",
+        ),
+        concat!(
+            "\\begin{frame}{Figures}\n",
+            "  \\note{Speaker note}\n",
+            "  \\only<1>{\\includegraphics{fig1.pdf}}\n",
+            "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
+            "\\end{frame}\n",
+        ),
+    ] {
+        let end_line = unsafe_frame.lines().count() as u32;
+        assert_eq!(
+            crate::tex::source_graphics_location_with_context(
+                unsafe_frame,
+                end_line,
+                0,
+                1,
+                true,
+                Some(2),
+                &[],
+            ),
+            None
+        );
+    }
+    assert_eq!(
+        crate::tex::source_graphics_location_with_context(
+            postfix_only,
+            4,
+            0,
+            1,
+            true,
+            Some(2),
+            &["\\againframe<2>{other}"],
+        ),
         None
     );
 }
