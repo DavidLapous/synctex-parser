@@ -1716,7 +1716,13 @@ impl InverseQuery<'_> {
                 .and_then(|result| result.as_ref().ok())
                 .and_then(|map| map.frame_slide);
             let spliced_preamble = if let Some(Ok(map)) = &source_map {
-                macro_preamble_source(&map.main, &mut self.sources, self.operation)?
+                macro_preamble_source(
+                    &map.main,
+                    Some(&map.inputs),
+                    self.pdf.parent(),
+                    &mut self.sources,
+                    self.operation,
+                )?
             } else {
                 None
             };
@@ -1844,8 +1850,10 @@ impl InverseQuery<'_> {
                 }
             {
                 if self.metadata.is_none() {
-                    self.metadata = Some(document_metadata_word_location(
+                    self.metadata = Some(document_metadata_word_location_with_context(
                         &map.main,
+                        Some(&map.inputs),
+                        self.pdf.parent(),
                         context,
                         offset,
                         &mut self.sources,
@@ -2011,6 +2019,7 @@ pub(crate) fn read_source_file(file: fs::File) -> io::Result<String> {
 
 struct SourceMap {
     main: PathBuf,
+    inputs: Vec<PathBuf>,
     page_source: Option<(PathBuf, u32)>,
     generated_at_point: bool,
     frame_slide: Option<u32>,
@@ -2111,7 +2120,7 @@ pub(crate) fn decode_synctex_file(file: fs::File, limit: u64) -> io::Result<Box<
     if reader.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
         Ok(Box::new(BufReader::with_capacity(
             64 * 1024,
-            flate2::read::GzDecoder::new(reader).take(limit),
+            flate2::read::MultiGzDecoder::new(reader).take(limit),
         )))
     } else {
         Ok(Box::new(reader.take(limit)))
@@ -2380,7 +2389,7 @@ fn source_map_from_reader_in(
                                 "conflicting SyncTeX input tag",
                             ));
                         }
-                        if input_cwd.is_none() {
+                        if input_cwd.is_none() && !page_complete {
                             entry.insert(path);
                         }
                     }
@@ -2414,33 +2423,6 @@ fn source_map_from_reader_in(
             active_sheet = None;
             if let Some(orig) = origin {
                 sheet_origins.push((point.page, orig));
-            }
-            if !geometry_required && input_cwd.is_none() {
-                operation.check()?;
-                let main = inputs
-                    .get(&1)
-                    .cloned()
-                    .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
-                let frame_slide = origin
-                    .and_then(|orig| {
-                        u32::try_from(
-                            sheet_origins
-                                .iter()
-                                .filter(|&&(p, o)| p <= point.page && o == orig)
-                                .count(),
-                        )
-                        .ok()
-                    })
-                    .filter(|&n| n > 0);
-                let page_source = origin
-                    .filter(|_| generated_on_page)
-                    .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
-                return Ok(SourceMap {
-                    main,
-                    page_source,
-                    generated_at_point: false,
-                    frame_slide,
-                });
             }
         } else if in_page {
             if geometry_required && matches!(row.as_bytes().first(), Some(b'<' | b'>')) {
@@ -2529,7 +2511,7 @@ fn source_map_from_reader_in(
         }
     }
     operation.check()?;
-    if !page_complete || !postamble_count {
+    if !page_complete || ((geometry_required || input_cwd.is_some()) && !postamble_count) {
         return Err(io::Error::other("SyncTeX source map is incomplete"));
     }
     let frame_slide = origin
@@ -2551,9 +2533,10 @@ fn source_map_from_reader_in(
             .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
         let page_source = origin
             .filter(|_| generated_on_page)
-            .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
+            .and_then(|(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)));
         return Ok(SourceMap {
             main,
+            inputs: inputs.into_values().collect(),
             page_source,
             generated_at_point: false,
             frame_slide,
@@ -2612,7 +2595,7 @@ fn source_map_from_reader_in(
         .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
     let page_source = origin
         .filter(|_| generated_on_page)
-        .and_then(|(tag, line)| inputs.remove(&tag).map(|path| (path, line)));
+        .and_then(|(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)));
     let generated_at_point = generated_box_at_point(
         &boxes,
         (f64::from(point.x) - x_offset) / visible_unit,
@@ -2621,6 +2604,7 @@ fn source_map_from_reader_in(
     )?;
     Ok(SourceMap {
         main,
+        inputs: inputs.into_values().collect(),
         page_source,
         generated_at_point,
         frame_slide,
@@ -2667,30 +2651,7 @@ fn fragile_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>
 }
 
 fn is_fragile_frame(source: &str, frame: &std::ops::Range<usize>) -> bool {
-    let Some(row) = source.lines().nth(frame.start).map(source_line_text) else {
-        return false;
-    };
-    let row_start: usize = source
-        .split_inclusive('\n')
-        .take(frame.start)
-        .map(str::len)
-        .sum();
-    let Some(mut at) = row
-        .match_indices("\\begin")
-        .filter(|(at, _)| {
-            row[..*at]
-                .bytes()
-                .rev()
-                .take_while(|ch| *ch == b'\\')
-                .count()
-                % 2
-                == 0
-        })
-        .find_map(|(at, _)| {
-            let (environment, end) = math::group(source, row_start + at + "\\begin".len())?;
-            (&source[environment] == "frame").then_some(end)
-        })
-    else {
+    let Some(mut at) = crate::tex::frame_header_after_begin(source, frame.start) else {
         return false;
     };
     at = skip_source_space(source, at);
@@ -2712,6 +2673,8 @@ fn is_fragile_frame(source: &str, frame: &std::ops::Range<usize>) -> bool {
 
 fn preamble_sources(
     main: &Path,
+    compiled_inputs: Option<&[PathBuf]>,
+    pdf_dir: Option<&Path>,
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<Vec<(PathBuf, Rc<String>)>> {
@@ -2730,6 +2693,14 @@ fn preamble_sources(
             return Ok(Vec::new());
         }
     };
+    let compiled: Option<Vec<PathBuf>> = compiled_inputs.map(|inputs| {
+        inputs
+            .iter()
+            .filter_map(|p| sources.normalize(p).ok())
+            .filter(|p| p != &main)
+            .collect()
+    });
+    let main_dir = main.parent().unwrap_or_else(|| Path::new(""));
     let mut files = vec![(main.clone(), main_source)];
     let inputs: Vec<_> = files[0]
         .1
@@ -2746,24 +2717,71 @@ fn preamble_sources(
         .collect();
     for name in inputs {
         operation.check()?;
-        let Some(parent) = main.parent() else {
-            return Ok(files);
-        };
-        let mut path = parent.join(name);
-        if path.extension().is_none() {
-            path.set_extension("tex");
+        let clean_name = source_line_text(&name).trim();
+        if clean_name.is_empty() || clean_name.contains('\\') {
+            continue;
         }
-        if let Ok(path) = sources.normalize(&path)
-            && !files.iter().any(|(known, _)| *known == path)
-            && sources.warning(&path).is_none()
-        {
-            match sources.read(&path, operation) {
-                Ok(source) => files.push((path, source)),
+        let mut rel_clean = PathBuf::from(clean_name);
+        if rel_clean.extension().is_none() {
+            rel_clean.set_extension("tex");
+        }
+        let mut local_candidates = Vec::new();
+        let bases = [
+            Some(main_dir),
+            pdf_dir,
+            sources.sidecar_dir.as_deref(),
+            sources.snapshot.map(|s| s.cwd.as_path()),
+        ];
+        for base in bases.into_iter().flatten() {
+            let cand = if rel_clean.is_absolute() {
+                rel_clean.clone()
+            } else {
+                base.join(&rel_clean)
+            };
+            if let Ok(norm) = sources.normalize(&cand)
+                && !local_candidates.contains(&norm)
+            {
+                local_candidates.push(norm);
+            }
+        }
+        let candidates = if let Some(ref compiled_list) = compiled {
+            let local_matches: Vec<PathBuf> = local_candidates
+                .into_iter()
+                .filter(|cand| compiled_list.contains(cand))
+                .collect();
+            if !local_matches.is_empty() {
+                local_matches
+            } else {
+                let rel_suffix: PathBuf = rel_clean
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .collect();
+                compiled_list
+                    .iter()
+                    .filter(|comp| {
+                        !rel_suffix.as_os_str().is_empty() && comp.ends_with(&rel_suffix)
+                    })
+                    .cloned()
+                    .collect()
+            }
+        } else {
+            local_candidates
+        };
+        let mut readable = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            if files.iter().any(|(known, _)| *known == cand) || sources.warning(&cand).is_some() {
+                continue;
+            }
+            match sources.read(&cand, operation) {
+                Ok(source) => readable.push((cand, source)),
                 Err(error) if crate::source_snapshot::required_cache_error(&error) => {
                     return Err(error);
                 }
                 Err(_) => operation.check()?,
             }
+        }
+        if readable.len() == 1 {
+            files.push(readable.pop().unwrap());
         }
     }
     Ok(files)
@@ -2771,24 +2789,33 @@ fn preamble_sources(
 
 fn macro_preamble_source(
     main: &Path,
+    compiled_inputs: Option<&[PathBuf]>,
+    pdf_dir: Option<&Path>,
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<Option<String>> {
     operation.check()?;
     let Ok(main) = sources.normalize(main) else {
-        return Ok(None);
+        return Ok(Some("\\csname **\\endcsname\n".to_owned()));
     };
     if sources.warning(&main).is_some() {
-        return Ok(None);
+        return Ok(Some("\\csname **\\endcsname\n".to_owned()));
     }
     let main_source = match sources.read(&main, operation) {
         Ok(source) => source,
         Err(error) if crate::source_snapshot::required_cache_error(&error) => return Err(error),
         Err(_) => {
             operation.check()?;
-            return Ok(None);
+            return Ok(Some("\\csname **\\endcsname\n".to_owned()));
         }
     };
+    let compiled: Option<Vec<PathBuf>> = compiled_inputs.map(|inputs| {
+        inputs
+            .iter()
+            .filter_map(|p| sources.normalize(p).ok())
+            .filter(|p| p != &main)
+            .collect()
+    });
     let main_dir = main.parent().unwrap_or_else(|| Path::new(""));
     let mut visited = vec![main.clone()];
     let mut in_preamble = true;
@@ -2797,6 +2824,8 @@ fn macro_preamble_source(
         &main,
         &main_source,
         main_dir,
+        compiled.as_deref(),
+        pdf_dir,
         sources,
         operation,
         &mut visited,
@@ -2813,6 +2842,8 @@ fn append_spliced_source(
     path: &Path,
     source: &str,
     main_dir: &Path,
+    compiled: Option<&[PathBuf]>,
+    pdf_dir: Option<&Path>,
     sources: &mut QuerySources<'_>,
     operation: &Operation,
     visited: &mut Vec<PathBuf>,
@@ -2823,6 +2854,7 @@ fn append_spliced_source(
 ) -> io::Result<()> {
     operation.check()?;
     if depth > 8 || visited.len() >= 32 {
+        out.push_str("\\csname **\\endcsname\n");
         return Ok(());
     }
     if poisoned_scope {
@@ -2899,28 +2931,6 @@ fn append_spliced_source(
                     }
                     continue;
                 }
-                if matches!(
-                    cmd,
-                    "newif"
-                        | "def"
-                        | "gdef"
-                        | "edef"
-                        | "xdef"
-                        | "newcommand"
-                        | "renewcommand"
-                        | "providecommand"
-                        | "DeclareRobustCommand"
-                ) {
-                    let mut next =
-                        at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                    next = skip_source_space(source, next);
-                    if let Some((_, grp_end)) = math::group(source, next) {
-                        at = grp_end;
-                    } else if source.as_bytes().get(next) == Some(&b'\\') {
-                        at = math::command(source, next).1;
-                    }
-                    continue;
-                }
                 if matches!(cmd, "let" | "futurelet") {
                     let mut next = skip_source_space(source, at);
                     if source.as_bytes().get(next) == Some(&b'\\') {
@@ -2938,6 +2948,17 @@ fn append_spliced_source(
                         next += source[next..].chars().next().map_or(1, char::len_utf8);
                     }
                     at = next;
+                    continue;
+                }
+                if math::is_macro_definition_command(cmd) {
+                    let mut next =
+                        at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    next = skip_source_space(source, next);
+                    if let Some((_, grp_end)) = math::group(source, next) {
+                        at = grp_end;
+                    } else if source.as_bytes().get(next) == Some(&b'\\') {
+                        at = math::command(source, next).1;
+                    }
                     continue;
                 }
                 if brace_depth == 0 {
@@ -2965,8 +2986,9 @@ fn append_spliced_source(
                     }
                 }
                 if matches!(cmd, "input" | "include" | "usepackage" | "RequirePackage") {
+                    let is_tex_input = matches!(cmd, "input" | "include");
                     let mut imports: Vec<(&str, &str)> = Vec::new();
-                    if matches!(cmd, "input" | "include") {
+                    if is_tex_input {
                         let arg_pos = skip_source_space(source, at);
                         if let Some((grp, next)) = math::group(source, arg_pos) {
                             at = next;
@@ -3002,72 +3024,131 @@ fn append_spliced_source(
                             }
                         }
                     }
-                    if !imports.is_empty() {
-                        out.push_str(&source[cursor..cmd_start]);
-                        out.push('\n');
-                        cursor = at;
-                        if if_stack.contains(&Some(false)) {
+                    if imports.is_empty() {
+                        if is_tex_input && !if_stack.contains(&Some(false)) {
+                            out.push_str(&source[cursor..cmd_start]);
+                            out.push_str("\n\\csname **\\endcsname\n");
+                            cursor = at;
+                        }
+                        continue;
+                    }
+                    out.push_str(&source[cursor..cmd_start]);
+                    out.push('\n');
+                    cursor = at;
+                    if if_stack.contains(&Some(false)) {
+                        continue;
+                    }
+                    let child_poisoned = poisoned_scope
+                        || !*in_preamble
+                        || brace_depth > 0
+                        || group_depth > 0
+                        || !if_stack.is_empty();
+                    for (raw_name, ext) in imports {
+                        operation.check()?;
+                        let clean_name = source_line_text(raw_name).trim();
+                        if clean_name.is_empty() || clean_name.contains('\\') {
+                            if ext == "tex" || clean_name.contains('\\') {
+                                out.push_str("\\csname **\\endcsname\n");
+                            }
                             continue;
                         }
-                        let child_poisoned = poisoned_scope
-                            || !*in_preamble
-                            || brace_depth > 0
-                            || group_depth > 0
-                            || !if_stack.is_empty();
-                        for (raw_name, ext) in imports {
-                            operation.check()?;
-                            let clean_name = source_line_text(raw_name).trim();
-                            if clean_name.is_empty() {
+                        let mut rel_clean = PathBuf::from(clean_name);
+                        if rel_clean.extension().is_none() {
+                            rel_clean.set_extension(ext);
+                        }
+                        let mut local_candidates = Vec::new();
+                        let bases = [
+                            Some(main_dir),
+                            path.parent(),
+                            pdf_dir,
+                            sources.sidecar_dir.as_deref(),
+                            sources.snapshot.map(|s| s.cwd.as_path()),
+                        ];
+                        for base in bases.into_iter().flatten() {
+                            let cand = if rel_clean.is_absolute() {
+                                rel_clean.clone()
+                            } else {
+                                base.join(&rel_clean)
+                            };
+                            if let Ok(norm) = sources.normalize(&cand)
+                                && !local_candidates.contains(&norm)
+                            {
+                                local_candidates.push(norm);
+                            }
+                        }
+                        let candidates = if let Some(compiled_list) = compiled {
+                            let local_matches: Vec<PathBuf> = local_candidates
+                                .into_iter()
+                                .filter(|cand| compiled_list.contains(cand))
+                                .collect();
+                            if !local_matches.is_empty() {
+                                local_matches
+                            } else {
+                                let rel_suffix: PathBuf = rel_clean
+                                    .components()
+                                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                                    .collect();
+                                compiled_list
+                                    .iter()
+                                    .filter(|comp| {
+                                        !rel_suffix.as_os_str().is_empty()
+                                            && comp.ends_with(&rel_suffix)
+                                            && (ext != "sty"
+                                                || !comp.components().any(|c| {
+                                                    let s = c.as_os_str().to_string_lossy();
+                                                    s.starts_with("texmf")
+                                                        || s.starts_with("texlive")
+                                                }))
+                                    })
+                                    .cloned()
+                                    .collect()
+                            }
+                        } else {
+                            local_candidates
+                        };
+                        let mut readable = Vec::with_capacity(candidates.len());
+                        for cand in candidates {
+                            match sources.read(&cand, operation) {
+                                Ok(child_src) => readable.push((cand, child_src)),
+                                Err(err) if crate::source_snapshot::required_cache_error(&err) => {
+                                    return Err(err);
+                                }
+                                Err(_) => operation.check()?,
+                            }
+                        }
+                        if readable.is_empty() {
+                            if ext == "tex" {
+                                out.push_str("\\csname **\\endcsname\n");
+                            }
+                            continue;
+                        }
+                        let ambiguous_cwd = readable.len() > 1;
+                        if ambiguous_cwd {
+                            out.push_str("\\csname **\\endcsname\n");
+                        }
+                        for (resolved, child_src) in readable {
+                            if visited.contains(&resolved) {
                                 continue;
                             }
-                            let mut cand_main = main_dir.join(clean_name);
-                            if cand_main.extension().is_none() {
-                                cand_main.set_extension(ext);
+                            visited.push(resolved.clone());
+                            let warn_poisoned = sources.warning(&resolved).is_some();
+                            if warn_poisoned {
+                                out.push_str("\\csname **\\endcsname\n");
                             }
-                            let norm_main = sources.normalize(&cand_main).ok();
-                            let norm_cur = path
-                                .parent()
-                                .filter(|&d| d != main_dir)
-                                .and_then(|d| {
-                                    let mut p = d.join(clean_name);
-                                    if p.extension().is_none() {
-                                        p.set_extension(ext);
-                                    }
-                                    sources.normalize(&p).ok()
-                                })
-                                .filter(|p| Some(p) != norm_main.as_ref());
-                            let mut readable = Vec::with_capacity(2);
-                            for cand in [norm_main, norm_cur].into_iter().flatten() {
-                                match sources.read(&cand, operation) {
-                                    Ok(child_src) => readable.push((cand, child_src)),
-                                    Err(err)
-                                        if crate::source_snapshot::required_cache_error(&err) =>
-                                    {
-                                        return Err(err);
-                                    }
-                                    Err(_) => operation.check()?,
-                                }
-                            }
-                            let ambiguous_cwd = readable.len() > 1;
-                            for (resolved, child_src) in readable {
-                                if visited.contains(&resolved) {
-                                    continue;
-                                }
-                                visited.push(resolved.clone());
-                                let warn_poisoned = sources.warning(&resolved).is_some();
-                                append_spliced_source(
-                                    &resolved,
-                                    &child_src,
-                                    main_dir,
-                                    sources,
-                                    operation,
-                                    visited,
-                                    depth + 1,
-                                    in_preamble,
-                                    child_poisoned || ambiguous_cwd || warn_poisoned,
-                                    out,
-                                )?;
-                            }
+                            append_spliced_source(
+                                &resolved,
+                                &child_src,
+                                main_dir,
+                                compiled,
+                                pdf_dir,
+                                sources,
+                                operation,
+                                visited,
+                                depth + 1,
+                                in_preamble,
+                                child_poisoned || ambiguous_cwd || warn_poisoned,
+                                out,
+                            )?;
                         }
                     }
                 }
@@ -3093,6 +3174,7 @@ fn append_spliced_source(
 /// Title pages and running headers can be produced from declarations far
 /// outside SyncTeX's reported frame. Search only literal document metadata,
 /// including direct preamble inputs, and require neighboring PDF words.
+#[cfg(test)]
 fn document_metadata_word_location(
     main: &Path,
     context: &str,
@@ -3100,7 +3182,21 @@ fn document_metadata_word_location(
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<Option<MetadataLocation>> {
-    let mut files = preamble_sources(main, sources, operation)?;
+    document_metadata_word_location_with_context(
+        main, None, None, context, offset, sources, operation,
+    )
+}
+
+fn document_metadata_word_location_with_context(
+    main: &Path,
+    compiled_inputs: Option<&[PathBuf]>,
+    pdf_dir: Option<&Path>,
+    context: &str,
+    offset: usize,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<Option<MetadataLocation>> {
+    let mut files = preamble_sources(main, compiled_inputs, pdf_dir, sources, operation)?;
     if files.is_empty() {
         return Ok(None);
     }

@@ -23,6 +23,8 @@ pub struct SourceInfo {
     pub cwd: PathBuf,
     pub main: Option<PathBuf>,
     pub inputs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<PathBuf, PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -71,6 +73,7 @@ impl SourceInfo {
                 cwd,
                 main: None,
                 inputs: Vec::new(),
+                aliases: BTreeMap::new(),
                 warning: Some("compiled source list unavailable: no SyncTeX sidecar".into()),
             });
         };
@@ -94,7 +97,7 @@ impl SourceInfo {
         {
             fallback_dirs.push(sdir.as_path());
         }
-        let (main, inputs, unavailable) = read_inputs_with_fallbacks(
+        let (main, inputs, aliases, unavailable) = read_inputs_with_fallbacks(
             synctex::decode_synctex_file(file, MAX_SOURCE_MAP_BYTES + 1)?,
             &cwd,
             &fallback_dirs,
@@ -117,6 +120,7 @@ impl SourceInfo {
             cwd,
             main,
             inputs,
+            aliases,
             warning,
         })
     }
@@ -155,16 +159,24 @@ fn read_inputs(
     cwd: &Path,
     operation: &Operation,
 ) -> io::Result<(Option<PathBuf>, Vec<PathBuf>, usize)> {
-    read_inputs_with_fallbacks(reader, cwd, &[], operation)
+    let (main, paths, _, unavailable) = read_inputs_with_fallbacks(reader, cwd, &[], operation)?;
+    Ok((main, paths, unavailable))
 }
 
+#[allow(clippy::type_complexity)]
 fn read_inputs_with_fallbacks(
     mut reader: impl BufRead,
     cwd: &Path,
     fallback_dirs: &[&Path],
     operation: &Operation,
-) -> io::Result<(Option<PathBuf>, Vec<PathBuf>, usize)> {
+) -> io::Result<(
+    Option<PathBuf>,
+    Vec<PathBuf>,
+    BTreeMap<PathBuf, PathBuf>,
+    usize,
+)> {
     let mut inputs = BTreeMap::new();
+    let mut raw_aliases = BTreeMap::new();
     let mut first = None;
     let mut row = String::new();
     let mut bytes = 0;
@@ -223,18 +235,29 @@ fn read_inputs_with_fallbacks(
                 absolute
             } else {
                 match fs::canonicalize(&absolute) {
-                    Ok(path) => path,
+                    Ok(path) => {
+                        if path != absolute {
+                            raw_aliases.insert(absolute, path.clone());
+                        }
+                        path
+                    }
                     Err(_) => {
                         let fallback = (!raw_path.is_absolute())
                             .then(|| {
                                 fallback_dirs.iter().find_map(|dir| {
-                                    normalize_absolute(raw_path, dir)
-                                        .ok()
-                                        .and_then(|cand| fs::canonicalize(cand).ok())
+                                    let cand = normalize_absolute(raw_path, dir).ok()?;
+                                    let resolved = fs::canonicalize(&cand).ok()?;
+                                    Some((cand, resolved))
                                 })
                             })
                             .flatten();
-                        if let Some(found) = fallback {
+                        if let Some((cand, found)) = fallback {
+                            if cand != found {
+                                raw_aliases.insert(cand, found.clone());
+                            }
+                            if absolute != found {
+                                raw_aliases.insert(absolute, found.clone());
+                            }
                             found
                         } else {
                             unavailable += 1;
@@ -294,7 +317,13 @@ fn read_inputs_with_fallbacks(
         .collect();
     paths.sort_unstable();
     paths.dedup();
-    Ok((main, paths, unavailable))
+    let aliases = raw_aliases
+        .into_iter()
+        .filter(|(alias, target)| {
+            alias != target && (paths.contains(target) || Some(target) == main.as_ref())
+        })
+        .collect();
+    Ok((main, paths, aliases, unavailable))
 }
 
 #[derive(Deserialize)]
@@ -304,6 +333,8 @@ struct Manifest {
     revision: DocumentRevision,
     cwd: PathBuf,
     main: PathBuf,
+    #[serde(default)]
+    aliases: BTreeMap<PathBuf, PathBuf>,
     files: BTreeMap<PathBuf, String>,
     digests: BTreeMap<PathBuf, String>,
     warnings: BTreeMap<PathBuf, String>,
@@ -320,6 +351,7 @@ pub struct SourceSnapshot {
     pub main: PathBuf,
     fallback_dirs: Vec<PathBuf>,
     directory: PathBuf,
+    aliases: BTreeMap<PathBuf, PathBuf>,
     files: BTreeMap<PathBuf, String>,
     digests: BTreeMap<PathBuf, [u8; 32]>,
     warnings: BTreeMap<PathBuf, String>,
@@ -426,6 +458,20 @@ impl SourceSnapshot {
                 ));
             }
         }
+        for (alias, target) in &manifest.aliases {
+            if !valid_absolute_path(alias)
+                || !valid_absolute_path(target)
+                || alias == target
+                || !(manifest.files.contains_key(target)
+                    || manifest.warnings.contains_key(target)
+                    || target == &manifest.main)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source snapshot contains an invalid input alias",
+                ));
+            }
+        }
         manifest.revision.check_in(&pdf, build_directory)?;
         let sidecar_dir = sidecar_dir_for(&pdf, build_directory);
         let mut fallback_dirs = Vec::new();
@@ -455,6 +501,7 @@ impl SourceSnapshot {
             main: manifest.main,
             fallback_dirs,
             directory,
+            aliases: manifest.aliases,
             files: manifest.files,
             digests,
             warnings: manifest.warnings,
@@ -472,11 +519,17 @@ impl SourceSnapshot {
         if self.is_recorded(&absolute) {
             return Ok(absolute);
         }
+        if let Some(target) = self.aliases.get(&absolute) {
+            return Ok(target.clone());
+        }
         if !original.is_absolute() {
             for base in &self.fallback_dirs {
                 if let Ok(cand) = normalize_absolute(original, base) {
                     if self.is_recorded(&cand) {
                         return Ok(cand);
+                    }
+                    if let Some(target) = self.aliases.get(&cand) {
+                        return Ok(target.clone());
                     }
                     if let Ok(canon) = fs::canonicalize(&cand)
                         && self.is_recorded(&canon)

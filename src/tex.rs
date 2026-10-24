@@ -152,7 +152,7 @@ pub(crate) fn source_tabularx_range(source: &str, line: u32) -> Option<std::ops:
         .map(|(start, end)| start..end + 1)
 }
 
-fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usize) -> bool {
+fn tikzpicture_exclusive_bounds(source: &str, anchor: usize, start: usize, end: usize) -> bool {
     let mut line_starts = Vec::with_capacity(end + 2);
     line_starts.push(0usize);
     for (idx, line) in source.split_inclusive('\n').enumerate() {
@@ -161,7 +161,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
             break;
         }
     }
-    if end + 1 >= line_starts.len() || anchor >= start {
+    if end + 1 >= line_starts.len() || anchor > end {
         return false;
     }
     for row in anchor..start {
@@ -170,7 +170,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
             return false;
         }
     }
-    let anchor_byte = line_starts[anchor];
+    let scan_start = line_starts[anchor.min(start)];
     let start_line_byte = line_starts[start];
     let end_line_byte = line_starts[end];
     let end_line_end = line_starts[end + 1];
@@ -186,8 +186,9 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
         return false;
     };
     let tikz_end = end_line_byte + end_rel + end_marker.len();
-    let mut at = anchor_byte;
+    let mut at = scan_start;
     let mut saw_wrapper = false;
+    let mut outer_end = tikz_end;
     while at < tikz_start {
         let next_at = skip_source_space(source, at);
         if next_at > at {
@@ -202,6 +203,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                 if grp_end < tikz_end {
                     return false;
                 }
+                outer_end = outer_end.max(grp_end);
                 saw_wrapper = true;
                 at += 1;
             }
@@ -223,6 +225,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                         if grp >= tikz_start || grp_end < tikz_end {
                             return false;
                         }
+                        outer_end = outer_end.max(grp_end);
                         at = grp + 1;
                     }
                     "makebox" | "framebox" | "subfloat" | "subfigure" => {
@@ -240,6 +243,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                         if grp >= tikz_start || grp_end < tikz_end {
                             return false;
                         }
+                        outer_end = outer_end.max(grp_end);
                         at = grp + 1;
                     }
                     "scalebox" => {
@@ -263,6 +267,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                         if grp >= tikz_start || grp_end < tikz_end {
                             return false;
                         }
+                        outer_end = outer_end.max(grp_end);
                         at = grp + 1;
                     }
                     "resizebox" => {
@@ -287,6 +292,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                         if grp >= tikz_start || grp_end < tikz_end {
                             return false;
                         }
+                        outer_end = outer_end.max(grp_end);
                         at = grp + 1;
                     }
                     "adjustbox" => {
@@ -311,6 +317,7 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
                         if grp >= tikz_start || grp_end < tikz_end {
                             return false;
                         }
+                        outer_end = outer_end.max(grp_end);
                         at = grp + 1;
                     }
                     _ => return false,
@@ -319,7 +326,111 @@ fn tikzpicture_wrapper_span(source: &str, anchor: usize, start: usize, end: usiz
             _ => return false,
         }
     }
-    saw_wrapper
+    if anchor < start && !saw_wrapper {
+        return false;
+    }
+    let mut tail = tikz_end;
+    while tail < outer_end {
+        tail = skip_source_space(source, tail);
+        if tail >= outer_end {
+            break;
+        }
+        if source.as_bytes()[tail] == b'}' {
+            tail += 1;
+        } else {
+            return false;
+        }
+    }
+    if anchor <= start || anchor == end {
+        let bytes = source.as_bytes();
+        let mut pos = outer_end;
+        while pos < source.len() {
+            match bytes[pos] {
+                b' ' | b'\t' | b'\r' => pos += 1,
+                b'%' => {
+                    pos += source[pos..].find('\n').unwrap_or(source.len() - pos);
+                }
+                b'\n' => {
+                    pos += 1;
+                    let mut line_pos = pos;
+                    while line_pos < source.len() && matches!(bytes[line_pos], b' ' | b'\t' | b'\r')
+                    {
+                        line_pos += 1;
+                    }
+                    if line_pos >= source.len() || bytes[line_pos] == b'\n' {
+                        break;
+                    }
+                }
+                b'}' => pos += 1,
+                b'\\' => {
+                    if bytes.get(pos + 1) == Some(&b'\\') {
+                        break;
+                    }
+                    let (cmd, next) = math::command(source, pos);
+                    if matches!(
+                        cmd,
+                        "par"
+                            | "newline"
+                            | "linebreak"
+                            | "pagebreak"
+                            | "newpage"
+                            | "clearpage"
+                            | "cleardoublepage"
+                            | "vfill"
+                            | "vfil"
+                            | "vspace"
+                            | "bigskip"
+                            | "medskip"
+                            | "smallskip"
+                            | "hline"
+                            | "toprule"
+                            | "midrule"
+                            | "bottomrule"
+                            | "item"
+                            | "caption"
+                            | "subcaption"
+                            | "captionof"
+                            | "begin"
+                            | "end"
+                    ) {
+                        break;
+                    }
+                    if matches!(
+                        cmd,
+                        "relax"
+                            | "hfill"
+                            | "hfil"
+                            | "hss"
+                            | "centering"
+                            | "raggedright"
+                            | "raggedleft"
+                            | "noindent"
+                            | "egroup"
+                            | "endgroup"
+                    ) {
+                        pos = next;
+                        continue;
+                    }
+                    if cmd == "label" {
+                        let mut lpos = next;
+                        if let Some(opt_end) = optional_argument_end(source, lpos) {
+                            lpos = opt_end;
+                        }
+                        let Some((_, grp_end)) =
+                            math::group(source, skip_source_space(source, lpos))
+                        else {
+                            return false;
+                        };
+                        pos = grp_end;
+                        continue;
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Find a `tikzpicture` environment enclosing the one-based SyncTeX line, or
@@ -330,13 +441,13 @@ pub(crate) fn source_tikzpicture_range(source: &str, line: u32) -> Option<std::o
     }
     let anchor = line.checked_sub(1)? as usize;
     if let Some((start, end)) = environment_bounds(source, anchor, "tikzpicture") {
-        return Some(start..end + 1);
+        return tikzpicture_exclusive_bounds(source, anchor, start, end).then_some(start..end + 1);
     }
     for offset in 1..=3 {
         let probe = anchor + offset;
         if let Some((start, end)) = environment_bounds(source, probe, "tikzpicture")
             && start == probe
-            && tikzpicture_wrapper_span(source, anchor, start, end)
+            && tikzpicture_exclusive_bounds(source, anchor, start, end)
         {
             return Some(start..end + 1);
         }
@@ -500,13 +611,129 @@ fn parse_foreach_items(list: &str, var_count: usize) -> Option<Vec<Vec<String>>>
     (!out.is_empty()).then_some(out)
 }
 
+#[allow(clippy::type_complexity)]
+fn parse_foreach_header(
+    source: &str,
+    mut pos: usize,
+) -> Option<(bool, Vec<&str>, Option<std::ops::Range<usize>>, usize)> {
+    let mut has_options = false;
+    while let Some(opt_end) = optional_argument_end(source, pos) {
+        has_options = true;
+        pos = opt_end;
+    }
+    let mut vars = Vec::new();
+    loop {
+        pos = skip_source_space(source, pos);
+        if source.as_bytes().get(pos) != Some(&b'\\') {
+            break;
+        }
+        let (var, var_end) = math::command(source, pos);
+        if var.is_empty() || !var.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return None;
+        }
+        vars.push(var);
+        pos = skip_source_space(source, var_end);
+        if source.as_bytes().get(pos) == Some(&b'/') {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if vars.is_empty() {
+        return None;
+    }
+    while let Some(opt_end) = optional_argument_end(source, pos) {
+        has_options = true;
+        pos = opt_end;
+    }
+    pos = skip_source_space(source, pos);
+    let after_in = source[pos..].strip_prefix("in")?;
+    if after_in
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
+    {
+        return None;
+    }
+    pos = skip_source_space(source, pos + 2);
+    let (list_range, after_list) = if let Some((range, end)) = math::group(source, pos) {
+        (Some(range), end)
+    } else if source.as_bytes().get(pos) == Some(&b'\\') {
+        let (list_cmd, end) = math::command(source, pos);
+        if list_cmd.is_empty() {
+            return None;
+        }
+        (None, end)
+    } else {
+        return None;
+    };
+    Some((has_options, vars, list_range, after_list))
+}
+
+fn foreach_body_range(
+    source: &str,
+    body_start: usize,
+    depth: usize,
+) -> Option<std::ops::Range<usize>> {
+    if depth > 4 || body_start >= source.len() {
+        return None;
+    }
+    if source.as_bytes()[body_start] == b'{' {
+        return math::group(source, body_start).map(|(range, _)| range);
+    }
+    if source.as_bytes()[body_start] != b'\\' {
+        return None;
+    }
+    let (bcmd, after_cmd) = math::command(source, body_start);
+    if bcmd == "foreach" {
+        let (_, _, _, after_list) = parse_foreach_header(source, after_cmd)?;
+        let inner_start = skip_source_space(source, after_list);
+        let inner_body = foreach_body_range(source, inner_start, depth + 1)?;
+        let inner_end =
+            inner_body.end + usize::from(source.as_bytes().get(inner_body.end) == Some(&b'}'));
+        return Some(body_start..inner_end);
+    }
+    if bcmd.is_empty() {
+        return None;
+    }
+    let mut scan = body_start;
+    while scan < source.len() {
+        match source.as_bytes()[scan] {
+            b'\\' => {
+                let (scmd, snext) = math::command(source, scan);
+                if scmd == "end" {
+                    return None;
+                }
+                scan = snext.max(scan + 1);
+            }
+            b'%' => {
+                scan += source[scan..].find('\n').unwrap_or(source.len() - scan);
+            }
+            b'{' => {
+                let (_, grp_end) = math::group(source, scan)?;
+                scan = grp_end;
+            }
+            b';' => return Some(body_start..scan),
+            _ => {
+                scan += source[scan..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn foreach_loops<'a>(
     source: &'a str,
     lines: &std::ops::Range<usize>,
+    extra_sources: &[&'a str],
 ) -> Vec<ForeachLoop<'a>> {
     if !source.contains("\\foreach") {
         return Vec::new();
     }
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let macros = math::macros_from_sources(&macro_sources);
     let start_byte: usize = source
         .split_inclusive('\n')
         .take(lines.start)
@@ -536,183 +763,25 @@ pub(crate) fn foreach_loops<'a>(
                 if cmd != "foreach" {
                     continue;
                 }
-                let mut pos = at;
-                let mut has_options = false;
-                while let Some(opt_end) = optional_argument_end(source, pos) {
-                    has_options = true;
-                    pos = opt_end;
-                }
-                let mut vars = Vec::new();
-                loop {
-                    pos = skip_source_space(source, pos);
-                    if source.as_bytes().get(pos) != Some(&b'\\') {
-                        break;
-                    }
-                    let (var, var_end) = math::command(source, pos);
-                    if var.is_empty() || !var.bytes().all(|b| b.is_ascii_alphabetic()) {
-                        vars.clear();
-                        break;
-                    }
-                    vars.push(var);
-                    pos = skip_source_space(source, var_end);
-                    if source.as_bytes().get(pos) == Some(&b'/') {
-                        pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if vars.is_empty() {
+                let Some((has_options, vars, list_range, after_list)) =
+                    parse_foreach_header(source, at)
+                else {
                     if cmd_start >= start_byte {
                         loops.push(ForeachLoop {
                             header: cmd_start..at,
                             body: cmd_start..end_byte,
-                            vars,
-                            items: None,
-                        });
-                    }
-                    continue;
-                }
-                while let Some(opt_end) = optional_argument_end(source, pos) {
-                    has_options = true;
-                    pos = opt_end;
-                }
-                pos = skip_source_space(source, pos);
-                let Some(after_in) = source[pos..].strip_prefix("in") else {
-                    if cmd_start >= start_byte {
-                        loops.push(ForeachLoop {
-                            header: cmd_start..pos,
-                            body: cmd_start..end_byte,
-                            vars,
-                            items: None,
-                        });
-                    }
-                    continue;
-                };
-                if after_in
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
-                {
-                    if cmd_start >= start_byte {
-                        loops.push(ForeachLoop {
-                            header: cmd_start..pos,
-                            body: cmd_start..end_byte,
-                            vars,
-                            items: None,
-                        });
-                    }
-                    continue;
-                }
-                pos = skip_source_space(source, pos + 2);
-                let (list_range, after_list) = if let Some((range, end)) = math::group(source, pos)
-                {
-                    (Some(range), end)
-                } else if source.as_bytes().get(pos) == Some(&b'\\') {
-                    let (list_cmd, end) = math::command(source, pos);
-                    if list_cmd.is_empty() {
-                        if cmd_start >= start_byte {
-                            loops.push(ForeachLoop {
-                                header: cmd_start..pos,
-                                body: cmd_start..end_byte,
-                                vars,
-                                items: None,
-                            });
-                        }
-                        continue;
-                    }
-                    (None, end)
-                } else {
-                    if cmd_start >= start_byte {
-                        loops.push(ForeachLoop {
-                            header: cmd_start..pos,
-                            body: cmd_start..end_byte,
-                            vars,
+                            vars: Vec::new(),
                             items: None,
                         });
                     }
                     continue;
                 };
                 let body_start = skip_source_space(source, after_list);
-                let body = if source.as_bytes().get(body_start) == Some(&b'{') {
-                    let Some((body_range, _)) = math::group(source, body_start) else {
-                        if cmd_start >= start_byte {
-                            loops.push(ForeachLoop {
-                                header: cmd_start..after_list,
-                                body: body_start..end_byte,
-                                vars,
-                                items: None,
-                            });
-                        }
-                        continue;
-                    };
-                    body_range
-                } else if source.as_bytes().get(body_start) == Some(&b'\\') {
-                    let (bcmd, bnext) = math::command(source, body_start);
-                    if matches!(
-                        bcmd,
-                        "path"
-                            | "draw"
-                            | "fill"
-                            | "filldraw"
-                            | "pattern"
-                            | "shade"
-                            | "shadedraw"
-                            | "clip"
-                            | "useasboundingbox"
-                            | "node"
-                            | "coordinate"
-                            | "pic"
-                            | "matrix"
-                            | "scoped"
-                            | "foreach"
-                    ) {
-                        let mut scan = body_start;
-                        let mut semi = None;
-                        while scan < source.len() {
-                            match source.as_bytes()[scan] {
-                                b'\\' => {
-                                    scan += 1;
-                                    scan += source[scan..].chars().next().map_or(0, char::len_utf8);
-                                }
-                                b'%' => {
-                                    scan +=
-                                        source[scan..].find('\n').unwrap_or(source.len() - scan);
-                                }
-                                b'{' => {
-                                    let Some((_, grp_end)) = math::group(source, scan) else {
-                                        break;
-                                    };
-                                    scan = grp_end;
-                                }
-                                b';' => {
-                                    semi = Some(scan);
-                                    break;
-                                }
-                                _ => {
-                                    scan += source[scan..].chars().next().map_or(1, char::len_utf8);
-                                }
-                            }
-                        }
-                        let Some(semi) = semi else {
-                            if cmd_start >= start_byte {
-                                loops.push(ForeachLoop {
-                                    header: cmd_start..after_list,
-                                    body: body_start..end_byte,
-                                    vars,
-                                    items: None,
-                                });
-                            }
-                            continue;
-                        };
-                        body_start..semi
-                    } else {
-                        body_start..bnext
-                    }
-                } else {
+                let Some(body) = foreach_body_range(source, body_start, 0) else {
                     if cmd_start >= start_byte {
                         loops.push(ForeachLoop {
                             header: cmd_start..after_list,
-                            body: body_start..end_byte,
+                            body: body_start.min(end_byte)..end_byte,
                             vars,
                             items: None,
                         });
@@ -729,25 +798,15 @@ pub(crate) fn foreach_loops<'a>(
                     let slash = bpos + rel;
                     let (bcmd, bnext) = math::command(body_src, slash);
                     bpos = bnext.max(slash + 1);
-                    if matches!(
-                        bcmd,
-                        "def"
-                            | "edef"
-                            | "gdef"
-                            | "xdef"
-                            | "let"
-                            | "futurelet"
-                            | "newcommand"
-                            | "renewcommand"
-                            | "providecommand"
-                            | "pgfmathsetmacro"
-                            | "pgfmathtruncatemacro"
-                    ) {
+                    if math::is_macro_definition_command(bcmd) {
                         body_redefines = true;
                         break;
                     }
                 }
-                let items = if has_options || vars.len() > 4 || body_redefines {
+                let clashes_with_macro =
+                    macros.contains_key("**") || vars.iter().any(|v| macros.contains_key(v));
+                let items = if has_options || vars.len() > 4 || body_redefines || clashes_with_macro
+                {
                     None
                 } else {
                     list_range.and_then(|r| parse_foreach_items(&source[r], vars.len()))
@@ -1064,6 +1123,91 @@ pub(crate) fn source_word_location_with_sources(
     )
 }
 
+fn discarded_macro_arg_ranges(
+    source: &str,
+    lines: &std::ops::Range<usize>,
+    extra_sources: &[&str],
+) -> Vec<std::ops::Range<usize>> {
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let macros = math::macros_from_sources(&macro_sources);
+    if macros.is_empty() || macros.contains_key("**") {
+        return Vec::new();
+    }
+    let start_byte: usize = source
+        .split_inclusive('\n')
+        .take(lines.start)
+        .map(str::len)
+        .sum();
+    let end_byte: usize = start_byte
+        + source[start_byte..]
+            .split_inclusive('\n')
+            .take(lines.end.saturating_sub(lines.start))
+            .map(str::len)
+            .sum::<usize>();
+    let mut ranges = Vec::new();
+    let mut at = start_byte;
+    while at < end_byte {
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            }
+            b'\\' => {
+                let (cmd, next) = math::command(source, at);
+                at = next;
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, at) {
+                    at = opaque_end;
+                    continue;
+                }
+                if math::is_macro_definition_command(cmd) {
+                    let mut def_cur =
+                        at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    def_cur = skip_source_space(source, def_cur);
+                    if let Some((_, grp_end)) = math::group(source, def_cur) {
+                        def_cur = grp_end;
+                    } else if source.as_bytes().get(def_cur) == Some(&b'\\') {
+                        def_cur = math::command(source, def_cur).1;
+                    }
+                    while let Some(opt_end) = optional_argument_end(source, def_cur) {
+                        def_cur = opt_end;
+                    }
+                    if let Some((_, body_end)) =
+                        math::group(source, skip_source_space(source, def_cur))
+                    {
+                        at = body_end;
+                    }
+                    continue;
+                }
+                if let Some(Some(def)) = macros.get(cmd)
+                    && def.arity > 0
+                {
+                    let mut arg_cursor = at;
+                    for idx in 0..def.arity {
+                        let open = skip_source_space(source, arg_cursor);
+                        let Some((_, arg_end)) = math::group(source, open) else {
+                            break;
+                        };
+                        if (def.used_params & (1 << idx)) == 0 {
+                            ranges.push(open..arg_end);
+                        }
+                        arg_cursor = arg_end;
+                    }
+                }
+            }
+            _ => {
+                let rest = &source.as_bytes()[at + 1..end_byte];
+                let step = rest
+                    .iter()
+                    .position(|&b| matches!(b, b'%' | b'\\'))
+                    .map_or(rest.len() + 1, |p| p + 1);
+                at += step;
+            }
+        }
+    }
+    ranges
+}
+
 pub(crate) fn source_word_location_in_range_with_sources(
     source: &str,
     line: u32,
@@ -1073,7 +1217,12 @@ pub(crate) fn source_word_location_in_range_with_sources(
     within_scope: bool,
     extra_sources: &[&str],
 ) -> Option<(u32, usize)> {
-    let hidden = nonprinting_source_ranges(source);
+    let mut hidden = nonprinting_source_ranges(source);
+    let discarded = discarded_macro_arg_ranges(source, &lines, extra_sources);
+    if !discarded.is_empty() {
+        hidden.extend(discarded);
+        hidden.sort_by_key(|r| (r.start, r.end));
+    }
     // A closing layout environment can alias every row to one source line.
     // A search radius alone does not identify neighboring prose or math;
     // independently established frame/caption and math scopes remain eligible.
@@ -1087,12 +1236,10 @@ pub(crate) fn source_word_location_in_range_with_sources(
             math::group(rest, 0).map(|(name, _)| !math::math_environment(&rest[name]))
         })
         .unwrap_or(false);
-    let lines = if !within_scope && closing_layout {
-        line.saturating_sub(1) as usize..line as usize
-    } else {
-        lines
-    };
-    let loops = foreach_loops(source, &lines);
+    if !within_scope && closing_layout {
+        return None;
+    }
+    let loops = foreach_loops(source, &lines, extra_sources);
     let prose = source_prose_scored_location_with_loops(
         source,
         line,
@@ -1284,6 +1431,29 @@ fn overlay_spec_matches(spec: &str, slide: u32) -> Option<bool> {
     Some(matched)
 }
 
+pub(crate) fn frame_header_after_begin(source: &str, frame_start_line: usize) -> Option<usize> {
+    let row = source.lines().nth(frame_start_line).map(source_line_text)?;
+    let row_start: usize = source
+        .split_inclusive('\n')
+        .take(frame_start_line)
+        .map(str::len)
+        .sum();
+    row.match_indices("\\begin")
+        .filter(|(at, _)| {
+            row[..*at]
+                .bytes()
+                .rev()
+                .take_while(|ch| *ch == b'\\')
+                .count()
+                % 2
+                == 0
+        })
+        .find_map(|(at, _)| {
+            let (env, end) = math::group(source, row_start + at + "\\begin".len())?;
+            (&source[env] == "frame").then_some(end)
+        })
+}
+
 #[allow(clippy::type_complexity)]
 fn filter_frame_graphics_for_slide(
     source: &str,
@@ -1318,14 +1488,7 @@ fn filter_frame_graphics_for_slide(
             return None;
         }
     }
-    let header = source
-        .lines()
-        .nth(frame_range.start)
-        .map(source_line_text)?;
-    if let Some(pos) = header.find("\\begin")
-        && let Some((env, end)) = math::group(source, frame_start + pos + "\\begin".len())
-        && &source[env] == "frame"
-    {
+    if let Some(end) = frame_header_after_begin(source, frame_range.start) {
         let mut cursor = end;
         loop {
             let after = skip_source_space(source, cursor);
@@ -1574,6 +1737,9 @@ pub(crate) fn source_graphics_location_with_context(
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
     let macros = math::macros_from_sources(&macro_sources);
+    if macros.contains_key("**") {
+        return None;
+    }
     let mut safe_macros = Vec::new();
     let mut masked = masked.into_iter().peekable();
     let mut if_depth = 0usize;
@@ -1824,24 +1990,9 @@ pub(crate) fn nonprinting_source_spans(
                     return Some((start, start..at, None));
                 }
                 at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
-                let definition = matches!(
-                    command,
-                    "newcommand"
-                        | "renewcommand"
-                        | "providecommand"
-                        | "DeclareRobustCommand"
-                        | "DeclareMathOperator"
-                        | "NewDocumentCommand"
-                        | "RenewDocumentCommand"
-                        | "ProvideDocumentCommand"
-                        | "DeclareDocumentCommand"
-                        | "newenvironment"
-                        | "renewenvironment"
-                        | "def"
-                        | "gdef"
-                        | "edef"
-                        | "xdef"
-                );
+                let definition = (math::is_macro_definition_command(command)
+                    && !matches!(command, "csname" | "newif"))
+                    || matches!(command, "newenvironment" | "renewenvironment");
                 if definition {
                     if matches!(command, "def" | "gdef" | "edef" | "xdef") {
                         while at < source.len() && source.as_bytes()[at] != b'{' {
@@ -2204,7 +2355,11 @@ pub(crate) fn source_prose_scored_location_with_loops(
             let proximity = if within_frame { 0 } else { row.abs_diff(line) };
             let rank = (
                 score,
-                frame_header && *row as usize == lines.start + 1,
+                frame_header
+                    && pdf.len() > 1
+                    && score == 0
+                    && *row as usize == lines.start + 1
+                    && candidates.iter().filter(|(r, _, _)| *r == *row).count() <= 2,
                 context_bonus,
                 std::cmp::Reverse(proximity),
             );

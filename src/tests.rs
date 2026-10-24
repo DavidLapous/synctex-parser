@@ -4576,9 +4576,10 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
     assert_eq!(table.get("ClashSym"), Some(&None));
 
     let synctex = format!(
-        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nInput:3:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
         main_tex.display(),
         sub_tex.display(),
+        preamble_tex.display(),
     );
     fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
 
@@ -4860,14 +4861,93 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         );
     }
 
-    // 5. Non-path single-token body (\relax) does not swallow a following \node.
-    let relax_body = concat!(
+    // 5. Unbraced \foreach body scans up to the first top-level semicolon (and nested \foreach).
+    let unbraced_macro_body = concat!(
         "\\begin{tikzpicture}\n",
-        "\\foreach \\tag in {Alpha, Beta} \\relax\n",
-        "\\node {\\tag};\n",
+        "\\newcommand{\\mycmd}[1]{}\n",
+        "\\foreach \\tag in {Alpha, Beta} \\mycmd{x} \\node {\\tag};\n",
+        "\\node {Alpha};\n",
         "\\end{tikzpicture}\n",
     );
-    assert_eq!(source_word_location(relax_body, 4, "Alpha", 0, 2), None);
+    assert_eq!(
+        source_word_location(unbraced_macro_body, 5, "Beta", 0, 2),
+        Some((
+            3,
+            "\\foreach \\tag in {Alpha, Beta} \\mycmd{x} \\node {".len()
+        ))
+    );
+    let nested_unbraced_foreach = concat!(
+        "\\begin{tikzpicture}\n",
+        "\\foreach \\x in {Alpha, Beta} \\foreach \\y in {1, 2} { \\node {\\x}; \\node {\\y}; }\n",
+        "\\node {Alpha};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(
+        source_word_location(nested_unbraced_foreach, 4, "Beta", 0, 2),
+        Some((
+            2,
+            "\\foreach \\x in {Alpha, Beta} \\foreach \\y in {1, 2} { \\node {".len()
+        ))
+    );
+
+    // 6. Loop variable clashing with a defined or poisoned macro abstains, and \DeclareMathOperator
+    //    inside a loop body poisons the loop.
+    let clashing_loop_var = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{tikz}\n",
+        "\\let\\tag\\relax\n",
+        "\\begin{document}\n",
+        "\\begin{tikzpicture}\n",
+        "  \\foreach \\tag in {\\alpha, \\beta} { \\node {$\\tag + \\alpha$}; }\n",
+        "  \\node {$\\alpha$};\n",
+        "\\end{tikzpicture}\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        source_word_location(clashing_loop_var, 8, "\u{03b1}", 0, 2),
+        None
+    );
+    let dmo_in_loop = concat!(
+        "\\begin{tikzpicture}\n",
+        "  \\foreach \\tag in {Alpha, Beta} { \\DeclareMathOperator{\\tag}{Op} \\node {\\tag}; }\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture}\n",
+    );
+    assert_eq!(source_word_location(dmo_in_loop, 4, "Alpha", 0, 2), None);
+
+    // 7. Trailing prose after \end{tikzpicture} (or after its wrapper) prevents exclusive
+    //    tikzpicture ownership and does not resolve to the trailing prose on the closing line.
+    let trailing_prose_after_tikz = concat!(
+        "\\documentclass{article}\n",
+        "\\usepackage{tikz}\n",
+        "\\begin{document}\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture} Alpha\n",
+        "\\end{document}\n",
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(trailing_prose_after_tikz, 6),
+        None
+    );
+    assert_eq!(
+        source_word_location(trailing_prose_after_tikz, 6, "Alpha", 0, 2),
+        None
+    );
+    let trailing_prose_after_wrapper = concat!(
+        "\\resizebox{0.5\\linewidth}{!}{%\n",
+        "\\begin{tikzpicture}\n",
+        "  \\node {Alpha};\n",
+        "\\end{tikzpicture}} Alpha\n",
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(trailing_prose_after_wrapper, 1),
+        None
+    );
+    assert_eq!(
+        crate::tex::source_tikzpicture_range(trailing_prose_after_wrapper, 4),
+        None
+    );
 }
 
 #[test]
@@ -4905,13 +4985,164 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     .unwrap();
 
     let mut sources = crate::QuerySources::default();
-    let spliced = crate::macro_preamble_source(&main_tex, &mut sources, &Operation::default())
-        .unwrap()
-        .unwrap();
+    let spliced =
+        crate::macro_preamble_source(&main_tex, None, None, &mut sources, &Operation::default())
+            .unwrap()
+            .unwrap();
     let table = crate::math::macros_from_sources(&[spliced.as_str()]);
     assert!(table.get("DeepSym").is_some_and(Option::is_some));
     assert!(table.get("PkgSym").is_some_and(Option::is_some));
     assert_eq!(table.get("GroupedSym"), Some(&None));
+
+    // Compiler-recorded Input: paths disambiguate CWD-relative preamble imports when main.tex
+    // lives in a subdirectory, and unrecorded ambiguous imports are poisoned.
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    let sub_main = src_dir.join("provenance.tex");
+    let root_cwd_defs = root.join("cwd_defs.tex");
+    let decoy_src_defs = src_dir.join("cwd_defs.tex");
+    fs::write(&root_cwd_defs, "\\newcommand{\\Pick}{\\beta}\n").unwrap();
+    fs::write(&decoy_src_defs, "\\newcommand{\\Pick}{\\alpha}\n").unwrap();
+    fs::write(
+        &sub_main,
+        concat!(
+            "\\documentclass{article}\n",
+            "\\input{cwd_defs}\n",
+            "\\begin{document}\n",
+            "$\\Pick$ and $\\alpha$\n",
+            "\\end{document}\n",
+        ),
+    )
+    .unwrap();
+    let compiled_spliced = crate::macro_preamble_source(
+        &sub_main,
+        Some(std::slice::from_ref(&root_cwd_defs)),
+        Some(&root),
+        &mut sources,
+        &Operation::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let compiled_table = crate::math::macros_from_sources(&[compiled_spliced.as_str()]);
+    assert_eq!(
+        compiled_table
+            .get("Pick")
+            .and_then(|d| d.as_ref())
+            .and_then(|d| d.body),
+        Some("\\beta")
+    );
+    let unrecorded_spliced = crate::macro_preamble_source(
+        &sub_main,
+        None,
+        Some(&root),
+        &mut sources,
+        &Operation::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let unrecorded_table = crate::math::macros_from_sources(&[unrecorded_spliced.as_str()]);
+    assert_eq!(unrecorded_table.get("Pick"), Some(&None));
+
+    // Exceeding recursion depth poisons all macros via \csname *\endcsname so stale definitions
+    // before deep \input chains cannot survive a truncated redefinition.
+    let prev = root.join("depth_0.tex");
+    fs::write(
+        &prev,
+        "\\newcommand{\\StaleDepthSym}{\\alpha}\n\\input{depth_1}\n",
+    )
+    .unwrap();
+    for i in 1..=9 {
+        let cur = root.join(format!("depth_{i}.tex"));
+        let body = if i < 9 {
+            format!("\\input{{depth_{}}}\n", i + 1)
+        } else {
+            "\\renewcommand{\\StaleDepthSym}{\\beta}\n".to_owned()
+        };
+        fs::write(&cur, body).unwrap();
+    }
+    let deep_spliced =
+        crate::macro_preamble_source(&prev, None, None, &mut sources, &Operation::default())
+            .unwrap()
+            .unwrap();
+    let deep_table = crate::math::macros_from_sources(&[deep_spliced.as_str()]);
+    assert_eq!(deep_table.get("StaleDepthSym"), Some(&None));
+    assert_eq!(deep_table.get("**"), Some(&None));
+    assert_eq!(
+        crate::tex::source_word_location_with_sources(
+            "$\\alpha$ and $\\beta$\n",
+            1,
+            "\u{03b2} and \u{03b2}",
+            0,
+            2,
+            &[deep_spliced.as_str()],
+        ),
+        None
+    );
+    assert_eq!(
+        crate::tex::source_word_location_with_sources(
+            "$\\NewSym + 1$ and $x + 1$\n",
+            1,
+            "x + 1 and x + 1",
+            0,
+            2,
+            &[deep_spliced.as_str()],
+        ),
+        None
+    );
+
+    // TEXINPUTS-style compiler provenance takes precedence over an uncompiled decoy in pdf_dir.
+    let search_dir = root.join("search");
+    let out_dir = root.join("out");
+    fs::create_dir_all(&search_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+    let texinputs_defs = search_dir.join("ext_defs.tex");
+    let decoy_out_defs = out_dir.join("ext_defs.tex");
+    let texinputs_main = root.join("texinputs_main.tex");
+    fs::write(&texinputs_defs, "\\newcommand{\\ExtSym}{\\beta}\n").unwrap();
+    fs::write(&decoy_out_defs, "\\newcommand{\\ExtSym}{\\alpha}\n").unwrap();
+    fs::write(
+        &texinputs_main,
+        "\\documentclass{article}\n\\input{ext_defs}\n\\begin{document}\n$\\ExtSym$\n\\end{document}\n",
+    )
+    .unwrap();
+    let texinputs_spliced = crate::macro_preamble_source(
+        &texinputs_main,
+        Some(std::slice::from_ref(&texinputs_defs)),
+        Some(&out_dir),
+        &mut sources,
+        &Operation::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let texinputs_table = crate::math::macros_from_sources(&[texinputs_spliced.as_str()]);
+    assert_eq!(
+        texinputs_table
+            .get("ExtSym")
+            .and_then(|d| d.as_ref())
+            .and_then(|d| d.body),
+        Some("\\beta")
+    );
+
+    // \pgfmathsetmacro and \pgfmathtruncatemacro are masked as nonprinting definitions,
+    // and repeated multi-word or word-only frame titles abstain instead of breaking ties.
+    let pgf_source = concat!("\\pgfmathsetmacro{\\unused}{42}\n", "Result 42 here.\n",);
+    assert_eq!(
+        source_word_location(pgf_source, 2, "Result 42 here.", "Result ".len(), 2),
+        Some((2, "Result ".len()))
+    );
+    let repeated_frame = concat!(
+        "\\begin{frame}{Repeated Topic}\n",
+        "Repeated Topic\n",
+        "\\end{frame}\n",
+    );
+    assert_eq!(
+        source_word_location(repeated_frame, 3, "Repeated Topic", 0, 3),
+        None
+    );
+    assert_eq!(
+        source_word_location(repeated_frame, 3, "Repeated", 0, 3),
+        None
+    );
 
     // Postfix \only{...}<2> resolves, whereas frame-level [label=...], [1-2], \againframe, or \note abstains.
     let postfix_only = concat!(
@@ -4959,6 +5190,12 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
             "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
             "\\end{frame}\n",
         ),
+        concat!(
+            "{\\begin{center}\\end{center}}\\begin{frame}<2->{Figures}\n",
+            "  \\only<1>{\\includegraphics{fig1.pdf}}\n",
+            "  \\only<2>{\\includegraphics{fig2.pdf}}\n",
+            "\\end{frame}\n",
+        ),
     ] {
         let end_line = unsafe_frame.lines().count() as u32;
         assert_eq!(
@@ -4986,4 +5223,259 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         ),
         None
     );
+
+    // Late Input: tags emitted after sheet 1 are still captured by source_map_from_reader.
+    let late_input_synctex = concat!(
+        "SyncTeX Version:1\n",
+        "Input:1:/tmp/main.tex\n",
+        "Output:pdf\n",
+        "Magnification:1000\n",
+        "Unit:1\n",
+        "X Offset:0\n",
+        "Y Offset:0\n",
+        "Content:\n",
+        "{1\n",
+        "[1,1:0,0:0,0,0\n",
+        "]\n",
+        "}1\n",
+        "Input:2:/tmp/sub.tex\n",
+        "{2\n",
+        "[2,1:0,0:0,0,0\n",
+        "]\n",
+        "}2\n",
+        "Postamble:\n",
+        "Count:2\n",
+    );
+    let late_point = InversePoint {
+        page: 1,
+        x: 0.0,
+        y_from_top: 0.0,
+        page_height_pt: 792.0,
+    };
+    let late_map = source_map_from_reader(
+        std::io::Cursor::new(late_input_synctex.as_bytes()),
+        &pdf,
+        late_point,
+        Path::new("/tmp/doc.synctex"),
+        false,
+        &Operation::default(),
+        Some(&root),
+    )
+    .unwrap();
+    assert_eq!(late_map.inputs.len(), 2);
+
+    // Defining the single-character control symbol \* does not trigger the "**" incomplete-macro sentinel.
+    let star_def = "\\def\\*{\\times}\n$\\alpha + 1$ and $\\beta + 1$\n";
+    let star_table = crate::math::macros_from_sources(&[star_def]);
+    assert!(!star_table.contains_key("**"));
+    assert_eq!(
+        source_word_location(star_def, 2, "\u{03b2} + 1", 0, 2),
+        Some((2, "$\\alpha + 1$ and $".len()))
+    );
+
+    // Discarded user-macro arguments are masked from prose matching, and unbraced non-TikZ \foreach bodies do not scan to ';'.
+    let discarded_arg_src = "\\newcommand{\\ignore}[1]{}\n\\ignore{Target} Target;\n";
+    assert_eq!(
+        source_word_location(discarded_arg_src, 2, "Target;", 0, 2),
+        Some((2, "\\ignore{Target} ".len()))
+    );
+    let prose_foreach_src = "\\foreach \\x in {Target} { Static }\n";
+    assert_eq!(
+        source_word_location(prose_foreach_src, 1, "Target", 0, 1),
+        None
+    );
+
+    // \operatorname*{argmax}_x, @-named macros, \csname...\endcsname, redefined \label, and glue with repeated plus.
+    let math_fixes_src = concat!(
+        "\\makeatletter\\newcommand{\\foo@bar}{\\beta}\\makeatother\n",
+        "$\\operatorname*{argmax}_x$ and $\\foo@bar$\n",
+    );
+    assert_eq!(
+        source_word_location(math_fixes_src, 2, "argmax", 0, 2),
+        Some((2, "$\\operatorname*{".len()))
+    );
+    assert_eq!(
+        source_word_location(math_fixes_src, 2, "\u{03b2}", 0, 2),
+        Some((2, "$\\operatorname*{argmax}_x$ and $".len()))
+    );
+    let csname_src = concat!(
+        "\\newcommand{\\dyn}{\\alpha}\n",
+        "\\expandafter\\def\\csname dyn\\endcsname{\\beta}\n",
+        "$\\dyn$ and $\\alpha$\n",
+    );
+    assert_eq!(
+        crate::math::macros_from_sources(&[csname_src]).get("dyn"),
+        Some(&None)
+    );
+    assert_eq!(source_word_location(csname_src, 3, "\u{03b1}", 0, 3), None);
+
+    let redefined_label_src = "\\renewcommand{\\label}[1]{\\alpha}\n$\\label{x} + \\beta$\n";
+    assert_eq!(
+        source_word_location(redefined_label_src, 2, "\u{03b1}+\u{03b2}", 0, 2),
+        Some((2, "$".len()))
+    );
+
+    let double_plus_glue = "$\\mskip 1mu plus 2mu plus 3mu \\alpha$\n";
+    assert_eq!(
+        source_word_location(double_plus_glue, 1, "plus 3mu \u{03b1}", 0, 1),
+        Some((1, "$\\mskip 1mu plus 2mu ".len()))
+    );
+
+    // Metadata lookup with explicit compiled_inputs refuses uncompiled decoy in main.parent().
+    let meta_dir = root.join("meta_prov");
+    let meta_sub = meta_dir.join("compiled");
+    fs::create_dir_all(&meta_sub).unwrap();
+    let meta_main = meta_dir.join("main.tex");
+    let meta_decoy = meta_dir.join("defs.tex");
+    let meta_real = meta_sub.join("defs.tex");
+    fs::write(
+        &meta_main,
+        "\\documentclass{article}\n\\input{defs}\n\\begin{document}\nBody\n\\end{document}\n",
+    )
+    .unwrap();
+    fs::write(&meta_decoy, "\\title{Sample Title}\n").unwrap();
+    fs::write(&meta_real, "\\title{Other Heading}\n").unwrap();
+    assert_eq!(
+        crate::document_metadata_word_location_with_context(
+            &meta_main,
+            Some(std::slice::from_ref(&meta_real)),
+            Some(&meta_sub),
+            "Sample Title",
+            0,
+            &mut sources,
+            &Operation::default(),
+        )
+        .unwrap(),
+        None
+    );
+
+    // Concatenated gzip members in .synctex.gz are decoded across member boundaries.
+    {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let gz_path = root.join("multi.synctex.gz");
+        let part1 = concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:/tmp/main.tex\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+        );
+        let part2 = concat!(
+            "{1\n",
+            "[1,1:0,0:0,0,0\n",
+            "]\n",
+            "}1\n",
+            "Postamble:\n",
+            "Count:1\n",
+        );
+        let mut combined = Vec::new();
+        {
+            let mut enc1 = GzEncoder::new(&mut combined, Compression::default());
+            enc1.write_all(part1.as_bytes()).unwrap();
+            enc1.finish().unwrap();
+        }
+        {
+            let mut enc2 = GzEncoder::new(&mut combined, Compression::default());
+            enc2.write_all(part2.as_bytes()).unwrap();
+            enc2.finish().unwrap();
+        }
+        fs::write(&gz_path, &combined).unwrap();
+        let decoded =
+            crate::decode_synctex_file(fs::File::open(&gz_path).unwrap(), 1024 * 1024).unwrap();
+        let parsed = source_map_from_reader(
+            decoded,
+            &pdf,
+            late_point,
+            &gz_path,
+            false,
+            &Operation::default(),
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(parsed.inputs.len(), 1);
+    }
+
+    // Symlink alias recorded in SourceInfo/SourceSnapshot still normalizes after symlink retargeting.
+    #[cfg(unix)]
+    {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let alias_dir = root.join("alias_snap");
+        fs::create_dir_all(&alias_dir).unwrap();
+        let target_a = alias_dir.join("target_a.tex");
+        let target_b = alias_dir.join("target_b.tex");
+        let link_tex = alias_dir.join("chapter.tex");
+        let snap_pdf = alias_dir.join("doc.pdf");
+        let snap_synctex = alias_dir.join("doc.synctex");
+        let snap_dir = alias_dir.join("snap");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&target_a, "Hello world\n").unwrap();
+        fs::write(&target_b, "Different file\n").unwrap();
+        fs::write(&snap_pdf, b"%PDF-1.4\n").unwrap();
+        std::os::unix::fs::symlink(&target_a, &link_tex).unwrap();
+        let synctex_body = format!(
+            concat!(
+                "SyncTeX Version:1\n",
+                "Input:1:{}\n",
+                "Output:pdf\n",
+                "Magnification:1000\n",
+                "Unit:1\n",
+                "X Offset:0\n",
+                "Y Offset:0\n",
+                "Content:\n",
+                "{{1\n",
+                "[1,1:0,0:0,0,0\n",
+                "]\n",
+                "}}\n",
+                "Postamble:\n",
+                "Count:1\n",
+            ),
+            link_tex.display()
+        );
+        fs::write(&snap_synctex, synctex_body).unwrap();
+        let info = crate::source_snapshot::SourceInfo::read_with_operation(
+            &snap_pdf,
+            &Operation::default(),
+        )
+        .unwrap();
+        let canonical_a = fs::canonicalize(&target_a).unwrap();
+        assert_eq!(info.aliases.get(&link_tex), Some(&canonical_a));
+
+        fs::write(snap_dir.join("1.txt"), "Hello world\n").unwrap();
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(b"Hello world\n").iter() {
+            write!(digest, "{byte:02x}").unwrap();
+        }
+        let manifest_path = snap_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pdf": fs::canonicalize(&snap_pdf).unwrap(),
+                "revision": crate::DocumentRevision::read(&snap_pdf).unwrap(),
+                "cwd": &alias_dir,
+                "main": &canonical_a,
+                "aliases": info.aliases,
+                "files": BTreeMap::from([(canonical_a.clone(), "1.txt")]),
+                "digests": BTreeMap::from([(canonical_a.clone(), digest)]),
+                "warnings": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&link_tex).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link_tex).unwrap();
+        let loaded =
+            crate::source_snapshot::SourceSnapshot::load(&manifest_path, &snap_pdf).unwrap();
+        assert_eq!(loaded.normalize(&link_tex).unwrap(), canonical_a);
+        assert_eq!(loaded.read(&link_tex).unwrap(), "Hello world\n");
+    }
 }

@@ -6,6 +6,7 @@ use std::ops::Range;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MacroDef<'a> {
     pub(super) arity: u8,
+    pub(super) used_params: u16,
     pub(super) body: Option<&'a str>,
 }
 
@@ -48,12 +49,12 @@ pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
     let end = if source
         .as_bytes()
         .get(after)
-        .is_some_and(u8::is_ascii_alphabetic)
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
     {
         after
             + source[after..]
                 .bytes()
-                .take_while(u8::is_ascii_alphabetic)
+                .take_while(|b| b.is_ascii_alphabetic() || *b == b'@')
                 .count()
     } else {
         after + source[after..].chars().next().map_or(0, char::len_utf8)
@@ -883,19 +884,48 @@ fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
     at = super::skip_source_space(source, at);
     if let Some((grp, next)) = group(source, at) {
         let name = source[grp].trim().strip_prefix('\\')?.trim();
-        (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic())).then_some((name, next))
+        (!name.is_empty()
+            && !matches!(name, "csname" | "expandafter")
+            && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'@'))
+        .then_some((name, next))
     } else if source.as_bytes().get(at) == Some(&b'\\') {
         let (name, next) = command(source, at);
-        (!name.is_empty()).then_some((name, next))
+        (!name.is_empty() && !matches!(name, "csname" | "expandafter")).then_some((name, next))
     } else {
         None
     }
+}
+
+pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "newcommand"
+            | "renewcommand"
+            | "providecommand"
+            | "DeclareRobustCommand"
+            | "DeclareMathOperator"
+            | "NewDocumentCommand"
+            | "RenewDocumentCommand"
+            | "ProvideDocumentCommand"
+            | "DeclareDocumentCommand"
+            | "def"
+            | "gdef"
+            | "edef"
+            | "xdef"
+            | "let"
+            | "futurelet"
+            | "csname"
+            | "newif"
+            | "pgfmathsetmacro"
+            | "pgfmathtruncatemacro"
+    )
 }
 
 pub(crate) fn macros_from_sources<'a>(
     sources: &[&'a str],
 ) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
     let mut table = BTreeMap::<&'a str, Option<MacroDef<'a>>>::new();
+    let mut poison_all = false;
     for &source in sources {
         let mut in_preamble = true;
         let mut brace_depth = 0usize;
@@ -972,7 +1002,9 @@ pub(crate) fn macros_from_sources<'a>(
                     if cmd == "csname" {
                         if let Some(pos) = source[at..].find("\\endcsname") {
                             let name = source[at..at + pos].trim();
-                            if !name.is_empty() {
+                            if name == "**" {
+                                poison_all = true;
+                            } else if !name.is_empty() {
                                 table.insert(name, None);
                             }
                             at += pos + "\\endcsname".len();
@@ -1006,6 +1038,8 @@ pub(crate) fn macros_from_sources<'a>(
                             | "RenewDocumentCommand"
                             | "ProvideDocumentCommand"
                             | "DeclareDocumentCommand"
+                            | "pgfmathsetmacro"
+                            | "pgfmathtruncatemacro"
                     ) {
                         if let Some((name, _)) = macro_target_name(source, at) {
                             table.insert(name, None);
@@ -1084,24 +1118,26 @@ pub(crate) fn macros_from_sources<'a>(
                     let body = &source[body_range];
                     let mut valid = !body.contains('$') && !body.contains("^^");
                     let mut seen_params = 0u16;
+                    let mut used_params = 0u16;
                     for (idx, _) in body.match_indices('#') {
-                        let Some(d) = body
+                        if let Some(d) = body
                             .as_bytes()
                             .get(idx + 1)
                             .filter(|b| (b'1'..=b'0' + arity).contains(b))
                             .map(|b| b - b'1')
-                        else {
+                        {
+                            used_params |= 1 << d;
+                            if (seen_params >> d) != 0 {
+                                valid = false;
+                            }
+                            seen_params |= 1 << d;
+                        } else {
                             valid = false;
-                            break;
-                        };
-                        if (seen_params >> d) != 0 {
-                            valid = false;
-                            break;
                         }
-                        seen_params |= 1 << d;
                     }
                     let def = MacroDef {
                         arity,
+                        used_params,
                         body: valid.then_some(body),
                     };
                     match table.get(name) {
@@ -1124,6 +1160,12 @@ pub(crate) fn macros_from_sources<'a>(
                 }
             }
         }
+    }
+    if poison_all {
+        for val in table.values_mut() {
+            *val = None;
+        }
+        table.insert("**", None);
     }
     table
 }
@@ -1359,17 +1401,6 @@ fn atoms_with_macros<'a>(
                 {
                     return None;
                 }
-                if name == "label" {
-                    while let Some(opt_end) =
-                        super::optional_argument_end(source, i).filter(|e| *e <= range.end)
-                    {
-                        i = opt_end;
-                    }
-                    if let Some((_, grp_end)) = script_arg(i) {
-                        i = grp_end;
-                    }
-                    continue;
-                }
                 if name == "begin" {
                     let (environment, mut end) =
                         group(source, i).filter(|(_, e)| *e <= range.end)?;
@@ -1446,7 +1477,16 @@ fn atoms_with_macros<'a>(
                     i = end;
                     continue;
                 }
-                if let Some(macro_entry) = macros.get(name).copied() {
+                let incomplete_macros = macros.contains_key("**");
+                let macro_entry = macros.get(name).copied().or_else(|| {
+                    (incomplete_macros
+                        && name
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@'))
+                    .then_some(None)
+                });
+                if let Some(macro_entry) = macro_entry {
                     if let Some(def) = macro_entry
                         && depth + 16 <= 64
                     {
@@ -1517,6 +1557,17 @@ fn atoms_with_macros<'a>(
                     append(&mut result, '\0', span);
                     continue;
                 }
+                if name == "label" {
+                    while let Some(opt_end) =
+                        super::optional_argument_end(source, i).filter(|e| *e <= range.end)
+                    {
+                        i = opt_end;
+                    }
+                    if let Some((_, grp_end)) = script_arg(i) {
+                        i = grp_end;
+                    }
+                    continue;
+                }
                 if name == "not" {
                     let next = super::skip_source_space(source, i).min(range.end);
                     let negated = if source[next..range.end].starts_with('=') {
@@ -1547,7 +1598,14 @@ fn atoms_with_macros<'a>(
                     continue;
                 }
                 match classify_command(name) {
-                    MathCommand::Transparent => {}
+                    MathCommand::Transparent => {
+                        if name == "operatorname"
+                            && i < range.end
+                            && source.as_bytes().get(i) == Some(&b'*')
+                        {
+                            i += 1;
+                        }
+                    }
                     MathCommand::DelimiterPrefix => {
                         let following = source[i..range.end].trim_start();
                         if following.starts_with('.') {
@@ -1557,22 +1615,19 @@ fn atoms_with_macros<'a>(
                     MathCommand::Dimension { allow_glue } => {
                         let mut dim_end = skip_tex_dimen(source, i, range.end)?;
                         if allow_glue {
-                            loop {
-                                let kw = super::skip_source_space(source, dim_end).min(range.end);
-                                let kw_end = if source[kw..range.end]
-                                    .get(..4)
-                                    .is_some_and(|s| s.eq_ignore_ascii_case("plus"))
-                                {
-                                    kw + 4
-                                } else if source[kw..range.end]
-                                    .get(..5)
-                                    .is_some_and(|s| s.eq_ignore_ascii_case("minus"))
-                                {
-                                    kw + 5
-                                } else {
-                                    break;
-                                };
-                                dim_end = skip_tex_dimen(source, kw_end, range.end)?;
+                            let kw = super::skip_source_space(source, dim_end).min(range.end);
+                            if source[kw..range.end]
+                                .get(..4)
+                                .is_some_and(|s| s.eq_ignore_ascii_case("plus"))
+                            {
+                                dim_end = skip_tex_dimen(source, kw + 4, range.end)?;
+                            }
+                            let kw = super::skip_source_space(source, dim_end).min(range.end);
+                            if source[kw..range.end]
+                                .get(..5)
+                                .is_some_and(|s| s.eq_ignore_ascii_case("minus"))
+                            {
+                                dim_end = skip_tex_dimen(source, kw + 5, range.end)?;
                             }
                         }
                         i = dim_end;
@@ -1788,11 +1843,15 @@ pub(super) fn source_location_with_context(
             for binding in &bindings {
                 let mut local_macros = macros.clone();
                 for &(var, val) in binding {
+                    if macros.contains_key(var) {
+                        return None;
+                    }
                     local_macros.insert(
                         var,
                         Some(MacroDef {
                             arity: 0,
                             body: Some(val),
+                            used_params: 0,
                         }),
                     );
                 }
@@ -1955,6 +2014,7 @@ pub(super) fn source_location_with_context(
             }
         }
     }
+    let incomplete_macros = macros.contains_key("**");
     let mathematical = best
         .filter(|((score, ..), location)| {
             let has_unknown = if within_frame || location.0 != line {
@@ -1962,7 +2022,9 @@ pub(super) fn source_location_with_context(
             } else {
                 line_unknown
             };
-            !tied && (!has_unknown || word.len() > 1 || *score > 0)
+            !tied
+                && !(incomplete_macros && has_unknown)
+                && (!has_unknown || word.len() > 1 || *score > 0)
         })
         .map(|(_, location)| location);
     let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
