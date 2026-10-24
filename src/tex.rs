@@ -351,7 +351,7 @@ pub(crate) struct ForeachLoop<'a> {
     pub items: Option<Vec<Vec<String>>>,
 }
 
-fn split_top_level<'a>(text: &'a str, sep: u8) -> Vec<&'a str> {
+fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
     if text.trim().is_empty() {
         return Vec::new();
     }
