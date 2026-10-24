@@ -10,7 +10,7 @@ pub(super) struct MacroDef<'a> {
     pub(super) body: Option<&'a str>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Atom {
     value: char,
     span: Range<usize>,
@@ -1328,7 +1328,7 @@ fn atoms_with_macros<'a>(
                 if source[after1..range.end].starts_with(['_', '^'])
                     && !source[after1..range.end].starts_with("^^")
                 {
-                    append(&mut result, '\0', emit_span(start..i));
+                    append(&mut result, '\x01', emit_span(start..i));
                     let sub = atoms_with_macros(
                         source,
                         arg1,
@@ -1344,7 +1344,7 @@ fn atoms_with_macros<'a>(
                         && source[i..range.end].starts_with(['_', '^'])
                         && !source[i..range.end].starts_with("^^")
                     {
-                        append(&mut result, '\0', emit_span(i..i + 1));
+                        append(&mut result, '\x02', emit_span(i..i + 1));
                         let Some((arg_next, end_next)) = script_arg(i + 1) else {
                             *has_unknown = true;
                             i += 1;
@@ -1362,7 +1362,7 @@ fn atoms_with_macros<'a>(
                         result.extend(sub);
                         i = super::skip_source_space(source, end_next).min(range.end);
                     }
-                    append(&mut result, '\0', emit_span(start..i));
+                    append(&mut result, '\x03', emit_span(start..i));
                 }
             }
             '\\' => {
@@ -1733,6 +1733,105 @@ fn private_use(c: char) -> bool {
     matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
 }
 
+/// Collapse multi-glyph composite TeX symbols whose participating PDF pieces
+/// (`\u{20d2}` prefix negation, `\u{0338}` negation overlay, `\mapstochar`
+/// `\u{237f}`, `\mapsfromchar` `\u{23ae}`, `\lhook` `\u{297c}`, `\rhook`
+/// `\u{297d}`, `\dasharrow` shaft `\u{23af}`, stacked harpoons `\u{296a}`/`\u{296b}`)
+/// are dedicated non-symbol connector pieces that never occur as standalone math symbols.
+fn collapse_pdf_composites(atoms: &mut Vec<Atom>) {
+    let negated = |c: char| match c {
+        '=' => Some('≠'),
+        '∈' => Some('∉'),
+        '∋' => Some('∌'),
+        '∃' => Some('∄'),
+        '≡' => Some('≢'),
+        '<' => Some('≮'),
+        '>' => Some('≯'),
+        '≤' | '≦' => Some('≰'),
+        '≥' | '≧' => Some('≱'),
+        '≺' => Some('⊀'),
+        '≻' => Some('⊁'),
+        '⪯' => Some('⋠'),
+        '⪰' => Some('⋡'),
+        '⊂' => Some('⊄'),
+        '⊃' => Some('⊅'),
+        '⊆' | '⫅' => Some('⊈'),
+        '⊇' | '⫆' => Some('⊉'),
+        '⊑' => Some('⋢'),
+        '⊒' => Some('⋣'),
+        '~' | '∼' => Some('≁'),
+        '≃' => Some('≄'),
+        '≈' => Some('≉'),
+        '≅' => Some('≇'),
+        '≍' => Some('≭'),
+        '⊢' => Some('⊬'),
+        '⊨' => Some('⊭'),
+        '⊩' => Some('⊮'),
+        '⊪' => Some('⊯'),
+        '◁' | '⊲' => Some('⋪'),
+        '▷' | '⊳' => Some('⋫'),
+        '⊴' => Some('⋬'),
+        '⊵' => Some('⋭'),
+        '|' => Some('∤'),
+        '‖' => Some('∦'),
+        '←' => Some('↚'),
+        '→' => Some('↛'),
+        '↔' => Some('↮'),
+        '⇐' => Some('⇍'),
+        '⇒' => Some('⇏'),
+        '⇔' => Some('⇎'),
+        _ => None,
+    };
+    let mut i = 0;
+    while i + 1 < atoms.len() {
+        if atoms[i].span.end != atoms[i + 1].span.start {
+            i += 1;
+            continue;
+        }
+        if i + 2 < atoms.len() && atoms[i + 1].span.end == atoms[i + 2].span.start {
+            let triple = match (atoms[i].value, atoms[i + 1].value, atoms[i + 2].value) {
+                ('⍿', '-', '→') => Some('⟼'),
+                ('⍿', '=', '⇒') => Some('⟾'),
+                ('←', '-', '⎮') => Some('⟻'),
+                ('⇐', '=', '⎮') => Some('⟽'),
+                ('⎯', '⎯', '⇢') => Some('⇢'),
+                ('⇠', '⎯', '⎯') => Some('⇠'),
+                _ => None,
+            };
+            if let Some(value) = triple {
+                let end = atoms[i + 2].span.end;
+                atoms[i].value = value;
+                atoms[i].span.end = end;
+                atoms[i].word_join = false;
+                atoms.drain(i + 1..=i + 2);
+                continue;
+            }
+        }
+        let pair = match (atoms[i].value, atoms[i + 1].value) {
+            ('\u{20d2}', c) | (c, '\u{0338}') => negated(c),
+            ('⍿', '→') => Some('↦'),
+            ('⍿', '⇒') => Some('⤇'),
+            ('←', '⎮') | ('⎮', '←') => Some('↤'),
+            ('⇐', '⎮') | ('⎮', '⇐') => Some('⤆'),
+            ('⎯', '⇢') => Some('⇢'),
+            ('⇠', '⎯') => Some('⇠'),
+            ('⥼', '→') => Some('↪'),
+            ('←', '⥽') => Some('↩'),
+            ('⥪', '⥫') | ('⥫', '⥪') => Some('⇌'),
+            _ => None,
+        };
+        if let Some(value) = pair {
+            let end = atoms[i + 1].span.end;
+            atoms[i].value = value;
+            atoms[i].span.end = end;
+            atoms[i].word_join = false;
+            atoms.remove(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 pub(super) fn source_location(
     source: &str,
@@ -1789,10 +1888,11 @@ pub(super) fn source_location_with_context(
             .is_some_and(|prev: &Atom| prev.value.is_alphanumeric() && prev.span.end == i);
         append_joined(&mut pdf, c, i..i + c.len_utf8(), join);
     }
+    collapse_pdf_composites(&mut pdf);
     let Some(selected) = pdf.iter().position(|atom| atom.span.contains(&offset)) else {
         return prose.map(|(row, byte, _)| (row, byte));
     };
-    if pdf[selected].value == '\0' || private_use(pdf[selected].value) {
+    if matches!(pdf[selected].value, '\0'..='\x03') || private_use(pdf[selected].value) {
         return None;
     }
     // A letter inside an ordinary PDF word must match that entire word, not a
@@ -1875,7 +1975,10 @@ pub(super) fn source_location_with_context(
         for atoms in passes {
             let atoms = inline_context(source, &range, atoms);
             for (index, atom) in atoms.iter().enumerate() {
-                if !range.contains(&atom.span.start) || atom.value != pdf[selected].value {
+                if !range.contains(&atom.span.start)
+                    || matches!(atom.value, '\0'..='\x03')
+                    || atom.value != pdf[selected].value
+                {
                     continue;
                 }
                 let row = starts.partition_point(|start| *start <= atom.span.start);
@@ -1907,9 +2010,6 @@ pub(super) fn source_location_with_context(
                 }
                 // Stop at the first mismatch and at this expression's boundary.
                 // Context from a different formula must not break an ambiguity tie.
-                let mut score = 0;
-                let mut lexical_score = 0;
-                let mut contradictions = 0usize;
                 let joined = |slice: &[Atom], prev: usize, direction: isize| {
                     if direction < 0 {
                         slice[prev].word_join
@@ -1917,70 +2017,143 @@ pub(super) fn source_location_with_context(
                         slice.get(prev + 1).is_some_and(|next| next.word_join)
                     }
                 };
-                for direction in [-1isize, 1] {
-                    let source_edge = if direction < 0 {
-                        begin
-                    } else {
-                        begin + word.len() - 1
-                    };
-                    let pdf_edge = if direction < 0 {
-                        word.start
-                    } else {
-                        word.end - 1
-                    };
-                    let mut committed = (score, lexical_score);
-                    let mut word_start = 1;
-                    for distance in 1..=8 {
-                        let delta = direction * distance;
-                        let in_word = if distance > 1 {
-                            let prev_src = source_edge
-                                .checked_add_signed(direction * (distance - 1))
-                                .unwrap();
-                            let prev_pdf = pdf_edge
-                                .checked_add_signed(direction * (distance - 1))
-                                .unwrap();
-                            let join_a = joined(&atoms, prev_src, direction);
-                            let join_b = joined(&pdf, prev_pdf, direction);
-                            if !join_a && !join_b {
-                                committed = (score, lexical_score);
-                                word_start = distance;
-                            }
-                            join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                let score_with = |atoms: &[Atom], begin: usize| {
+                    let mut score = 0;
+                    let mut lexical_score = 0;
+                    let mut contradictions = 0usize;
+                    for direction in [-1isize, 1] {
+                        let source_edge = if direction < 0 {
+                            begin
                         } else {
-                            false
+                            begin + word.len() - 1
                         };
-                        match (
-                            source_edge
-                                .checked_add_signed(delta)
-                                .and_then(|i| atoms.get(i)),
-                            pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
-                        ) {
-                            (Some(a), Some(b))
-                                if a.value == b.value
-                                    && (!in_word
-                                        || joined(
-                                            &pdf,
-                                            pdf_edge
-                                                .checked_add_signed(direction * (distance - 1))
-                                                .unwrap(),
-                                            direction,
-                                        )) =>
-                            {
-                                score += 9 - distance;
-                                lexical_score += usize::from(a.value.is_alphanumeric());
-                            }
-                            (Some(a), Some(_)) if a.value != '\0' && distance == 1 => {
-                                contradictions += 1;
-                                break;
-                            }
-                            _ => {
-                                if in_word {
-                                    (score, lexical_score) = committed;
-                                    if word_start == 1 {
-                                        contradictions += 1;
-                                    }
+                        let pdf_edge = if direction < 0 {
+                            word.start
+                        } else {
+                            word.end - 1
+                        };
+                        let mut committed = (score, lexical_score);
+                        let mut word_start = 1;
+                        for distance in 1..=8 {
+                            let delta = direction * distance;
+                            let in_word = if distance > 1 {
+                                let prev_src = source_edge
+                                    .checked_add_signed(direction * (distance - 1))
+                                    .unwrap();
+                                let prev_pdf = pdf_edge
+                                    .checked_add_signed(direction * (distance - 1))
+                                    .unwrap();
+                                let join_a = joined(atoms, prev_src, direction);
+                                let join_b = joined(&pdf, prev_pdf, direction);
+                                if !join_a && !join_b {
+                                    committed = (score, lexical_score);
+                                    word_start = distance;
                                 }
-                                break;
+                                join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                            } else {
+                                false
+                            };
+                            match (
+                                source_edge
+                                    .checked_add_signed(delta)
+                                    .and_then(|i| atoms.get(i)),
+                                pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
+                            ) {
+                                (Some(a), Some(b))
+                                    if !matches!(a.value, '\0'..='\x03')
+                                        && a.value == b.value
+                                        && (!in_word
+                                            || joined(
+                                                &pdf,
+                                                pdf_edge
+                                                    .checked_add_signed(direction * (distance - 1))
+                                                    .unwrap(),
+                                                direction,
+                                            )) =>
+                                {
+                                    score += 9 - distance;
+                                    lexical_score += usize::from(a.value.is_alphanumeric());
+                                }
+                                (Some(a), Some(_))
+                                    if !matches!(a.value, '\0'..='\x03') && distance == 1 =>
+                                {
+                                    contradictions += 1;
+                                    break;
+                                }
+                                _ => {
+                                    if in_word {
+                                        (score, lexical_score) = committed;
+                                        if word_start == 1 {
+                                            contradictions += 1;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    (score, lexical_score, contradictions)
+                };
+                let (mut score, mut lexical_score, mut contradictions) = score_with(&atoms, begin);
+                if !pdf[selected].value.is_alphanumeric()
+                    && atoms
+                        .get(begin + word.len())
+                        .is_some_and(|a| a.value == '\x01')
+                {
+                    let end_op = begin + word.len();
+                    let mut depth = 1usize;
+                    let mut sep = None;
+                    let mut multi_sep = false;
+                    let mut close = None;
+                    for (idx, a) in atoms.iter().enumerate().skip(end_op + 1) {
+                        match a.value {
+                            '\x01' => depth += 1,
+                            '\x02' if depth == 1 => {
+                                multi_sep |= sep.is_some();
+                                sep = Some(idx);
+                            }
+                            '\x03' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(idx);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let (false, Some(z2), Some(z3)) = (multi_sep, sep, close) {
+                        let (before, op, s1, s2, after) = (
+                            &atoms[..begin],
+                            &atoms[begin..end_op],
+                            &atoms[end_op + 1..z2],
+                            &atoms[z2 + 1..z3],
+                            &atoms[z3 + 1..],
+                        );
+                        for (left, right) in [
+                            ([before, &[][..]], [s1, s2, after]),
+                            ([before, &[][..]], [s2, s1, after]),
+                            ([before, s1], [&[][..], s2, after]),
+                            ([before, s2], [&[][..], s1, after]),
+                        ] {
+                            let candidate_begin = left[0].len() + left[1].len();
+                            let seq: Vec<Atom> = left
+                                .into_iter()
+                                .chain([op])
+                                .chain(right)
+                                .flatten()
+                                .cloned()
+                                .collect();
+                            let (s, l, c) = score_with(&seq, candidate_begin);
+                            if (s, l > 0, std::cmp::Reverse(c), l)
+                                > (
+                                    score,
+                                    lexical_score > 0,
+                                    std::cmp::Reverse(contradictions),
+                                    lexical_score,
+                                )
+                            {
+                                (score, lexical_score, contradictions) = (s, l, c);
                             }
                         }
                     }
@@ -2508,6 +2681,324 @@ caption}";
         assert_eq!(
             source_location(not_ll, 3, 0..3, true, "prose", 0, Some((1, 6, 5))),
             Some((1, 6))
+        );
+    }
+
+    #[test]
+    fn big_operators_with_simultaneous_limits_resolve_in_inline_and_display_orders() {
+        let display =
+            "\\[\n  A = \\bigoplus_{i=1}^n U_i\n\\]\n\\[\n  B = \\bigoplus_{k=1}^m V_k\n\\]";
+        let visual_ctx = "A = ⊕n\r\ni=1 Ui B = ⊕m\r\nk=1 Vk";
+        let first_op = visual_ctx.find('⊕').unwrap();
+        let second_op = visual_ctx.rfind('⊕').unwrap();
+        assert_eq!(
+            source_location(display, 2, 0..6, true, visual_ctx, first_op, None),
+            Some((2, 6))
+        );
+        assert_eq!(
+            source_location(display, 5, 0..6, true, visual_ctx, second_op, None),
+            Some((5, 6))
+        );
+
+        let stream_ctx = "A = n ⊕ i=1 Ui B = m ⊕ k=1 Vk";
+        assert_eq!(
+            source_location(
+                display,
+                2,
+                0..6,
+                true,
+                stream_ctx,
+                stream_ctx.find('⊕').unwrap(),
+                None
+            ),
+            Some((2, 6))
+        );
+        assert_eq!(
+            source_location(
+                display,
+                5,
+                0..6,
+                true,
+                stream_ctx,
+                stream_ctx.rfind('⊕').unwrap(),
+                None
+            ),
+            Some((5, 6))
+        );
+
+        let inline = "Consider $\\bigoplus_{i=1}^n V_i$ and $\\bigoplus$.";
+        let inline_ctx = "Consider ⊕n\r\ni=1 Vi and ⊕.";
+        assert_eq!(
+            source_location(
+                inline,
+                1,
+                0..1,
+                false,
+                inline_ctx,
+                inline_ctx.find('⊕').unwrap(),
+                None
+            ),
+            Some((1, 10))
+        );
+        assert_eq!(
+            source_location(
+                inline,
+                1,
+                0..1,
+                false,
+                inline_ctx,
+                inline_ctx.rfind('⊕').unwrap(),
+                None
+            ),
+            Some((1, 38))
+        );
+
+        let nested = "\\[\n  A = \\bigoplus_{i=1}^{n_j^k} U_i\n\\]\n\\[\n  B = \\bigoplus_{i=1}^{m_j^k} V_i\n\\]";
+        let nested_ctx = "A = ⊕njk i=1 Ui B = ⊕mjk i=1 Vi";
+        assert_eq!(
+            source_location(
+                nested,
+                5,
+                0..6,
+                true,
+                nested_ctx,
+                nested_ctx.rfind('⊕').unwrap(),
+                None
+            ),
+            Some((5, 6))
+        );
+
+        let refs = "\\[\n  \\bigoplus\\ref{a}x\\ref{b}y\\ref{c}z\n\\]\n\\[\n  \\bigoplus x y\n\\]";
+        let refs_ctx = "⊕1x2y3z ⊕xy";
+        assert_eq!(
+            source_location(
+                refs,
+                5,
+                0..6,
+                true,
+                refs_ctx,
+                refs_ctx.rfind('⊕').unwrap(),
+                None
+            ),
+            Some((5, 2))
+        );
+
+        let isolated = "\\[\\bigoplus\\]\n\\ensuremath{\\oplus}";
+        let isolated_ctx = "⊕ ⊕";
+        assert_eq!(
+            source_location(
+                isolated,
+                2,
+                0..2,
+                true,
+                isolated_ctx,
+                isolated_ctx.rfind('⊕').unwrap(),
+                None
+            ),
+            None
+        );
+
+        let composites = "\\[\n  A \\mapsto B \\longmapsto C \\hookleftarrow D \\hookrightarrow E \\dashrightarrow F \\dashleftarrow G \\rightleftharpoons H \\notin I \\nleqslant J\n\\]\n\\[\n  X \\mapsto Y \\longmapsto Z \\hookleftarrow W \\hookrightarrow K \\dashrightarrow U \\dashleftarrow V \\rightleftharpoons T \\notin S \\nleqslant R\n\\]";
+        let composites_ctx = "A \u{237f}\u{2192} B \u{237f}-\u{2192} C \u{2190}\u{297d} D \u{297c}\u{2192} E \u{23af}\u{23af}\u{21e2} F \u{21e0}\u{23af}\u{23af} G \u{296a}\u{296b} H \u{20d2}\u{220a} I \u{2a7d}\u{0338} J X \u{237f}\u{2192} Y \u{237f}-\u{2192} Z \u{2190}\u{297d} W \u{297c}\u{2192} K \u{23af}\u{23af}\u{21e2} U \u{21e0}\u{23af}\u{23af} V \u{296a}\u{296b} T \u{2208}\u{0338} S \u{2264}\u{0338} R";
+        for (needle, col) in [
+            ("\u{237f}\u{2192} Y", 4),
+            ("\u{237f}-\u{2192} Z", 14),
+            ("\u{2190}\u{297d} W", 28),
+            ("\u{297c}\u{2192} K", 45),
+            ("\u{23af}\u{23af}\u{21e2} U", 63),
+            ("\u{21e0}\u{23af}\u{23af} V", 81),
+            ("\u{23af} V", 81),
+            ("\u{296a}\u{296b} T", 98),
+            ("\u{2208}\u{0338} S", 119),
+            ("\u{2264}\u{0338} R", 128),
+        ] {
+            let offset = composites_ctx.find(needle).unwrap();
+            assert_eq!(
+                source_location(composites, 5, 0..6, true, composites_ctx, offset, None),
+                Some((5, col)),
+                "failed for {needle}"
+            );
+        }
+
+        let non_collapsing = "\\[\n  f \\mapsto \\rightarrow g \\quad \\rightharpoonup\\leftharpoondown \\quad a = \\not= b \\quad x \\notin \\notin y\n\\]";
+        let non_collapsing_ctx = "f\u{237f}\u{2192}\u{2192}g \u{21c0}\u{21bd} a=\u{20d2}=b x\u{2208}\u{0338}\u{2208}\u{0338}y";
+        assert_eq!(
+            source_location(
+                non_collapsing,
+                2,
+                0..3,
+                true,
+                non_collapsing_ctx,
+                non_collapsing_ctx.rfind('\u{2192}').unwrap(),
+                None
+            ),
+            Some((2, 12))
+        );
+        assert_eq!(
+            source_location(
+                non_collapsing,
+                2,
+                0..3,
+                true,
+                non_collapsing_ctx,
+                non_collapsing_ctx.find('\u{21bd}').unwrap(),
+                None
+            ),
+            Some((2, 47))
+        );
+        assert_eq!(
+            source_location(
+                non_collapsing,
+                2,
+                0..3,
+                true,
+                non_collapsing_ctx,
+                non_collapsing_ctx.find('=').unwrap(),
+                None
+            ),
+            Some((2, 72))
+        );
+        assert_eq!(
+            source_location(
+                non_collapsing,
+                2,
+                0..3,
+                true,
+                non_collapsing_ctx,
+                non_collapsing_ctx.rfind('\u{2208}').unwrap(),
+                None
+            ),
+            Some((2, 97))
+        );
+
+        let stmary = "\\[\n  \\llbracket x \\rrbracket \\sslash y \\interleave z \\trianglelefteqslant w\n\\]\n\\[\n  \\llbracket a \\rrbracket \\sslash b \\interleave c \\trianglelefteqslant d\n\\]";
+        let stmary_ctx = "⟦x⟧ ⫽ y ⫴ z ⊴ w ⟦a⟧ ⫽ b ⫴ c ⊴ d";
+        assert_eq!(
+            source_location(
+                stmary,
+                5,
+                0..6,
+                true,
+                stmary_ctx,
+                stmary_ctx.rfind('⫴').unwrap(),
+                None
+            ),
+            Some((5, 36))
+        );
+
+        let variants = "\\[\n  \\vartheta + 7 + \\lgroup x \\rgroup + a = b + \\not\\rightarrow c + u \\coloneqq v + p \\bbslash q \\setminus r + m \\Mapsto n \\Longmapsto k\n\\]";
+        let variants_ctx = "\u{1D6DD} + \u{1D7DF} + ⟮x⦘ + a\u{0338}=b + \u{20d2}→ c + u ≔ v + p ⧵ q \\ r + m \u{237f}⇒ n \u{237f}=⇒ k";
+        assert_eq!(
+            source_location(variants, 2, 0..3, true, variants_ctx, 0, None),
+            Some((2, 2))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find('\u{1D7DF}').unwrap(),
+                None
+            ),
+            Some((2, 14))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find('⦘').unwrap(),
+                None
+            ),
+            Some((2, 28))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find('=').unwrap(),
+                None
+            ),
+            Some((2, 40))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find("→ c").unwrap(),
+                None
+            ),
+            Some((2, 46))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find('≔').unwrap(),
+                None
+            ),
+            Some((2, 68))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find('⧵').unwrap(),
+                None
+            ),
+            Some((2, 84))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find("\\ r").unwrap(),
+                None
+            ),
+            Some((2, 95))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find("\u{237f}⇒ n").unwrap(),
+                None
+            ),
+            Some((2, 111))
+        );
+        assert_eq!(
+            source_location(
+                variants,
+                2,
+                0..3,
+                true,
+                variants_ctx,
+                variants_ctx.find("\u{237f}=⇒ k").unwrap(),
+                None
+            ),
+            Some((2, 121))
         );
     }
 }
