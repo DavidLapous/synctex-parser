@@ -291,7 +291,7 @@ impl ForwardWord {
         let words: Vec<_> = words(text)
             .into_iter()
             .filter(|(start, _)| {
-                (*start == 0 || !text[..*start].ends_with('\\'))
+                !tex::has_unescaped_backslash_before(text, *start)
                     && !hidden.iter().any(|range| range.contains(start))
             })
             .collect();
@@ -552,7 +552,7 @@ pub fn resolve_forward_with_selector(
     };
     // Root identity is compiler metadata, never a basename or a live-source
     // guess. A published root cache remains required even for LINE fallback.
-    let (root_source, cached_root) = match &snapshot {
+    let (root_source, cached_root, cached_sidecar) = match &snapshot {
         Some(snapshot) => {
             let root = snapshot.read(&snapshot.main).map_err(|error| {
                 if crate::source_snapshot::required_cache_error(&error) {
@@ -565,11 +565,13 @@ pub fn resolve_forward_with_selector(
                 }
             })?;
             let root_source = snapshot.main == file;
-            (root_source, root_source.then_some(root))
+            (root_source, root_source.then_some(root), None)
         }
         None => {
-            let inputs =
-                crate::source_snapshot::SourceInfo::read_in(&pdf, context.build_directory)?;
+            let (inputs, sidecar) = crate::source_snapshot::SourceInfo::read_with_sidecar_in(
+                &pdf,
+                context.build_directory,
+            )?;
             let main = inputs
                 .main
                 .as_ref()
@@ -582,7 +584,7 @@ pub fn resolve_forward_with_selector(
                 ));
             }
             document_revision = Some(inputs.revision);
-            (main == &file, None)
+            (main == &file, None, sidecar)
         }
     };
     let mut warning = snapshot
@@ -660,14 +662,28 @@ pub fn resolve_forward_with_selector(
                 .or_else(|| math::math_closing_line(source, line, column))
         })
         .unwrap_or(line);
-    let candidates = forward_candidates_in(
-        &pdf,
-        &file,
-        snapshot.as_ref(),
-        view_line,
-        context.page_hint,
-        context.build_directory,
-    )?;
+    let candidates = match &cached_sidecar {
+        Some((bytes, sidecar_path)) => {
+            crate::parser::forward_candidates_from_reader_with_page_hint_in(
+                io::Cursor::new(bytes),
+                &pdf,
+                &file,
+                snapshot.as_ref(),
+                view_line,
+                true,
+                context.page_hint,
+                sidecar_path.parent(),
+            )?
+        }
+        None => forward_candidates_in(
+            &pdf,
+            &file,
+            snapshot.as_ref(),
+            view_line,
+            context.page_hint,
+            context.build_directory,
+        )?,
+    };
     let line_candidate = |hint: Option<&ForwardWord>| {
         let anchor = best_guess_forward_candidate(&candidates)?;
         match hint {
@@ -1074,6 +1090,7 @@ fn resolve_inverse_targets<'a>(
         structural_map: None,
         geometry_map: None,
         metadata: None,
+        spliced_preamble: None,
     };
     let mut resolutions = Vec::with_capacity(targets.len());
     for target in targets {
@@ -1242,6 +1259,13 @@ fn is_generated_sidecar(path: &Path, pdf: &Path) -> bool {
     path.file_stem() == pdf.file_stem() && crate::source_snapshot::is_compiler_sidecar_input(path)
 }
 
+fn is_generated_or_sidecar_input(path: &Path) -> bool {
+    crate::source_snapshot::is_compiler_sidecar_input(path)
+        || path
+            .to_str()
+            .is_some_and(crate::parser::is_generated_graphics_tex)
+}
+
 struct InverseQuery<'a> {
     pdf: &'a Path,
     point: InversePoint,
@@ -1254,6 +1278,7 @@ struct InverseQuery<'a> {
     structural_map: Option<(PathBuf, Result<Rc<SourceMap>, String>)>,
     geometry_map: Option<Result<Rc<SourceMap>, String>>,
     metadata: Option<Option<MetadataLocation>>,
+    spliced_preamble: Option<Option<Rc<String>>>,
 }
 
 impl InverseQuery<'_> {
@@ -1514,6 +1539,9 @@ impl InverseQuery<'_> {
             *warning = Some(reason);
             return Ok(None);
         }
+        let verbatim_only = Path::new(&target.file)
+            .extension()
+            .is_some_and(|ext| ext == "vrb");
         let source = if generated {
             let Some(source) = self.remap_generated_source(target, source_map, warning)? else {
                 return Ok(None);
@@ -1551,6 +1579,9 @@ impl InverseQuery<'_> {
             *warning = Some(reason.to_owned());
             return Ok(None);
         }
+        if generated && !verbatim_only {
+            return Ok(None);
+        }
         if let Some(column) = raw_column {
             apply_compiler_column(target, text, column);
         }
@@ -1586,7 +1617,12 @@ impl InverseQuery<'_> {
                 if verbatim_only {
                     original_source_from_verbatim(map, &mut self.sources, self.operation)
                 } else {
-                    original_source_from_generated(map, &mut self.sources, self.operation)
+                    original_source_from_generated(
+                        map,
+                        target.line,
+                        &mut self.sources,
+                        self.operation,
+                    )
                 }
             });
         match remapped {
@@ -1604,28 +1640,38 @@ impl InverseQuery<'_> {
                 if self.sources.best_guess
                     && let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok())
                 {
-                    let (original, line) = map
-                        .page_source
-                        .as_ref()
-                        .map(|(path, line)| (path.as_path(), *line))
-                        .unwrap_or((&map.main, 1));
-                    if line == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "SyncTeX original compiler anchor line must be positive",
-                        ));
-                    }
-                    let original = if let Some(snapshot) = self.sources.snapshot {
-                        snapshot.normalize(original)?
+                    let fallback = if verbatim_only {
+                        Some(
+                            map.page_source
+                                .as_ref()
+                                .map(|(path, line)| (path.as_path(), *line))
+                                .unwrap_or((&map.main, 1)),
+                        )
                     } else {
-                        fs::canonicalize(original).unwrap_or_else(|_| original.to_owned())
+                        map.page_source
+                            .as_ref()
+                            .filter(|(path, _)| !is_generated_or_sidecar_input(path))
+                            .map(|(path, line)| (path.as_path(), *line))
                     };
-                    target.file = original
-                        .into_os_string()
-                        .into_string()
-                        .map_err(|_| io::Error::other("source path is not UTF-8"))?;
-                    target.line = line;
-                    self.operation.check()?;
+                    if let Some((original, line)) = fallback {
+                        if line == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "SyncTeX original compiler anchor line must be positive",
+                            ));
+                        }
+                        let original = if let Some(snapshot) = self.sources.snapshot {
+                            snapshot.normalize(original)?
+                        } else {
+                            fs::canonicalize(original).unwrap_or_else(|_| original.to_owned())
+                        };
+                        target.file = original
+                            .into_os_string()
+                            .into_string()
+                            .map_err(|_| io::Error::other("source path is not UTF-8"))?;
+                        target.line = line;
+                        self.operation.check()?;
+                    }
                 }
                 *warning = Some(format!(
                     "line-only navigation: original fragile frame unavailable: {error}"
@@ -1716,17 +1762,25 @@ impl InverseQuery<'_> {
                 .and_then(|result| result.as_ref().ok())
                 .and_then(|map| map.frame_slide);
             let spliced_preamble = if let Some(Ok(map)) = &source_map {
-                macro_preamble_source(
-                    &map.main,
-                    Some(&map.inputs),
-                    self.pdf.parent(),
-                    &mut self.sources,
-                    self.operation,
-                )?
+                match &self.spliced_preamble {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let loaded = macro_preamble_source(
+                            &map.main,
+                            Some(&map.inputs),
+                            self.pdf.parent(),
+                            &mut self.sources,
+                            self.operation,
+                        )?
+                        .map(Rc::new);
+                        self.spliced_preamble = Some(loaded.clone());
+                        loaded
+                    }
+                }
             } else {
                 None
             };
-            let spliced_ref = spliced_preamble.as_deref();
+            let spliced_ref = spliced_preamble.as_deref().map(String::as_str);
             let extra_sources: &[&str] = spliced_ref.as_slice();
             let mut location = if let Some((index, count)) = refine_graphics {
                 source_graphics_location_with_context(
@@ -2023,6 +2077,8 @@ struct SourceMap {
     page_source: Option<(PathBuf, u32)>,
     generated_at_point: bool,
     frame_slide: Option<u32>,
+    generated: PathBuf,
+    adjacent_origins: Vec<(PathBuf, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -2411,7 +2467,7 @@ fn source_map_from_reader_in(
                     "SyncTeX source map repeats the clicked sheet",
                 ));
             }
-            active_sheet = parsed_page.filter(|&p| p <= point.page).map(|p| (p, None));
+            active_sheet = parsed_page.map(|p| (p, None));
         } else if in_page && row.starts_with('}') {
             if row[1..].parse::<u32>() != Ok(point.page) || !stack.is_empty() {
                 return Err(io::Error::other(
@@ -2514,6 +2570,34 @@ fn source_map_from_reader_in(
     if !page_complete || ((geometry_required || input_cwd.is_some()) && !postamble_count) {
         return Err(io::Error::other("SyncTeX source map is incomplete"));
     }
+    let is_vrb = generated.extension().is_some_and(|ext| ext == "vrb");
+    let is_sidecar_tag = |tag: u32| {
+        generated_tags.contains(&tag)
+            || inputs
+                .get(&tag)
+                .is_some_and(|path| is_generated_or_sidecar_input(path))
+    };
+    let adjacent_tags: Vec<(u32, u32)> = match origin {
+        Some((tag, _)) if is_sidecar_tag(tag) && !is_vrb => {
+            let prev = sheet_origins
+                .iter()
+                .rev()
+                .find(|&&(p, (t, _))| p < point.page && !is_sidecar_tag(t))
+                .map(|&(_, orig)| orig);
+            let next = sheet_origins
+                .iter()
+                .find(|&&(p, (t, _))| p > point.page && !is_sidecar_tag(t))
+                .map(|&(_, orig)| orig);
+            match (prev, next) {
+                (Some(p), Some(n)) if n.0 == p.0 => vec![n, p],
+                (Some(p), Some(n)) => vec![p, n],
+                (Some(p), None) => vec![p],
+                (None, Some(n)) => vec![n],
+                (None, None) => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
     let frame_slide = origin
         .and_then(|orig| {
             u32::try_from(
@@ -2525,8 +2609,10 @@ fn source_map_from_reader_in(
             .ok()
         })
         .filter(|&n| n > 0);
-    if !geometry_required {
-        generated_on_page |= page_tags.iter().any(|tag| generated_tags.contains(tag));
+    let build_map = |inputs: std::collections::HashMap<u32, PathBuf>,
+                     generated_on_page: bool,
+                     generated_at_point: bool|
+     -> io::Result<SourceMap> {
         let main = inputs
             .get(&1)
             .cloned()
@@ -2534,13 +2620,27 @@ fn source_map_from_reader_in(
         let page_source = origin
             .filter(|_| generated_on_page)
             .and_then(|(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)));
-        return Ok(SourceMap {
+        let adjacent_origins = if generated_on_page {
+            adjacent_tags
+                .iter()
+                .filter_map(|&(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(SourceMap {
             main,
             inputs: inputs.into_values().collect(),
             page_source,
-            generated_at_point: false,
+            generated_at_point,
             frame_slide,
-        });
+            generated: generated.to_path_buf(),
+            adjacent_origins,
+        })
+    };
+    if !geometry_required {
+        generated_on_page |= page_tags.iter().any(|tag| generated_tags.contains(tag));
+        return build_map(inputs, generated_on_page, false);
     }
     // With form recording disabled, TeX still emits sheet references whose
     // definitions are absent. The native SyncTeX parser removes those refs:
@@ -2589,26 +2689,13 @@ fn source_map_from_reader_in(
             "SyncTeX effective transform is not finite",
         ));
     }
-    let main = inputs
-        .get(&1)
-        .cloned()
-        .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
-    let page_source = origin
-        .filter(|_| generated_on_page)
-        .and_then(|(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)));
     let generated_at_point = generated_box_at_point(
         &boxes,
         (f64::from(point.x) - x_offset) / visible_unit,
         (f64::from(point.y_from_top) - y_offset) / visible_unit,
         operation,
     )?;
-    Ok(SourceMap {
-        main,
-        inputs: inputs.into_values().collect(),
-        page_source,
-        generated_at_point,
-        frame_slide,
-    })
+    build_map(inputs, generated_on_page, generated_at_point)
 }
 
 /// Beamer reopens the same .vrb for successive fragile frames. The clicked
@@ -2619,31 +2706,74 @@ fn original_source_from_verbatim(
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<(String, Rc<String>, u32)> {
-    let (file, source, line) = original_source_from_generated(map, sources, operation)?;
-    fragile_frame_range(&source, line)
-        .filter(|frame| line == frame.end as u32)
-        .ok_or_else(|| {
-            io::Error::other("clicked sheet does not identify a fragile frame's closing line")
-        })?;
-    Ok((file, source, line))
-}
-
-fn original_source_from_generated(
-    map: &SourceMap,
-    sources: &mut QuerySources<'_>,
-    operation: &Operation,
-) -> io::Result<(String, Rc<String>, u32)> {
     let (original, line) = map.page_source.as_ref().ok_or_else(|| {
         io::Error::other("clicked sheet has no original generated-file provenance")
     })?;
+    if is_generated_or_sidecar_input(original) {
+        return Err(io::Error::other(
+            "clicked sheet does not identify a fragile frame's closing line",
+        ));
+    }
     let original = sources.normalize(original)?;
     let source = sources.read(&original, operation)?;
     validate_inverse_source_line(&source, *line, &original)?;
+    fragile_frame_range(&source, *line)
+        .filter(|frame| *line == frame.end as u32)
+        .ok_or_else(|| {
+            io::Error::other("clicked sheet does not identify a fragile frame's closing line")
+        })?;
     let file = original
         .to_str()
         .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
         .to_owned();
     Ok((file, source, *line))
+}
+
+fn original_source_from_generated(
+    map: &SourceMap,
+    raw_line: u32,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<(String, Rc<String>, u32)> {
+    let generated_norm = sources
+        .normalize(&map.generated)
+        .unwrap_or_else(|_| map.generated.clone());
+    let main_dir = sources
+        .normalize(&map.main)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| map.main.parent().map(Path::to_path_buf));
+    for (candidate, line) in &map.adjacent_origins {
+        if is_generated_or_sidecar_input(candidate) {
+            continue;
+        }
+        let original = sources.normalize(candidate)?;
+        let source = sources.read(&original, operation)?;
+        validate_inverse_source_line(&source, *line, &original)?;
+        if host_owns_generated_sidecar(&source, &original, &generated_norm, main_dir.as_deref()) {
+            let file = original
+                .to_str()
+                .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
+                .to_owned();
+            return Ok((file, source, *line));
+        }
+    }
+    let (original, page_line) = map.page_source.as_ref().ok_or_else(|| {
+        io::Error::other("clicked sheet has no original generated-file provenance")
+    })?;
+    let (target_path, line) = if is_generated_or_sidecar_input(original) {
+        (&map.generated, raw_line)
+    } else {
+        (original, *page_line)
+    };
+    let original = sources.normalize(target_path)?;
+    let source = sources.read(&original, operation)?;
+    validate_inverse_source_line(&source, line, &original)?;
+    let file = original
+        .to_str()
+        .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
+        .to_owned();
+    Ok((file, source, line))
 }
 
 fn fragile_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {

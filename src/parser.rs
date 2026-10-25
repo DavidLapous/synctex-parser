@@ -93,38 +93,35 @@ impl ForwardNode {
         }
     }
 
-    fn contain_box(&mut self, bounds: [i64; 4], fix_both_sides: bool) {
+    fn contain_box(&mut self, bounds: [i64; 4]) {
         if self.kind != b'(' {
             return;
         }
         let [min_h, max_h, min_v, max_v] = bounds;
-        let (cur_min_h, cur_max_h) = if self.width_v < 0 {
-            (self.h_v.saturating_add(self.width_v), self.h_v)
-        } else {
-            (self.h_v, self.h_v.saturating_add(self.width_v))
-        };
-        let (new_min_h, new_max_h) = if fix_both_sides {
-            (cur_min_h.min(min_h), cur_max_h.max(max_h))
-        } else if min_h < cur_min_h {
-            (min_h, cur_max_h)
-        } else if max_h > cur_max_h {
-            (cur_min_h, max_h)
-        } else {
-            (cur_min_h, cur_max_h)
-        };
         if self.width_v < 0 {
-            self.h_v = new_max_h;
-            self.width_v = new_min_h.saturating_sub(new_max_h);
+            let mx = self.h_v;
+            let mn = mx.saturating_add(self.width_v);
+            if min_h < mn {
+                self.width_v = min_h.saturating_sub(mx);
+            } else if max_h > mx {
+                self.h_v = max_h;
+                self.width_v = mn.saturating_sub(max_h);
+            }
         } else {
-            self.h_v = new_min_h;
-            self.width_v = new_max_h.saturating_sub(new_min_h);
+            let mn = self.h_v;
+            let mx = mn.saturating_add(self.width_v);
+            if min_h < mn {
+                self.h_v = min_h;
+                self.width_v = mx.saturating_sub(min_h);
+            } else if max_h > mx {
+                self.width_v = max_h.saturating_sub(mn);
+            }
         }
         let mn = self.v_v.saturating_sub(self.height_v);
         let mx = self.v_v.saturating_add(self.depth_v);
         if min_v < mn {
             self.height_v = self.v_v.saturating_sub(min_v);
-        }
-        if (fix_both_sides || min_v >= mn) && max_v > mx {
+        } else if max_v > mx {
             self.depth_v = max_v.saturating_sub(self.v_v);
         }
     }
@@ -183,7 +180,7 @@ fn parse_synctex_int_prefix(text: &str) -> Option<(i64, &str)> {
 
 const MAX_PROXY_DEPTH: usize = MAX_BOX_DEPTH;
 pub(crate) const MAX_BOX_DEPTH: usize = 512;
-const MAX_FORWARD_NODES: usize = 500_000;
+const MAX_FORWARD_NODES: usize = 4_000_000;
 const MAX_SYNCTEX_BYTES: usize = 128 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
@@ -850,7 +847,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         x_stack.pop();
                         flush_x_set(&mut x_stack, &mut friends, &mut nodes, in_form, p_idx);
                         if let Some(np_idx) = next_parent {
-                            nodes[np_idx].contain_box(box_v, fix_cross_file_tags);
+                            nodes[np_idx].contain_box(box_v);
                         }
                         parent = next_parent;
                         last_k = None;
@@ -872,6 +869,7 @@ pub(crate) fn parse_synctex_document_with_options(
                             && kind == b'r'
                             && w == 0
                             && let Some(p_idx) = parent
+                            && nodes[p_idx].width != 0
                             && tag != nodes[p_idx].tag
                         {
                             tag = nodes[p_idx].tag;
@@ -891,7 +889,7 @@ pub(crate) fn parse_synctex_document_with_options(
                             nodes[p_idx].children.push(idx);
                             if kind == b'h' {
                                 let bounds = nodes[idx].data_box();
-                                nodes[p_idx].contain_box(bounds, fix_cross_file_tags);
+                                nodes[p_idx].contain_box(bounds);
                             }
                         }
                         if kind == b'r' && !in_form {
@@ -922,7 +920,7 @@ pub(crate) fn parse_synctex_document_with_options(
                         if let Some(p_idx) = parent {
                             nodes[p_idx].children.push(idx);
                             let bounds = nodes[idx].data_xob();
-                            nodes[p_idx].contain_box(bounds, fix_cross_file_tags);
+                            nodes[p_idx].contain_box(bounds);
                         }
                         if !in_form {
                             make_friend(&mut friends, &nodes, idx);
@@ -1250,7 +1248,7 @@ pub fn forward_candidates_from_reader_with_page_hint(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_candidates_from_reader_with_page_hint_in(
+pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
     reader: impl BufRead,
     pdf: &Path,
     file: &Path,
@@ -1396,9 +1394,9 @@ fn forward_candidates_from_reader_with_page_hint_in(
         let mut line_offset = 1i64;
         for _ in 0..100 {
             if line <= max_l {
-                let bucket_idx =
-                    ((i64::from(tag).saturating_add(line)).unsigned_abs() as usize) % 1024;
                 for exclude_box in [true, false] {
+                    let bucket_idx =
+                        ((i64::from(tag).saturating_add(line)).unsigned_abs() as usize) % 1024;
                     let mut pages: Vec<(u32, Vec<usize>)> = Vec::new();
                     let mut first_page = None::<u32>;
                     for &target in friends[bucket_idx].iter().rev() {
@@ -1428,34 +1426,29 @@ fn forward_candidates_from_reader_with_page_hint_in(
                         for (p_num, page_nodes) in pages {
                             for &n_idx in &page_nodes {
                                 if let Some(p_idx) = nodes[n_idx].parent {
-                                    nodes[p_idx].friend_weight = 0;
+                                    nodes[p_idx].friend_weight = usize::MAX;
                                 }
                             }
                             let mut weighted = Vec::with_capacity(page_nodes.len());
                             for n_idx in page_nodes {
                                 if let Some(p_idx) = nodes[n_idx].parent {
-                                    let has_weight_slot =
-                                        nodes[p_idx].kind == b'(' && nodes[p_idx].target.is_none();
-                                    let cached_w = if has_weight_slot {
-                                        nodes[p_idx].friend_weight
-                                    } else {
-                                        0
-                                    };
-                                    if cached_w == 0 {
-                                        let w = nodes[p_idx]
+                                    let w = if nodes[p_idx].friend_weight == usize::MAX {
+                                        let count = nodes[p_idx]
                                             .children
                                             .iter()
                                             .filter(|&&c| {
                                                 nodes[c].tag == tag && nodes[c].line == line
                                             })
                                             .count();
-                                        if has_weight_slot {
-                                            nodes[p_idx].friend_weight = w;
-                                        }
-                                        weighted.push((w, n_idx));
+                                        let has_weight_slot = nodes[p_idx].kind == b'('
+                                            && nodes[p_idx].target.is_none();
+                                        nodes[p_idx].friend_weight =
+                                            if has_weight_slot { 0 } else { count };
+                                        count
                                     } else {
-                                        weighted.push((0, n_idx));
-                                    }
+                                        nodes[p_idx].friend_weight
+                                    };
+                                    weighted.push((w, n_idx));
                                 } else {
                                     weighted.push((0, n_idx));
                                 }
@@ -1788,9 +1781,14 @@ fn single_hbox_child(nodes: &[ForwardNode], idx: usize, allow_kern: bool) -> Opt
 
 pub(crate) fn is_generated_graphics_tex(path: &str) -> bool {
     let p = path.trim().as_bytes();
-    [b".pdf_tex".as_slice(), b".pdftex_t", b".pstex_t"]
-        .iter()
-        .any(|ext| p.len() >= ext.len() && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext))
+    [
+        b".pdf_tex".as_slice(),
+        b".pdftex_t",
+        b".ps_tex",
+        b".pstex_t",
+    ]
+    .iter()
+    .any(|ext| p.len() >= ext.len() && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext))
 }
 
 fn tag_is_generated_graphics_tex(inputs: &[(u32, String)], tag: u32) -> bool {

@@ -20,6 +20,22 @@ pub(crate) fn source_line_text(text: &str) -> &str {
 /// the closing line: forward search refines against the closing line, inverse
 /// search against the enclosing range.
 fn environment_bounds(source: &str, anchor: usize, environment: &str) -> Option<(usize, usize)> {
+    if !source.contains(environment) {
+        return None;
+    }
+    let hidden = nonprinting_source_ranges(source);
+    environment_bounds_with_hidden(source, anchor, environment, &hidden)
+}
+
+fn environment_bounds_with_hidden(
+    source: &str,
+    anchor: usize,
+    environment: &str,
+    hidden: &[std::ops::Range<usize>],
+) -> Option<(usize, usize)> {
+    if !source.contains(environment) {
+        return None;
+    }
     let mut ignored = Vec::new();
     let mut scan = 0;
     while scan < source.len() {
@@ -49,7 +65,7 @@ fn environment_bounds(source: &str, anchor: usize, environment: &str) -> Option<
             }
         }
     }
-    ignored.extend(nonprinting_source_ranges(source));
+    ignored.extend_from_slice(hidden);
     ignored.sort_unstable_by_key(|range| range.start);
     let mut ignored = ignored.into_iter().peekable();
     let match_env = |text: &str, kind: &str| -> Option<usize> {
@@ -435,17 +451,33 @@ fn tikzpicture_exclusive_bounds(source: &str, anchor: usize, start: usize, end: 
 
 /// Find a `tikzpicture` environment enclosing the one-based SyncTeX line, or
 /// immediately following up to 3 box/layout wrapper lines (`\centering`, `\resizebox`).
+#[cfg(test)]
 pub(crate) fn source_tikzpicture_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
     if !source.contains("tikzpicture") {
         return None;
     }
+    let hidden = nonprinting_source_ranges(source);
+    source_tikzpicture_range_with_hidden(source, line, &hidden)
+}
+
+fn source_tikzpicture_range_with_hidden(
+    source: &str,
+    line: u32,
+    hidden: &[std::ops::Range<usize>],
+) -> Option<std::ops::Range<usize>> {
+    if !source.contains("tikzpicture") {
+        return None;
+    }
     let anchor = line.checked_sub(1)? as usize;
-    if let Some((start, end)) = environment_bounds(source, anchor, "tikzpicture") {
+    if let Some((start, end)) =
+        environment_bounds_with_hidden(source, anchor, "tikzpicture", hidden)
+    {
         return tikzpicture_exclusive_bounds(source, anchor, start, end).then_some(start..end + 1);
     }
     for offset in 1..=3 {
         let probe = anchor + offset;
-        if let Some((start, end)) = environment_bounds(source, probe, "tikzpicture")
+        if let Some((start, end)) =
+            environment_bounds_with_hidden(source, probe, "tikzpicture", hidden)
             && start == probe
             && tikzpicture_exclusive_bounds(source, anchor, start, end)
         {
@@ -978,10 +1010,16 @@ fn tex_accent_char(text: &str, at: usize) -> Option<(char, usize)> {
     None
 }
 
+pub(crate) fn has_unescaped_backslash_before(text: &str, index: usize) -> bool {
+    !text[..index]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\\')
+        .count()
+        .is_multiple_of(2)
+}
+
 fn tex_accent_at(text: &str, index: usize) -> Option<(char, usize)> {
-    if index > 0 && text.as_bytes()[index - 1] == b'\\' {
-        return None;
-    }
     match *text.as_bytes().get(index)? {
         b'\\' => tex_accent_char(text, index),
         b'{' => {
@@ -997,11 +1035,13 @@ fn source_words(text: &str) -> Vec<(usize, usize, String)> {
     let mut start = None;
     let mut word = String::new();
     let mut index = 0;
+    let mut escaped = false;
     while index < text.len() {
-        if let Some((ch, next)) = tex_accent_at(text, index) {
+        if !escaped && let Some((ch, next)) = tex_accent_at(text, index) {
             start.get_or_insert(index);
             word.push(ch);
             index = next;
+            escaped = false;
             continue;
         }
         let ch = text[index..].chars().next().unwrap();
@@ -1018,6 +1058,7 @@ fn source_words(text: &str) -> Vec<(usize, usize, String)> {
             result.push((start, index, normalized_word(&word)));
             word.clear();
         }
+        escaped = ch == '\\' && !escaped;
         index += ch.len_utf8();
     }
     if let Some(start) = start {
@@ -1054,9 +1095,10 @@ pub(crate) fn ordinary_word_source_start(
         return Some(byte);
     }
     if let Some((start, _, word)) = source.lines().nth(line as usize - 1).and_then(|text| {
-        source_words(source_line_text(text))
-            .into_iter()
-            .find(|(start, end, _)| *start <= byte && byte < *end)
+        let visible = source_line_text(text);
+        source_words(visible).into_iter().find(|(start, end, _)| {
+            *start <= byte && byte < *end && !has_unescaped_backslash_before(visible, *start)
+        })
     }) && word == pdf_word
     {
         return Some(start);
@@ -1090,8 +1132,9 @@ pub(crate) fn source_word_location_with_sources(
     radius: u32,
     extra_sources: &[&str],
 ) -> Option<(u32, usize)> {
-    if let Some(tikz) = source_tikzpicture_range(source, line)
-        && let Some(loc) = source_word_location_in_range_with_sources(
+    let hidden = nonprinting_source_ranges(source);
+    if let Some(tikz) = source_tikzpicture_range_with_hidden(source, line, &hidden)
+        && let Some(loc) = source_word_location_in_range_with_hidden(
             source,
             line,
             context,
@@ -1099,20 +1142,28 @@ pub(crate) fn source_word_location_with_sources(
             tikz,
             true,
             extra_sources,
+            &hidden,
         )
     {
         return Some(loc);
     }
+    let anchor = line.checked_sub(1).map(|l| l as usize);
     let scope = math::caption_lines(source, line)
-        .or_else(|| source_frame_range(source, line))
-        .or_else(|| source_tabularx_range(source, line))
+        .or_else(|| {
+            environment_bounds_with_hidden(source, anchor?, "frame", &hidden)
+                .map(|(start, end)| start..end + 1)
+        })
+        .or_else(|| {
+            environment_bounds_with_hidden(source, anchor?, "tabularx", &hidden)
+                .map(|(start, end)| start..end + 1)
+        })
         .or_else(|| math::math_lines(source, line));
     let within_scope = scope.is_some();
     let lines = scope.unwrap_or_else(|| {
         line.saturating_sub(radius.saturating_add(1)) as usize
             ..(line as usize).saturating_add(radius as usize)
     });
-    source_word_location_in_range_with_sources(
+    source_word_location_in_range_with_hidden(
         source,
         line,
         context,
@@ -1120,6 +1171,7 @@ pub(crate) fn source_word_location_with_sources(
         lines,
         within_scope,
         extra_sources,
+        &hidden,
     )
 }
 
@@ -1217,12 +1269,41 @@ pub(crate) fn source_word_location_in_range_with_sources(
     within_scope: bool,
     extra_sources: &[&str],
 ) -> Option<(u32, usize)> {
-    let mut hidden = nonprinting_source_ranges(source);
+    let hidden = nonprinting_source_ranges(source);
+    source_word_location_in_range_with_hidden(
+        source,
+        line,
+        context,
+        offset,
+        lines,
+        within_scope,
+        extra_sources,
+        &hidden,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_word_location_in_range_with_hidden(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    lines: std::ops::Range<usize>,
+    within_scope: bool,
+    extra_sources: &[&str],
+    base_hidden: &[std::ops::Range<usize>],
+) -> Option<(u32, usize)> {
     let discarded = discarded_macro_arg_ranges(source, &lines, extra_sources);
-    if !discarded.is_empty() {
-        hidden.extend(discarded);
-        hidden.sort_by_key(|r| (r.start, r.end));
-    }
+    let mut merged_hidden = Vec::new();
+    let hidden = if discarded.is_empty() {
+        base_hidden
+    } else {
+        merged_hidden.reserve(base_hidden.len() + discarded.len());
+        merged_hidden.extend_from_slice(base_hidden);
+        merged_hidden.extend(discarded);
+        merged_hidden.sort_by_key(|r| (r.start, r.end));
+        &merged_hidden
+    };
     // A closing layout environment can alias every row to one source line.
     // A search radius alone does not identify neighboring prose or math;
     // independently established frame/caption and math scopes remain eligible.
@@ -1247,9 +1328,10 @@ pub(crate) fn source_word_location_in_range_with_sources(
         offset,
         lines.clone(),
         within_scope,
-        &hidden,
+        hidden,
         None,
         &loops,
+        extra_sources,
     );
     math::source_location_with_context(
         source,
@@ -1285,6 +1367,10 @@ fn has_control_word(text: &str, name: &str) -> bool {
     let mut rest = text;
     while let Some(pos) = rest.find('\\') {
         let after_slash = &rest[pos + 1..];
+        if let Some(after_break) = after_slash.strip_prefix('\\') {
+            rest = after_break;
+            continue;
+        }
         if let Some(tail) = after_slash.strip_prefix(name)
             && !tail
                 .as_bytes()
@@ -1439,15 +1525,7 @@ pub(crate) fn frame_header_after_begin(source: &str, frame_start_line: usize) ->
         .map(str::len)
         .sum();
     row.match_indices("\\begin")
-        .filter(|(at, _)| {
-            row[..*at]
-                .bytes()
-                .rev()
-                .take_while(|ch| *ch == b'\\')
-                .count()
-                % 2
-                == 0
-        })
+        .filter(|(at, _)| !has_unescaped_backslash_before(row, *at))
         .find_map(|(at, _)| {
             let (env, end) = math::group(source, row_start + at + "\\begin".len())?;
             (&source[env] == "frame").then_some(end)
@@ -1798,26 +1876,7 @@ pub(crate) fn source_graphics_location_with_context(
                 {
                     return None;
                 }
-                let cmd_start = at - cmd.len();
-                let at_end = if source
-                    .as_bytes()
-                    .get(cmd_start)
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@')
-                {
-                    cmd_start
-                        + source[cmd_start..]
-                            .bytes()
-                            .take_while(|b| b.is_ascii_alphabetic() || *b == b'@')
-                            .count()
-                } else {
-                    at
-                };
-                let full_cmd = &source[cmd_start..at_end];
-                if macros.contains_key(cmd)
-                    || macros.contains_key(full_cmd)
-                    || (full_cmd.len() > 1 && full_cmd.contains('@'))
-                {
-                    at = at_end;
+                if macros.contains_key(cmd) || (cmd.len() > 1 && cmd.contains('@')) {
                     let mut arg_end = at;
                     while let Some(end) = optional_argument_end(source, arg_end)
                         .or_else(|| overlay_argument_end(source, arg_end))
@@ -1831,61 +1890,44 @@ pub(crate) fn source_graphics_location_with_context(
                     {
                         return None;
                     }
-                    for candidate in [full_cmd, cmd] {
-                        if macros.contains_key(candidate) && !safe_macros.contains(&candidate) {
-                            let mut stack = vec![candidate];
-                            let mut seen = Vec::new();
-                            while let Some(name) = stack.pop() {
-                                if safe_macros.contains(&name) || seen.contains(&name) {
-                                    continue;
-                                }
-                                seen.push(name);
-                                let body = macros.get(name).and_then(|e| e.and_then(|d| d.body))?;
-                                if body.contains("include") || body.contains("lrbox") {
+                    if macros.contains_key(cmd) && !safe_macros.contains(&cmd) {
+                        let mut stack = vec![cmd];
+                        let mut seen = Vec::new();
+                        while let Some(name) = stack.pop() {
+                            if safe_macros.contains(&name) || seen.contains(&name) {
+                                continue;
+                            }
+                            seen.push(name);
+                            let body = macros.get(name).and_then(|e| e.and_then(|d| d.body))?;
+                            if body.contains("include") || body.contains("lrbox") {
+                                return None;
+                            }
+                            let mut pos = 0;
+                            while let Some(rel) = body[pos..].find('\\') {
+                                let (sub, next) = math::command(body, pos + rel);
+                                pos = next;
+                                if matches!(
+                                    sub,
+                                    "csname"
+                                        | "savebox"
+                                        | "sbox"
+                                        | "setbox"
+                                        | "usebox"
+                                        | "phantom"
+                                        | "hphantom"
+                                        | "vphantom"
+                                        | "multiput"
+                                        | "foreach"
+                                ) {
                                     return None;
                                 }
-                                let mut pos = 0;
-                                while let Some(rel) = body[pos..].find('\\') {
-                                    let slash = pos + rel;
-                                    let after = slash + 1;
-                                    let (cmd_alpha, next_alpha) = math::command(body, slash);
-                                    let at_len = body[after..]
-                                        .bytes()
-                                        .take_while(|b| b.is_ascii_alphabetic() || *b == b'@')
-                                        .count();
-                                    let (sub, next) = if at_len > 0 {
-                                        (&body[after..after + at_len], after + at_len)
-                                    } else {
-                                        (cmd_alpha, next_alpha)
-                                    };
-                                    pos = next;
-                                    if matches!(
-                                        sub,
-                                        "csname"
-                                            | "savebox"
-                                            | "sbox"
-                                            | "setbox"
-                                            | "usebox"
-                                            | "phantom"
-                                            | "hphantom"
-                                            | "vphantom"
-                                            | "multiput"
-                                            | "foreach"
-                                    ) {
-                                        return None;
-                                    }
-                                    if macros.contains_key(sub)
-                                        || (sub.len() > 1 && sub.contains('@'))
-                                    {
-                                        stack.push(sub);
-                                    }
-                                    if cmd_alpha != sub && macros.contains_key(cmd_alpha) {
-                                        stack.push(cmd_alpha);
-                                    }
+                                if macros.contains_key(sub) || (sub.len() > 1 && sub.contains('@'))
+                                {
+                                    stack.push(sub);
                                 }
                             }
-                            safe_macros.extend(seen);
                         }
+                        safe_macros.extend(seen);
                     }
                 }
             }
@@ -1953,23 +1995,30 @@ pub(crate) fn nonprinting_source_spans(
                 at += 1;
             } else if source.as_bytes()[at] == b'\\' {
                 let start = at;
-                at += 1;
-                let end = at
-                    + source[at..]
-                        .bytes()
-                        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
-                        .count();
-                if end == at {
-                    at += source[at..].chars().next().map_or(0, char::len_utf8);
+                let (command, end) = math::command(source, start);
+                if !command
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                {
+                    at = end;
                     continue;
                 }
-                let command = &source[at..end];
                 if let Some((end, nonprinting)) = math::opaque_command_end(source, command, end) {
                     at = end;
                     if nonprinting {
                         return Some((start, start..end, None));
                     }
                     continue;
+                }
+                if command == "newif" {
+                    at = skip_source_space(source, end);
+                    if let Some((_, grp_end)) = math::group(source, at) {
+                        at = grp_end;
+                    } else if source.as_bytes().get(at) == Some(&b'\\') {
+                        at = math::command(source, at).1;
+                    }
+                    return Some((start, start..at, None));
                 }
                 if matches!(command, "let" | "futurelet") {
                     at = skip_source_space(source, end);
@@ -1992,7 +2041,20 @@ pub(crate) fn nonprinting_source_spans(
                 at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
                 let definition = (math::is_macro_definition_command(command)
                     && !matches!(command, "csname" | "newif"))
-                    || matches!(command, "newenvironment" | "renewenvironment");
+                    || matches!(
+                        command,
+                        "NewExpandableDocumentCommand"
+                            | "RenewExpandableDocumentCommand"
+                            | "ProvideExpandableDocumentCommand"
+                            | "DeclareExpandableDocumentCommand"
+                            | "newenvironment"
+                            | "renewenvironment"
+                            | "provideenvironment"
+                            | "NewDocumentEnvironment"
+                            | "RenewDocumentEnvironment"
+                            | "ProvideDocumentEnvironment"
+                            | "DeclareDocumentEnvironment"
+                    );
                 if definition {
                     if matches!(command, "def" | "gdef" | "edef" | "xdef") {
                         while at < source.len() && source.as_bytes()[at] != b'{' {
@@ -2034,10 +2096,13 @@ pub(crate) fn nonprinting_source_spans(
                         continue;
                     };
                     at = end;
-                    if command.ends_with("environment")
-                        && let Some((_, end)) = math::group(source, skip_source_space(source, at))
-                    {
-                        at = end;
+                    if command.ends_with("environment") || command.ends_with("Environment") {
+                        let end_start = skip_source_space(source, at);
+                        if let Some((_, end)) = math::group(source, end_start) {
+                            at = end;
+                        } else if source.as_bytes().get(end_start) == Some(&b'{') {
+                            at = source.len();
+                        }
                     }
                     return Some((start, start..at, None));
                 } else if let Some((heading, contents, full_end)) =
@@ -2082,6 +2147,7 @@ pub(crate) fn nonprinting_source_spans(
                         | "include"
                         | "bibliography"
                         | "addbibresource"
+                        | "bibitem"
                 ) {
                     while let Some(end) = optional_argument_end(source, at)
                         .or_else(|| overlay_argument_end(source, at))
@@ -2170,7 +2236,258 @@ pub(crate) fn source_prose_scored_location(
         hidden,
         allowed_bytes,
         &[],
+        &[],
     )
+}
+
+fn body_prints_word(
+    body: &str,
+    target_word: &str,
+    macros: &std::collections::BTreeMap<&str, Option<math::MacroDef<'_>>>,
+    depth: u8,
+) -> bool {
+    if body.lines().any(|line| {
+        source_words(source_line_text(line))
+            .into_iter()
+            .any(|(_, _, w)| w == target_word)
+    }) {
+        return true;
+    }
+    if depth >= 8 {
+        return false;
+    }
+    let mut pos = 0usize;
+    while pos < body.len() {
+        match body.as_bytes()[pos] {
+            b'%' => pos += body[pos..].find('\n').unwrap_or(body.len() - pos),
+            b'\\' => {
+                let (cmd, next) = math::command(body, pos);
+                if next > pos + 1
+                    && let Some(def) = macros.get(cmd)
+                    && def
+                        .as_ref()
+                        .and_then(|d| d.body)
+                        .is_none_or(|mbody| body_prints_word(mbody, target_word, macros, depth + 1))
+                {
+                    return true;
+                }
+                pos = next.max(pos + 1);
+            }
+            _ => pos += 1,
+        }
+    }
+    false
+}
+
+fn source_mentions_env(
+    src: &str,
+    skip_range: Option<std::ops::Range<usize>>,
+    env_name: &str,
+) -> bool {
+    if env_name.is_empty() {
+        return false;
+    }
+    let mut line_start = 0usize;
+    for raw_line in src.split_inclusive('\n') {
+        let line = source_line_text(raw_line.trim_end_matches(['\r', '\n']));
+        for (idx, _) in line.match_indices(env_name) {
+            let abs = line_start + idx;
+            if skip_range.as_ref().is_some_and(|r| r.contains(&abs)) {
+                continue;
+            }
+            let before_ok = idx == 0
+                || !line.as_bytes()[idx - 1].is_ascii_alphabetic()
+                || (idx >= 3
+                    && &line.as_bytes()[idx - 3..idx] == b"end"
+                    && (idx == 3 || !line.as_bytes()[idx - 4].is_ascii_alphabetic()));
+            let end_idx = idx + env_name.len();
+            let after_ok = end_idx == line.len() || !line.as_bytes()[end_idx].is_ascii_alphabetic();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        line_start += raw_line.len();
+    }
+    false
+}
+
+fn custom_env_prints_word(
+    source: &str,
+    lines: &std::ops::Range<usize>,
+    hidden: &[std::ops::Range<usize>],
+    extra_sources: &[&str],
+    target_word: &str,
+) -> bool {
+    let start_byte: usize = source
+        .split_inclusive('\n')
+        .take(lines.start)
+        .map(str::len)
+        .sum();
+    let end_byte: usize = start_byte
+        + source[start_byte..]
+            .split_inclusive('\n')
+            .take(lines.end.saturating_sub(lines.start))
+            .map(str::len)
+            .sum::<usize>();
+    let mut invoked: Vec<&str> = Vec::new();
+    let mut h_idx = 0usize;
+    let mut at = start_byte;
+    while at < end_byte {
+        while h_idx < hidden.len() && hidden[h_idx].end <= at {
+            h_idx += 1;
+        }
+        if h_idx < hidden.len() && hidden[h_idx].start <= at {
+            at = hidden[h_idx].end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => at += source[at..end_byte].find('\n').unwrap_or(end_byte - at),
+            b'\\' => {
+                let (cmd, next) = math::command(source, at);
+                if next == at + 1 {
+                    at = next + source[next..].chars().next().map_or(0, char::len_utf8);
+                    continue;
+                }
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, next) {
+                    at = opaque_end;
+                    continue;
+                }
+                if matches!(cmd, "begin" | "end")
+                    && let Some((grp, grp_end)) =
+                        math::group(source, skip_source_space(source, next))
+                {
+                    let env = source[grp].trim();
+                    if !matches!(env, "" | "document" | "frame") && !invoked.contains(&env) {
+                        invoked.push(env);
+                    }
+                    at = grp_end;
+                    continue;
+                }
+                at = next;
+            }
+            _ => {
+                at += source.as_bytes()[at + 1..end_byte]
+                    .iter()
+                    .position(|&b| matches!(b, b'%' | b'\\'))
+                    .map_or(end_byte - at, |pos| pos + 1);
+            }
+        }
+    }
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let macros = math::macros_from_sources(&macro_sources);
+    for &env in &invoked {
+        let end_macro = format!("end{env}");
+        for key in [env, end_macro.as_str()] {
+            if let Some(def) = macros.get(key)
+                && def
+                    .as_ref()
+                    .and_then(|d| d.body)
+                    .is_none_or(|b| body_prints_word(b, target_word, &macros, 0))
+            {
+                return true;
+            }
+        }
+    }
+    for (src_idx, &src) in macro_sources.iter().enumerate() {
+        let mut pos = 0usize;
+        while pos < src.len() {
+            match src.as_bytes()[pos] {
+                b'%' => pos += src[pos..].find('\n').unwrap_or(src.len() - pos),
+                b'\\' => {
+                    let (cmd, next) = math::command(src, pos);
+                    if next == pos + 1 {
+                        pos = next + src[next..].chars().next().map_or(0, char::len_utf8);
+                        continue;
+                    }
+                    if let Some((opaque_end, _)) = math::opaque_command_end(src, cmd, next) {
+                        pos = opaque_end;
+                        continue;
+                    }
+                    if matches!(
+                        cmd,
+                        "newenvironment"
+                            | "renewenvironment"
+                            | "provideenvironment"
+                            | "NewDocumentEnvironment"
+                            | "RenewDocumentEnvironment"
+                            | "ProvideDocumentEnvironment"
+                            | "DeclareDocumentEnvironment"
+                    ) {
+                        let def_start = pos;
+                        let mut cur = next
+                            + usize::from(matches!(src.as_bytes().get(next), Some(b'*' | b'+')));
+                        let Some((env_grp, after_env)) =
+                            math::group(src, skip_source_space(src, cur))
+                        else {
+                            pos = cur;
+                            continue;
+                        };
+                        let env_name = src[env_grp].trim();
+                        cur = after_env;
+                        let mut opt_ranges = Vec::new();
+                        while let Some(opt_end) = optional_argument_end(src, cur) {
+                            let opt_start = skip_source_space(src, cur);
+                            if opt_start < opt_end.saturating_sub(1) {
+                                opt_ranges.push(opt_start + 1..opt_end - 1);
+                            }
+                            cur = opt_end;
+                        }
+                        if cmd.contains("Document") {
+                            let Some((spec_grp, spec_end)) =
+                                math::group(src, skip_source_space(src, cur))
+                            else {
+                                pos = cur;
+                                continue;
+                            };
+                            opt_ranges.push(spec_grp);
+                            cur = spec_end;
+                        }
+                        let Some((begin_body, after_begin)) =
+                            math::group(src, skip_source_space(src, cur))
+                        else {
+                            pos = cur;
+                            continue;
+                        };
+                        let Some((end_body, after_end)) =
+                            math::group(src, skip_source_space(src, after_begin))
+                        else {
+                            pos = after_begin;
+                            continue;
+                        };
+                        let is_used = invoked.contains(&env_name)
+                            || macro_sources.iter().copied().enumerate().any(|(i, s)| {
+                                source_mentions_env(
+                                    s,
+                                    (i == src_idx).then_some(def_start..after_end),
+                                    env_name,
+                                )
+                            });
+                        if is_used
+                            && (opt_ranges
+                                .into_iter()
+                                .any(|r| body_prints_word(&src[r], target_word, &macros, 0))
+                                || body_prints_word(&src[begin_body], target_word, &macros, 0)
+                                || body_prints_word(&src[end_body], target_word, &macros, 0))
+                        {
+                            return true;
+                        }
+                        pos = after_end;
+                        continue;
+                    }
+                    pos = next;
+                }
+                _ => {
+                    pos += src.as_bytes()[pos + 1..]
+                        .iter()
+                        .position(|&b| matches!(b, b'%' | b'\\'))
+                        .map_or(src.len() - pos, |p| p + 1);
+                }
+            }
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2184,6 +2501,7 @@ pub(crate) fn source_prose_scored_location_with_loops(
     hidden: &[std::ops::Range<usize>],
     allowed_bytes: Option<std::ops::Range<usize>>,
     loops: &[ForeachLoop<'_>],
+    extra_sources: &[&str],
 ) -> Option<(u32, usize, isize)> {
     enum ProseToken<'a> {
         Word(u32, usize, String),
@@ -2196,6 +2514,9 @@ pub(crate) fn source_prose_scored_location_with_loops(
     let pdf = words(context);
     let selected = word_index_at(context, &pdf, offset)?;
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized_word(word)).collect();
+    if custom_env_prints_word(source, &lines, hidden, extra_sources, &pdf[selected]) {
+        return None;
+    }
     let frame_header = within_frame
         && source
             .lines()
@@ -2206,8 +2527,8 @@ pub(crate) fn source_prose_scored_location_with_loops(
     let mut has_loop_var = false;
     let mut line_start = 0;
     for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
-        let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
         if index >= lines.start {
+            let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
             for (byte, end, word) in source_words(text) {
                 let abs = line_start + byte;
                 while hidden.peek().is_some_and(|range| range.end <= abs) {
@@ -2221,10 +2542,9 @@ pub(crate) fn source_prose_scored_location_with_loops(
                 {
                     continue;
                 }
-                if byte == 0 || !text[..byte].ends_with('\\') {
+                if !has_unescaped_backslash_before(text, byte) {
                     tokens.push(ProseToken::Word(index as u32 + 1, byte, word));
-                } else if (byte < 2 || text.as_bytes()[byte - 2] != b'\\')
-                    && let raw = &text[byte..end]
+                } else if let raw = &text[byte..end]
                     && loops
                         .iter()
                         .any(|lp| lp.body.contains(&(abs - 1)) && lp.vars.contains(&raw))
@@ -2377,4 +2697,260 @@ pub(crate) fn source_prose_scored_location_with_loops(
     }
     best.filter(|_| !tied)
         .map(|(rank, row, byte)| (row, byte, rank.0))
+}
+
+fn clean_lexical_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+pub(crate) fn host_owns_generated_sidecar(
+    source: &str,
+    host_path: &std::path::Path,
+    generated: &std::path::Path,
+    main_dir: Option<&std::path::Path>,
+) -> bool {
+    let ext = generated.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let generated_clean = clean_lexical_path(generated);
+    let masked = nonprinting_source_ranges(source);
+    let mut masked_idx = 0usize;
+    let mut if_stack: Vec<Option<bool>> = Vec::new();
+    let mut at = 0usize;
+    let skip_arg = |cur: usize| -> Option<usize> {
+        let tok = skip_source_space(source, cur);
+        if tok >= source.len() {
+            return None;
+        }
+        if let Some((_, grp_end)) = math::group(source, tok) {
+            return Some(grp_end);
+        }
+        if source.as_bytes()[tok] == b'\\' {
+            let (_, cmd_end) = math::command(source, tok);
+            return Some(if cmd_end == tok + 1 {
+                cmd_end + source[cmd_end..].chars().next().map_or(0, char::len_utf8)
+            } else {
+                cmd_end
+            });
+        }
+        Some(tok + source[tok..].chars().next()?.len_utf8())
+    };
+    while at < source.len() {
+        while masked_idx < masked.len() && masked[masked_idx].end <= at {
+            masked_idx += 1;
+        }
+        if masked_idx < masked.len() && masked[masked_idx].start <= at {
+            at = masked[masked_idx].end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            }
+            b'=' => {
+                if let Some((_, grp_end)) = math::group(source, skip_source_space(source, at + 1)) {
+                    at = grp_end;
+                } else {
+                    at += 1;
+                }
+            }
+            b'\\' => {
+                let (cmd, next) = math::command(source, at);
+                if next == at + 1 {
+                    at = next + source[next..].chars().next().map_or(0, char::len_utf8);
+                    continue;
+                }
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, next) {
+                    at = opaque_end;
+                    continue;
+                }
+                if matches!(cmd, "gobble" | "@gobble")
+                    && let Some(arg_end) = skip_arg(next)
+                {
+                    at = arg_end;
+                    continue;
+                }
+                if matches!(cmd, "string" | "noexpand" | "meaning") {
+                    let tok = skip_source_space(source, next);
+                    if source.as_bytes().get(tok) == Some(&b'\\') {
+                        let (_, cmd_end) = math::command(source, tok);
+                        at = if cmd_end == tok + 1 {
+                            cmd_end + source[cmd_end..].chars().next().map_or(0, char::len_utf8)
+                        } else {
+                            cmd_end
+                        };
+                        continue;
+                    }
+                }
+                if matches!(
+                    cmd,
+                    "detokenize"
+                        | "unexpanded"
+                        | "typeout"
+                        | "message"
+                        | "errmessage"
+                        | "wlog"
+                        | "pdfescapestring"
+                        | "phantom"
+                        | "hphantom"
+                        | "vphantom"
+                        | "sbox"
+                        | "savebox"
+                ) {
+                    let mut cur = next;
+                    while let Some(opt_end) = optional_argument_end(source, cur) {
+                        cur = opt_end;
+                    }
+                    if let Some((_, grp_end)) = math::group(source, skip_source_space(source, cur))
+                    {
+                        at = grp_end;
+                        continue;
+                    }
+                }
+                let skip_args = if matches!(
+                    cmd,
+                    "@firstoftwo"
+                        | "@secondoftwo"
+                        | "@gobbletwo"
+                        | "IfBooleanT"
+                        | "IfBooleanF"
+                        | "IfValueT"
+                        | "IfValueF"
+                        | "IfNoValueT"
+                        | "IfNoValueF"
+                ) {
+                    2usize
+                } else if matches!(
+                    cmd,
+                    "IfBooleanTF" | "IfNoValueTF" | "IfValueTF" | "@ifnextchar"
+                ) {
+                    3usize
+                } else {
+                    0usize
+                };
+                if skip_args > 0 {
+                    let mut cur = next;
+                    for _ in 0..skip_args {
+                        let Some(arg_end) = skip_arg(cur) else {
+                            break;
+                        };
+                        cur = arg_end;
+                    }
+                    at = cur;
+                    continue;
+                }
+                if cmd.starts_with("toks") || cmd.starts_with("every") {
+                    let mut cur = skip_source_space(source, next);
+                    while source.as_bytes().get(cur).is_some_and(u8::is_ascii_digit) {
+                        cur += 1;
+                    }
+                    cur = skip_source_space(source, cur);
+                    if source.as_bytes().get(cur) == Some(&b'=') {
+                        cur = skip_source_space(source, cur + 1);
+                    }
+                    if let Some((_, grp_end)) = math::group(source, cur) {
+                        at = grp_end;
+                        continue;
+                    }
+                }
+                if cmd == "iffalse" {
+                    if_stack.push(Some(false));
+                    at = next;
+                    continue;
+                }
+                if cmd == "iftrue" {
+                    if_stack.push(Some(true));
+                    at = next;
+                    continue;
+                }
+                if cmd.starts_with("if") && cmd != "iff" {
+                    if_stack.push(None);
+                    at = next;
+                    continue;
+                }
+                if cmd == "else" {
+                    if let Some(last) = if_stack.last_mut() {
+                        *last = last.map(|b| !b);
+                    }
+                    at = next;
+                    continue;
+                }
+                if cmd == "fi" {
+                    if_stack.pop();
+                    at = next;
+                    continue;
+                }
+                if if_stack.iter().all(|&b| b == Some(true)) {
+                    if cmd == "endinput" {
+                        break;
+                    }
+                    if matches!(cmd, "begin" | "end")
+                        && let Some((_, grp_end)) =
+                            math::group(source, skip_source_space(source, next))
+                    {
+                        at = grp_end;
+                        continue;
+                    }
+                    let arg_start = skip_source_space(source, next);
+                    if matches!(cmd, "input" | "include" | "InputIfFileExists")
+                        && math::group(source, arg_start).is_some_and(|(g, _)| {
+                            let target = source[g].trim();
+                            if target.is_empty() {
+                                return false;
+                            }
+                            let target_path = std::path::Path::new(target);
+                            let matches_cand = |cand: &std::path::Path| {
+                                clean_lexical_path(cand) == generated_clean
+                                    || (cand.extension().is_none()
+                                        && clean_lexical_path(&cand.with_extension("tex"))
+                                            == generated_clean)
+                            };
+                            if target_path.is_absolute() {
+                                matches_cand(target_path)
+                            } else {
+                                [host_path.parent(), main_dir]
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|base| matches_cand(&base.join(target_path)))
+                            }
+                        })
+                    {
+                        return true;
+                    }
+                    match ext {
+                        "bbl"
+                            if matches!(
+                                cmd,
+                                "bibliography"
+                                    | "printbibliography"
+                                    | "nobibliography"
+                                    | "putbib"
+                                    | "bibbysection"
+                            ) =>
+                        {
+                            return true;
+                        }
+                        "toc" if cmd == "tableofcontents" => return true,
+                        _ => {}
+                    }
+                }
+                at = next;
+            }
+            _ => {
+                at += source.as_bytes()[at + 1..]
+                    .iter()
+                    .position(|&b| matches!(b, b'%' | b'\\' | b'='))
+                    .map_or(source.len() - at, |pos| pos + 1);
+            }
+        }
+    }
+    false
 }

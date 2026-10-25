@@ -3687,6 +3687,7 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     assert!(crate::parser::is_generated_graphics_tex(
         "/tmp/ééé.pdftex_t"
     ));
+    assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.ps_tex"));
     assert!(crate::parser::is_generated_graphics_tex("/tmp/ééé.pstex_t"));
 
     // A paragraph line box containing prose alongside a raw .pdf_tex input without
@@ -5321,6 +5322,44 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         Some((1, "$\\mskip 1mu plus 2mu ".len()))
     );
 
+    let row_break_tikz = concat!(
+        "\\begin{tikzpicture}\n",
+        "  \\node at (0,0) {the first label $X_1$};\n",
+        "  \\node at (1,0) {$Y$ is placed below $X_1$:\\\\the second block is aligned};\n",
+        "\\end{tikzpicture}\n",
+    );
+    let row_break_ctx = "the first label X1 Y is placed below X1:\r\nthe second block is aligned";
+    let second_the = row_break_ctx.rfind("the ").unwrap();
+    assert_eq!(
+        source_word_location(row_break_tikz, 3, row_break_ctx, second_the, 2),
+        Some((3, "  \\node at (1,0) {$Y$ is placed below $X_1$:\\\\".len()))
+    );
+    let forward_row_break = crate::ForwardWord::at("Alpha\\\\beta gamma", 8).unwrap();
+    assert_eq!(forward_row_break.words, vec!["Alpha", "beta", "gamma"]);
+    assert_eq!(forward_row_break.selected, 1);
+    let accent_after_break = "First line\nRow\\\\\\'example here\n";
+    assert_eq!(
+        source_word_location(accent_after_break, 1, "Row \u{00e9}xample here", 4, 2),
+        Some((2, "Row\\\\".len()))
+    );
+    let active_custom_env_prose = concat!(
+        "\\NewDocumentEnvironment{badge}{}{Sharedword }{}%\n",
+        "\\begin{badge}Body\\end{badge}\n",
+        "Sharedword text\n",
+    );
+    assert_eq!(
+        source_word_location(active_custom_env_prose, 3, "Sharedword", 0, 1),
+        None
+    );
+    let unused_custom_env_prose = concat!(
+        "\\NewDocumentEnvironment{badge}{}{Sharedword }{}%\n",
+        "Sharedword text\n",
+    );
+    assert_eq!(
+        source_word_location(unused_custom_env_prose, 2, "Sharedword", 0, 1),
+        Some((2, 0))
+    );
+
     // Metadata lookup with explicit compiled_inputs refuses uncompiled decoy in main.parent().
     let meta_dir = root.join("meta_prov");
     let meta_sub = meta_dir.join("compiled");
@@ -5478,4 +5517,489 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         assert_eq!(loaded.normalize(&link_tex).unwrap(), canonical_a);
         assert_eq!(loaded.read(&link_tex).unwrap(), "Hello world\n");
     }
+}
+
+#[test]
+fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+
+    // 1. Zero-width \copy\strutbox hbox from preamble (1,54) must not overwrite a
+    // cross-file zero-width rule `r2,25` on Page 2 and hijack preamble forward search.
+    let strut_dir = root.join("strutbox_case");
+    fs::create_dir_all(&strut_dir).unwrap();
+    let strut_pdf = strut_dir.join("main.pdf");
+    let strut_main = strut_dir.join("main.tex");
+    let strut_sub = strut_dir.join("chapter.tex");
+    fs::write(&strut_pdf, b"%PDF-1.4\n").unwrap();
+    let mut main_lines = String::new();
+    for idx in 1..=59 {
+        main_lines.push_str(&format!("% preamble line {idx}\n"));
+    }
+    main_lines.push_str("\\begin{document}\nFirst page text.\n\\input{chapter}\n\\end{document}\n");
+    fs::write(&strut_main, &main_lines).unwrap();
+    fs::write(&strut_sub, "Aligned equation text.\n".repeat(30)).unwrap();
+    let strut_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,60:0,0:30000000,40000000,0\n",
+            "(1,61:655360,6553600:6553600,655360,0\n",
+            "x1,61:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "{{2\n",
+            "[2,30:0,0:30000000,40000000,0\n",
+            "(2,25:655360,6553600:6553600,655360,0\n",
+            "[2,25:655360,6553600:0,623900,267389\n",
+            "(1,54:655360,6553600:0,623900,267389\n",
+            "r2,25:655360,6553600:0,623900,267389\n",
+            ")\n",
+            "]\n",
+            "x2,25:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}2\n",
+            "Postamble:\n",
+            "Count:13\n",
+        ),
+        strut_main.display(),
+        strut_sub.display()
+    );
+    fs::write(strut_pdf.with_extension("synctex"), strut_synctex).unwrap();
+    let forward_preamble = resolve_forward(&strut_pdf, &strut_main, 10, 1).unwrap();
+    assert_eq!(forward_preamble.page, 1);
+
+    // 2. Multi-page generated `.bbl` sheets whose sheet roots point into `.bbl`
+    // remap inverse hits back to the host `.tex` file instead of failing.
+    let bbl_dir = root.join("bbl_case");
+    fs::create_dir_all(&bbl_dir).unwrap();
+    let bbl_pdf = bbl_dir.join("paper.pdf");
+    let bbl_tex = bbl_dir.join("paper.tex");
+    let bbl_file = bbl_dir.join("paper.bbl");
+    fs::write(&bbl_pdf, b"%PDF-1.4\n").unwrap();
+    fs::write(
+        &bbl_tex,
+        concat!(
+            "\\documentclass{article}\n",
+            "\\begin{document}\n",
+            "Intro paragraph.\n",
+            "\\bibliography{refs}\n",
+            "Appendix text.\n",
+            "\\end{document}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &bbl_file,
+        "\\begin{thebibliography}{99}\n\\bibitem{a} Ref.\n\\end{thebibliography}\n",
+    )
+    .unwrap();
+    let bbl_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,4:0,0:30000000,40000000,0\n",
+            "(2,1:655360,6553600:6553600,655360,0\n",
+            "x2,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "{{2\n",
+            "[2,2:0,0:30000000,40000000,0\n",
+            "(2,2:655360,6553600:6553600,655360,0\n",
+            "x2,2:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}2\n",
+            "{{3\n",
+            "[1,5:0,0:30000000,40000000,0\n",
+            "(1,5:655360,6553600:6553600,655360,0\n",
+            "x1,5:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}3\n",
+            "Postamble:\n",
+            "Count:12\n",
+        ),
+        bbl_tex.display(),
+        bbl_file.display()
+    );
+    fs::write(bbl_pdf.with_extension("synctex"), bbl_synctex).unwrap();
+    let bbl_hit = resolve_inverse(
+        &bbl_pdf,
+        InversePoint {
+            page: 2,
+            x: 19.0,
+            y_from_top: 98.0,
+            page_height_pt: 792.0,
+        },
+        Some(("Appendix", 0)),
+        2,
+        &Operation::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(Path::new(&bbl_hit.location.file), bbl_tex.as_path());
+    assert_eq!(bbl_hit.location.line, 5);
+    assert!(!bbl_hit.location.precise);
+
+    // When the sheet after a multi-page `.bbl` belongs to a different `\input`
+    // (`appendix.tex`), prefer the preceding bibliography host sheet (`paper.tex`)
+    // instead of attributing bibliography pages to `appendix.tex`.
+    let appendix_tex = bbl_dir.join("appendix.tex");
+    fs::write(&appendix_tex, "\\section{Appendix}\nSharedword text.\n").unwrap();
+    let bbl_split_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Input:3:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,4:0,0:30000000,40000000,0\n",
+            "(2,1:655360,6553600:6553600,655360,0\n",
+            "x2,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "{{2\n",
+            "[2,2:0,0:30000000,40000000,0\n",
+            "(2,2:655360,6553600:6553600,655360,0\n",
+            "x2,2:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}2\n",
+            "{{3\n",
+            "[3,1:0,0:30000000,40000000,0\n",
+            "(3,2:655360,6553600:6553600,655360,0\n",
+            "x3,2:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}3\n",
+            "Postamble:\n",
+            "Count:12\n",
+        ),
+        bbl_tex.display(),
+        bbl_file.display(),
+        appendix_tex.display()
+    );
+    fs::write(bbl_pdf.with_extension("synctex"), bbl_split_synctex).unwrap();
+    let bbl_split_hit = resolve_inverse(
+        &bbl_pdf,
+        InversePoint {
+            page: 2,
+            x: 19.0,
+            y_from_top: 98.0,
+            page_height_pt: 792.0,
+        },
+        Some(("Sharedword", 0)),
+        2,
+        &Operation::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(Path::new(&bbl_split_hit.location.file), bbl_tex.as_path());
+    assert_eq!(bbl_split_hit.location.line, 4);
+    assert!(!bbl_split_hit.location.precise);
+
+    // When a preceding sheet (`appendix.tex`) only has `\bibliographystyle`,
+    // an unused macro/environment definition, `\iffalse\bibliography{decoy}\fi`,
+    // manual `thebibliography`, or `\verb`/`\lstinline` mentioning `paper.bbl`
+    // (or another generated sidecar/graphics wrapper like `other.vrb` or
+    // `figure.pdf_tex` precedes the `.bbl` sheet), fall through to the following
+    // owning sheet (`paper.tex`); when no adjacent sheet owns `paper.bbl`,
+    // preserve the raw line `paper.bbl:2` even if the sheet-root is `paper.bbl:3`.
+    let vrb_sidecar = dir.path().join("other.vrb");
+    fs::write(&vrb_sidecar, "\\input{paper.bbl}\nSharedword\n").unwrap();
+    let pdf_tex_sidecar = dir.path().join("figure.pdf_tex");
+    fs::write(&pdf_tex_sidecar, "\\input{paper.bbl}\nSharedword\n").unwrap();
+    fs::write(
+        &appendix_tex,
+        concat!(
+            "\\bibliographystyle{plain}\n",
+            "\\newcommand{\\example}{\\bibliography{unused}}\n",
+            "\\NewDocumentEnvironment{unusedrefs}{}{\\bibliography{decoy}}{}\n",
+            "\\newif\\ifunusedbib \\iffalse\\bibliography{decoy}\\fi\n",
+            "\\begin{thebibliography}{1}\\bibitem{k}Sharedword\\end{thebibliography}\n",
+            "\\verb|paper.bbl| \\lstinline|\\input{paper.bbl}|\n",
+            "\\detokenize{\\input{paper.bbl}} \\string\\input{paper.bbl}\n",
+            "\\NewExpandableDocumentCommand{\\unused}{}{\\input{paper.bbl}}\n",
+            "\\toks0{\\input{paper.bbl}} \\makeatletter\\@firstoftwo{safe}{\\input{paper.bbl}}\\@gobbletwo\\input{paper.bbl}\\makeatother\n",
+            "\\input{other/paper.bbl}\n",
+            "Sharedword text.\n",
+            "{\\endinput}\n",
+            "\\input{paper.bbl}\n",
+        ),
+    )
+    .unwrap();
+    let bbl_after_foreign_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Input:3:{}\n",
+            "Input:4:{}\n",
+            "Input:5:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[4,1:0,0:30000000,40000000,0\n",
+            "(4,1:655360,6553600:6553600,655360,0\n",
+            "x4,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "{{2\n",
+            "[5,1:0,0:30000000,40000000,0\n",
+            "(5,1:655360,6553600:6553600,655360,0\n",
+            "x5,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}2\n",
+            "{{3\n",
+            "[3,7:0,0:30000000,40000000,0\n",
+            "(3,7:655360,6553600:6553600,655360,0\n",
+            "x3,7:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}3\n",
+            "{{4\n",
+            "[2,3:0,0:30000000,40000000,0\n",
+            "(2,2:655360,6553600:6553600,655360,0\n",
+            "x2,2:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}4\n",
+            "{{5\n",
+            "[1,5:0,0:30000000,40000000,0\n",
+            "(1,5:655360,6553600:6553600,655360,0\n",
+            "x1,5:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}5\n",
+            "Postamble:\n",
+            "Count:20\n",
+        ),
+        bbl_tex.display(),
+        bbl_file.display(),
+        appendix_tex.display(),
+        vrb_sidecar.display(),
+        pdf_tex_sidecar.display()
+    );
+    fs::write(bbl_pdf.with_extension("synctex"), bbl_after_foreign_synctex).unwrap();
+    for best in [false, true] {
+        let bbl_after_foreign_hit = resolve_inverse(
+            &bbl_pdf,
+            InversePoint {
+                page: 4,
+                x: 19.0,
+                y_from_top: 98.0,
+                page_height_pt: 792.0,
+            },
+            Some(("Sharedword", 0)),
+            3,
+            &Operation::default(),
+            None,
+            best,
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&bbl_after_foreign_hit.location.file),
+            bbl_tex.as_path()
+        );
+        assert_eq!(bbl_after_foreign_hit.location.line, 5);
+        assert!(!bbl_after_foreign_hit.location.precise);
+    }
+
+    let bbl_unowned_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Input:2:{}\n",
+            "Input:3:{}\n",
+            "Input:4:{}\n",
+            "Input:5:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[4,1:0,0:30000000,40000000,0\n",
+            "(4,1:655360,6553600:6553600,655360,0\n",
+            "x4,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "{{2\n",
+            "[5,1:0,0:30000000,40000000,0\n",
+            "(5,1:655360,6553600:6553600,655360,0\n",
+            "x5,1:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}2\n",
+            "{{3\n",
+            "[3,7:0,0:30000000,40000000,0\n",
+            "(3,7:655360,6553600:6553600,655360,0\n",
+            "x3,7:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}3\n",
+            "{{4\n",
+            "[2,3:0,0:30000000,40000000,0\n",
+            "(2,2:655360,6553600:6553600,655360,0\n",
+            "x2,2:1310720,6553600\n",
+            ")\n",
+            "]\n",
+            "}}4\n",
+            "Postamble:\n",
+            "Count:16\n",
+        ),
+        bbl_tex.display(),
+        bbl_file.display(),
+        appendix_tex.display(),
+        vrb_sidecar.display(),
+        pdf_tex_sidecar.display()
+    );
+    fs::write(bbl_pdf.with_extension("synctex"), bbl_unowned_synctex).unwrap();
+    for best in [false, true] {
+        let hit = resolve_inverse(
+            &bbl_pdf,
+            InversePoint {
+                page: 4,
+                x: 19.0,
+                y_from_top: 98.0,
+                page_height_pt: 792.0,
+            },
+            Some(("Sharedword", 0)),
+            3,
+            &Operation::default(),
+            None,
+            best,
+        )
+        .unwrap();
+        assert_eq!(Path::new(&hit.location.file), bbl_file.as_path());
+        assert_eq!(hit.location.line, 2);
+        assert!(!hit.location.precise);
+    }
+
+    assert_eq!(
+        source_word_location(
+            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\néaebadge Sharedword\n",
+            2,
+            "Sharedword",
+            0,
+            2,
+        ),
+        Some((2, 10)),
+    );
+    assert_eq!(
+        source_word_location(
+            "\\begin{thebibliography}{1}\n\\bibitem{Sharedword} Sharedword\n\\end{thebibliography}\n",
+            2,
+            "Sharedword",
+            0,
+            2,
+        ),
+        Some((2, 21)),
+    );
+
+    for env_src in [
+        concat!(
+            "\\NewDocumentEnvironment{badge}{O{Sharedword}}{#1 }{}\n",
+            "\\begin{badge}Body\\end{badge} Sharedword\n",
+        ),
+        concat!(
+            "\\newcommand{\\usebadge}{\\begin{badge}Body\\end{badge}}\n",
+            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\n",
+            "\\usebadge Sharedword\n",
+        ),
+        concat!(
+            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\n",
+            "\\csname badge\\endcsname Body\\csname endbadge\\endcsname Sharedword\n",
+        ),
+        concat!(
+            "\\newcommand{\\leaf}{Sharedword}\n",
+            "\\newcommand{\\outerword}{\\leaf}\n",
+            "\\NewDocumentEnvironment{badge}{}{\\outerword }{}\n",
+            "\\begin{badge}Body\\end{badge} Sharedword\n",
+        ),
+    ] {
+        let last = env_src.lines().count() as u32;
+        assert_eq!(
+            source_word_location(env_src, last, "Sharedword", 0, 2),
+            None,
+            "expected None for:\n{env_src}"
+        );
+    }
+
+    // 3. Zero-size TikZ wrapper hbox uses upstream one-sided `contain_box` (`else if`)
+    // so a straddling child hbox does not inflate both sides of the zero-size parent.
+    let tikz_synctex = format!(
+        concat!(
+            "SyncTeX Version:1\n",
+            "Input:1:{}\n",
+            "Output:pdf\n",
+            "Magnification:1000\n",
+            "Unit:1\n",
+            "X Offset:0\n",
+            "Y Offset:0\n",
+            "Content:\n",
+            "{{1\n",
+            "[1,6:0,0:30000000,40000000,0\n",
+            "(1,6:6553600,6553600:0,0,0\n",
+            "(1,3:3276800,6553600:6553600,655360,655360\n",
+            "x1,3:5898240,6553600\n",
+            ")\n",
+            ")\n",
+            "]\n",
+            "}}1\n",
+            "Postamble:\n",
+            "Count:5\n",
+        ),
+        bbl_tex.display()
+    );
+    let tikz_hits = inverse_candidates_from_reader_with_options(
+        tikz_synctex.as_bytes(),
+        InversePoint {
+            page: 1,
+            x: 120.0,
+            y_from_top: 105.0,
+            page_height_pt: 792.0,
+        },
+        true,
+    )
+    .unwrap();
+    assert_eq!(tikz_hits.len(), 1);
+    assert_eq!(tikz_hits[0].line, 3);
 }

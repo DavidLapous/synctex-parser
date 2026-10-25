@@ -12,6 +12,7 @@ use std::{
 const MAX_SOURCE_MAP_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_WARNING_BYTES: usize = 4096;
+pub(crate) type CapturedSidecar = (Vec<u8>, PathBuf);
 
 /// Compiler input identities, read without invoking the SyncTeX executable or
 /// interpreting geometry. Relative inputs belong to the actual build cwd.
@@ -47,6 +48,23 @@ impl SourceInfo {
         operation: &Operation,
         build_directory: Option<&Path>,
     ) -> io::Result<Self> {
+        Self::read_with_operation_and_sidecar_in(pdf, operation, build_directory, false)
+            .map(|(info, _)| info)
+    }
+
+    pub(crate) fn read_with_sidecar_in(
+        pdf: &Path,
+        build_directory: Option<&Path>,
+    ) -> io::Result<(Self, Option<CapturedSidecar>)> {
+        Self::read_with_operation_and_sidecar_in(pdf, &Operation::default(), build_directory, true)
+    }
+
+    fn read_with_operation_and_sidecar_in(
+        pdf: &Path,
+        operation: &Operation,
+        build_directory: Option<&Path>,
+        capture_sidecar: bool,
+    ) -> io::Result<(Self, Option<CapturedSidecar>)> {
         operation.check()?;
         let pdf = fs::canonicalize(pdf)?;
         let file = open_regular(&pdf, false)?;
@@ -67,15 +85,18 @@ impl SourceInfo {
         let Some((file, sidecar_path)) = opened else {
             revision.check_in(&pdf, build_directory)?;
             operation.check()?;
-            return Ok(Self {
-                pdf,
-                revision,
-                cwd,
-                main: None,
-                inputs: Vec::new(),
-                aliases: BTreeMap::new(),
-                warning: Some("compiled source list unavailable: no SyncTeX sidecar".into()),
-            });
+            return Ok((
+                Self {
+                    pdf,
+                    revision,
+                    cwd,
+                    main: None,
+                    inputs: Vec::new(),
+                    aliases: BTreeMap::new(),
+                    warning: Some("compiled source list unavailable: no SyncTeX sidecar".into()),
+                },
+                None,
+            ));
         };
         let pdf_dir = pdf
             .parent()
@@ -97,11 +118,13 @@ impl SourceInfo {
         {
             fallback_dirs.push(sdir.as_path());
         }
+        let mut raw_bytes = capture_sidecar.then(Vec::new);
         let (main, inputs, aliases, unavailable) = read_inputs_with_fallbacks(
             synctex::decode_synctex_file(file, MAX_SOURCE_MAP_BYTES + 1)?,
             &cwd,
             &fallback_dirs,
             operation,
+            raw_bytes.as_mut(),
         )?;
         operation.check()?;
         revision.check_in(&pdf, build_directory)?;
@@ -114,15 +137,18 @@ impl SourceInfo {
         } else {
             None
         };
-        Ok(Self {
-            pdf,
-            revision,
-            cwd,
-            main,
-            inputs,
-            aliases,
-            warning,
-        })
+        Ok((
+            Self {
+                pdf,
+                revision,
+                cwd,
+                main,
+                inputs,
+                aliases,
+                warning,
+            },
+            raw_bytes.map(|bytes| (bytes, sidecar_path)),
+        ))
     }
 }
 
@@ -159,7 +185,8 @@ fn read_inputs(
     cwd: &Path,
     operation: &Operation,
 ) -> io::Result<(Option<PathBuf>, Vec<PathBuf>, usize)> {
-    let (main, paths, _, unavailable) = read_inputs_with_fallbacks(reader, cwd, &[], operation)?;
+    let (main, paths, _, unavailable) =
+        read_inputs_with_fallbacks(reader, cwd, &[], operation, None)?;
     Ok((main, paths, unavailable))
 }
 
@@ -169,6 +196,7 @@ fn read_inputs_with_fallbacks(
     cwd: &Path,
     fallback_dirs: &[&Path],
     operation: &Operation,
+    mut raw_out: Option<&mut Vec<u8>>,
 ) -> io::Result<(
     Option<PathBuf>,
     Vec<PathBuf>,
@@ -200,6 +228,9 @@ fn read_inputs_with_fallbacks(
         }
         if count == 0 {
             break;
+        }
+        if let Some(buf) = raw_out.as_deref_mut() {
+            buf.extend_from_slice(row.as_bytes());
         }
         let row = row.trim_end_matches(['\r', '\n']);
         if let Some(input) = row.strip_prefix("Input:") {
@@ -320,7 +351,8 @@ fn read_inputs_with_fallbacks(
     let aliases = raw_aliases
         .into_iter()
         .filter(|(alias, target)| {
-            alias != target && (paths.contains(target) || Some(target) == main.as_ref())
+            alias != target
+                && (paths.binary_search(target).is_ok() || Some(target) == main.as_ref())
         })
         .collect();
     Ok((main, paths, aliases, unavailable))
