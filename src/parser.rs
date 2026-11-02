@@ -1512,6 +1512,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
                                 }
                                 let candidate = ForwardCandidate {
                                     page: p_num,
+                                    source_line: line as u32,
                                     rect: SearchRect {
                                         left: h,
                                         top: v - height,
@@ -1716,13 +1717,16 @@ pub(crate) fn forward_geometry_valid(page: u32, h: f32, v: f32, width: f32, heig
             .all(f32::is_finite)
 }
 
+pub(crate) fn inverse_point_valid(point: InversePoint) -> bool {
+    point.page > 0
+        && point.x.is_finite()
+        && point.y_from_top.is_finite()
+        && point.page_height_pt.is_finite()
+        && point.page_height_pt > 0.0
+}
+
 pub(crate) fn validate_inverse_point(point: InversePoint) -> io::Result<()> {
-    if point.page == 0
-        || !point.x.is_finite()
-        || !point.y_from_top.is_finite()
-        || !point.page_height_pt.is_finite()
-        || point.page_height_pt <= 0.0
-    {
+    if !inverse_point_valid(point) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid SyncTeX inverse query point",
@@ -2449,7 +2453,7 @@ pub(crate) fn inverse_candidates_in_doc(
         return Ok(Vec::new());
     };
 
-    let selected_nodes: Vec<usize> = match (nds_l, nds_r) {
+    let mut selected_nodes: Vec<usize> = match (nds_l, nds_r) {
         (Some((mut l_idx, l_dist)), Some((mut r_idx, r_dist))) => {
             if (data_tag(r_idx), data_line(r_idx), data_col(r_idx))
                 != (data_tag(l_idx), data_line(l_idx), data_col(l_idx))
@@ -2482,10 +2486,30 @@ pub(crate) fn inverse_candidates_in_doc(
         let [min_h, max_h, min_v, max_v] = nodes[idx].data_box();
         min_h <= hit_h && hit_h <= max_h && min_v <= hit_v && hit_v <= max_v
     };
-    let hit_graphics_total = graphics_boxes
+    let mut hits = graphics_boxes
         .iter()
-        .filter(|g| point_in_data_box(g.box_idx))
-        .count();
+        .filter(|g| point_in_data_box(g.box_idx));
+    let unique_graphics = match (hits.next(), hits.next()) {
+        (Some(graphics), None) => Some(graphics),
+        _ => None,
+    };
+    if let Some(graphics) = unique_graphics
+        && !selected_nodes.is_empty()
+        && selected_nodes.iter().all(|&idx| {
+            let mut ancestor = Some(idx);
+            while let Some(current) = ancestor {
+                if graphics_boxes.iter().any(|g| g.box_idx == current) {
+                    return true;
+                }
+                ancestor = nodes[current].parent;
+            }
+            false
+        })
+    {
+        // Unscaled inner image boxes can overlap a neighboring image's scaled box.
+        selected_nodes.clear();
+        selected_nodes.push(graphics.host_idx);
+    }
 
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
@@ -2541,7 +2565,7 @@ pub(crate) fn inverse_candidates_in_doc(
                 same_anchor_count += 1;
             }
         }
-        let graphics = if hit_same_anchor == 1 && hit_graphics_total == 1 {
+        let graphics = if hit_same_anchor == 1 && unique_graphics.is_some() {
             hit_index.map(|index| GraphicsHit::Unique {
                 index,
                 count: same_anchor_count,

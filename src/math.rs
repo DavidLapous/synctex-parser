@@ -7,6 +7,7 @@ use std::ops::Range;
 pub(super) struct MacroDef<'a> {
     pub(super) arity: u8,
     pub(super) used_params: u16,
+    pub(super) body_source: &'a str,
     pub(super) body: Option<&'a str>,
 }
 
@@ -62,14 +63,113 @@ pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
     (&source[after..end], end)
 }
 
+fn literal_csname(source: &str) -> Option<&str> {
+    // Only blanks skipped after the control word are absent from the name.
+    let name = source.trim_start_matches([' ', '\t', '\r', '\n']);
+    (!name.is_empty()
+        && !name.contains("^^")
+        && !name
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\\' | '#' | '%' | '{' | '}')))
+    .then_some(name)
+}
+
+// Name-only scans must not repeatedly balance unresolved constructs.
+pub(super) fn static_command(source: &str, start: usize) -> (&str, usize) {
+    let (raw, end) = command(source, start);
+    if raw != "csname" {
+        return (raw, end);
+    }
+    let Some(close) = source[end..].find('\\').map(|at| end + at) else {
+        return (raw, end);
+    };
+    let Some(name) = literal_csname(&source[end..close]) else {
+        return (raw, end);
+    };
+    let (closing, closing_end) = command(source, close);
+    if closing == "endcsname" {
+        (name, closing_end)
+    } else {
+        (raw, end)
+    }
+}
+
+pub(super) fn control_sequence(source: &str, start: usize) -> (&str, usize) {
+    let (name, mut at) = command(source, start);
+    if name != "csname" {
+        return (name, at);
+    }
+    let begin = at;
+    let mut depth = 1;
+    while at < source.len() {
+        if matches!(source.as_bytes()[at], b'{' | b'}') {
+            return ("csname", begin);
+        }
+        if source.as_bytes()[at] == b'%' {
+            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
+            continue;
+        }
+        if source.as_bytes()[at] == b'\\' {
+            let (token, end) = command(source, at);
+            if matches!(token, "string" | "meaning" | "noexpand")
+                && source.as_bytes().get(super::skip_source_space(source, end)) == Some(&b'\\')
+                && let Some(next) = quoted_token_end(source, token, end)
+            {
+                at = next;
+                continue;
+            }
+            if token == "endcsname" {
+                depth -= 1;
+                if depth == 0 {
+                    return (literal_csname(&source[begin..at]).unwrap_or("csname"), end);
+                }
+            } else if token == "csname" {
+                depth += 1;
+            }
+            at = end;
+        } else {
+            at += source[at..].chars().next().unwrap().len_utf8();
+        }
+    }
+    ("csname", begin)
+}
+
 pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)> {
+    group_with_boundaries(source, start, None, None)
+}
+
+fn group_with_boundaries(
+    source: &str,
+    start: usize,
+    mut boundaries: Option<&mut BTreeMap<usize, usize>>,
+    operation: Option<&crate::Operation>,
+) -> Option<(Range<usize>, usize)> {
+    if operation.is_some_and(|operation| operation.check().is_err()) {
+        return None;
+    }
     let start = super::skip_source_space(source, start);
     if source.as_bytes().get(start) != Some(&b'{') {
         return None;
     }
+    // Byte addresses identify the same borrowed group across root/body slices.
+    let base = source.as_ptr() as usize;
+    if let Some(end) = boundaries
+        .as_ref()
+        .and_then(|groups| groups.get(&(base + start)))
+    {
+        let end = *end - base;
+        return (end <= source.len()).then_some((start + 1..end - 1, end));
+    }
+    let mut openings = Vec::new();
+    if boundaries.is_some() {
+        openings.push(base + start);
+    }
     let mut depth = 1;
     let mut i = start + 1;
     while i < source.len() {
+        if operation.is_some_and(|operation| operation.check().is_err()) {
+            return None;
+        }
         match source.as_bytes()[i] {
             b'\\' => {
                 i = command(source, i).1;
@@ -79,9 +179,17 @@ pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)>
                 i += source[i..].find('\n').unwrap_or(source.len() - i);
                 continue;
             }
-            b'{' => depth += 1,
+            b'{' => {
+                depth += 1;
+                if boundaries.is_some() {
+                    openings.push(base + i);
+                }
+            }
             b'}' => {
                 depth -= 1;
+                if let Some(groups) = &mut boundaries {
+                    groups.insert(openings.pop().unwrap(), base + i + 1);
+                }
                 if depth == 0 {
                     return Some((start + 1..i, i + 1));
                 }
@@ -91,6 +199,109 @@ pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)>
         i += source[i..].chars().next()?.len_utf8();
     }
     None
+}
+
+pub(super) fn argument(
+    source: &str,
+    pos: usize,
+    limit: usize,
+    parameters: bool,
+) -> Option<(Range<usize>, usize)> {
+    argument_with_boundaries(source, pos, limit, parameters, None, None)
+}
+
+fn argument_with_boundaries(
+    source: &str,
+    pos: usize,
+    limit: usize,
+    parameters: bool,
+    boundaries: Option<&mut BTreeMap<usize, usize>>,
+    operation: Option<&crate::Operation>,
+) -> Option<(Range<usize>, usize)> {
+    let mut pos = pos;
+    let mut newline = false;
+    while pos < limit {
+        match source.as_bytes()[pos] {
+            b'%' => {
+                pos += source[pos..limit].find('\n').map_or(limit - pos, |n| n + 1);
+                newline = true;
+            }
+            b'\n' if newline => return None,
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                newline |= source.as_bytes()[pos] == b'\n';
+                pos += 1;
+            }
+            _ => break,
+        }
+    }
+    match *source.as_bytes()[..limit].get(pos)? {
+        b'{' => group_with_boundaries(source, pos, boundaries, operation)
+            .filter(|(_, end)| *end <= limit),
+        b'\\' => {
+            let (_, end) = command(source, pos);
+            (end <= limit).then_some((pos..end, end))
+        }
+        b'#' if parameters => source.as_bytes()[..limit]
+            .get(pos + 1)
+            .is_some_and(|b| matches!(b, b'1'..=b'9'))
+            .then_some((pos..pos + 2, pos + 2)),
+        _ => source[pos..limit]
+            .chars()
+            .next()
+            .map(|ch| (pos..pos + ch.len_utf8(), pos + ch.len_utf8())),
+    }
+}
+
+pub(super) fn quoted_token_end(source: &str, name: &str, at: usize) -> Option<usize> {
+    if !matches!(name, "string" | "meaning" | "noexpand") {
+        return None;
+    }
+    let mut at = at;
+    let mut newline = false;
+    while let Some(ch) = source[at..].chars().next() {
+        if ch == '%' {
+            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
+            newline = true;
+        } else if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            at += ch.len_utf8();
+            // A blank physical line supplies the quoted \par token.
+            if ch == '\n' {
+                if newline {
+                    return Some(at);
+                }
+                newline = true;
+            }
+        } else {
+            break;
+        }
+    }
+    if source.as_bytes().get(at) == Some(&b'\\') {
+        let (token, end) = command(source, at);
+        if name == "noexpand"
+            && matches!(
+                token,
+                "def"
+                    | "gdef"
+                    | "edef"
+                    | "xdef"
+                    | "let"
+                    | "futurelet"
+                    | "setbox"
+                    | "begingroup"
+                    | "endgroup"
+                    | "bgroup"
+                    | "egroup"
+                    | "endcsname"
+            )
+        {
+            return None;
+        }
+        Some(end)
+    } else if name == "noexpand" {
+        None
+    } else {
+        Some(at + source[at..].chars().next().map_or(0, char::len_utf8))
+    }
 }
 
 /// Return the opaque command's end and whether its entire span is nonprinting.
@@ -362,7 +573,7 @@ pub(super) fn in_region(source: &str, byte: usize) -> bool {
         .any(|range| range.contains(&byte))
 }
 
-fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
+pub(super) fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     let mut hidden = super::nonprinting_source_spans(source).peekable();
     let mut open: Option<(&str, usize)> = None;
@@ -880,20 +1091,169 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
     result
 }
 
-fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
+pub(super) fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
     at = super::skip_source_space(source, at);
     if let Some((grp, next)) = group(source, at) {
-        let name = source[grp].trim().strip_prefix('\\')?.trim();
+        let target = &source[grp];
+        let start = super::skip_source_space(target, 0);
+        if target.as_bytes().get(start) != Some(&b'\\') {
+            return None;
+        }
+        let (name, end) = command(target, start);
         (!name.is_empty()
             && !matches!(name, "csname" | "expandafter")
-            && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'@'))
+            && super::skip_source_space(target, end) == target.len())
         .then_some((name, next))
     } else if source.as_bytes().get(at) == Some(&b'\\') {
-        let (name, next) = command(source, at);
+        let (name, next) = control_sequence(source, at);
         (!name.is_empty() && !matches!(name, "csname" | "expandafter")).then_some((name, next))
     } else {
         None
     }
+}
+
+pub(super) fn macro_target_end(source: &str, mut at: usize) -> Option<usize> {
+    at = super::skip_source_space(source, at);
+    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+    at = super::skip_source_space(source, at);
+    while source.as_bytes().get(at) == Some(&b'\\') && command(source, at).0 == "expandafter" {
+        at = super::skip_source_space(source, command(source, at).1);
+        at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+        at = super::skip_source_space(source, at);
+    }
+    if let Some((_, end)) = group(source, at) {
+        Some(end)
+    } else if source.as_bytes().get(at) == Some(&b'\\') {
+        Some(control_sequence(source, at).1)
+    } else {
+        None
+    }
+}
+
+/// Known mutation APIs invalidate their static target; unknown dispatch invalidates all targets.
+pub(super) fn macro_mutation_target<'a>(
+    source: &'a str,
+    command: &str,
+    at: usize,
+) -> Option<(&'a str, usize)> {
+    let command = command
+        .strip_prefix("protected@")
+        .filter(|name| {
+            matches!(
+                *name,
+                "eappto"
+                    | "xappto"
+                    | "epreto"
+                    | "xpreto"
+                    | "cseappto"
+                    | "csxappto"
+                    | "csepreto"
+                    | "csxpreto"
+            )
+        })
+        .unwrap_or(command);
+    let named = command.strip_prefix("cs");
+    if matches!(
+        named.unwrap_or(command),
+        "appto" | "eappto" | "gappto" | "xappto" | "preto" | "epreto" | "gpreto" | "xpreto"
+    ) || matches!(command, "patchcmd" | "apptocmd" | "pretocmd")
+    {
+        let at = if command == "patchcmd" {
+            let start = super::skip_source_space(source, at);
+            if source.as_bytes().get(start) == Some(&b'[') {
+                match super::optional_argument_boundary(source, start) {
+                    Ok(end) => end,
+                    Err(end) => return Some(("**", end)),
+                }
+            } else {
+                at
+            }
+        } else {
+            at
+        };
+        let raw_target = |at| {
+            if source.as_bytes().get(at) != Some(&b'\\') {
+                return ("**", at);
+            }
+            let (name, end) = self::command(source, at);
+            (
+                if matches!(name, "" | "csname" | "expandafter") {
+                    "**"
+                } else {
+                    name
+                },
+                end,
+            )
+        };
+        let at = super::skip_source_space(source, at);
+        if let Some((span, end)) = group(source, at) {
+            let name = if named.is_some() {
+                literal_csname(&source[span]).unwrap_or("**")
+            } else {
+                let (name, next) = raw_target(super::skip_source_space(source, span.start));
+                if super::skip_source_space(source, next) == span.end {
+                    name
+                } else {
+                    "**"
+                }
+            };
+            return Some((name, end));
+        }
+        return Some(if named.is_some() {
+            ("**", at)
+        } else {
+            raw_target(at)
+        });
+    }
+    if matches!(
+        command,
+        "AtBeginEnvironment"
+            | "AtEndEnvironment"
+            | "BeforeBeginEnvironment"
+            | "AfterEndEnvironment"
+    ) {
+        let start = super::skip_source_space(source, at);
+        let at = if source.as_bytes().get(start) == Some(&b'[') {
+            match super::optional_argument_boundary(source, start) {
+                Ok(end) => end,
+                Err(end) => return Some(("**", end)),
+            }
+        } else {
+            at
+        };
+        return Some(
+            group(source, at)
+                .map(|(span, end)| (literal_csname(&source[span]).unwrap_or("**"), end))
+                .unwrap_or(("**", at)),
+        );
+    }
+    if matches!(
+        command,
+        "AddToHook" | "AddToHookNext" | "AddToHookWithArguments" | "AddToHookNextWithArguments"
+    ) {
+        let Some((span, end)) = group(source, at) else {
+            return Some(("**", at));
+        };
+        let Some(hook) = literal_csname(&source[span]) else {
+            return Some(("**", end));
+        };
+        if let Some(target) = hook
+            .strip_prefix("cmd/")
+            .or_else(|| hook.strip_prefix("env/"))
+        {
+            return Some(
+                target
+                    .rsplit_once('/')
+                    .filter(|(name, phase)| !name.is_empty() && !phase.is_empty())
+                    .map_or(("**", end), |(name, _)| (name, end)),
+            );
+        }
+        if hook.starts_with("file/") {
+            return Some(("input", end));
+        }
+        return Some(("**", end));
+    }
+    None
 }
 
 pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
@@ -908,6 +1268,10 @@ pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
             | "RenewDocumentCommand"
             | "ProvideDocumentCommand"
             | "DeclareDocumentCommand"
+            | "NewExpandableDocumentCommand"
+            | "RenewExpandableDocumentCommand"
+            | "ProvideExpandableDocumentCommand"
+            | "DeclareExpandableDocumentCommand"
             | "def"
             | "gdef"
             | "edef"
@@ -921,18 +1285,179 @@ pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
     )
 }
 
+pub(super) fn definition_command(source: &str, start: usize) -> (&str, usize, bool) {
+    let (name, end) = static_command(source, start);
+    if name == "csname" {
+        return (name, start + name.len() + 1, false);
+    }
+    if name == "expandafter" {
+        let next = super::skip_source_space(source, end);
+        if source.as_bytes().get(next) == Some(&b'\\') {
+            let (name, end) = command(source, next);
+            if is_macro_definition_command(name) && !matches!(name, "csname" | "newif") {
+                return (name, end, true);
+            }
+        }
+    }
+    (name, end, false)
+}
+
+pub(super) struct MacroAlias<'a> {
+    pub name: &'a str,
+    pub value: Range<usize>,
+    pub nonprinting_end: usize,
+}
+
+fn alias_token(source: &str, mut at: usize, mut skip_blanks: bool) -> Option<(Range<usize>, bool)> {
+    while at < source.len() {
+        let ch = source[at..].chars().next()?;
+        if ch == '%' {
+            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
+            skip_blanks = true;
+        } else if ch.is_ascii_whitespace() {
+            let start = at;
+            at += source[at..]
+                .bytes()
+                .take_while(u8::is_ascii_whitespace)
+                .count();
+            if !skip_blanks {
+                return Some((start..at, true));
+            }
+        } else if ch == '\\' {
+            let (name, end) = command(source, at);
+            return Some((
+                at..end,
+                name.as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@'),
+            ));
+        } else {
+            return Some((at..at + ch.len_utf8(), false));
+        }
+    }
+    None
+}
+
+pub(super) fn macro_alias<'a>(
+    source: &'a str,
+    cmd: &str,
+    mut at: usize,
+    expanded_target: bool,
+) -> MacroAlias<'a> {
+    at = super::skip_source_space(source, at);
+    let mut expanded_value = false;
+    let (mut name, target_end) = if source.as_bytes().get(at) == Some(&b'\\') {
+        let (raw, end) = command(source, at);
+        if raw == "expandafter" {
+            let target = super::skip_source_space(source, end);
+            if expanded_target && source.as_bytes().get(target) == Some(&b'\\') {
+                let (name, end) = command(source, target);
+                if !matches!(name, "csname" | "expandafter") {
+                    expanded_value = true;
+                    (name, end)
+                } else {
+                    ("**", macro_target_end(source, at).unwrap_or(end))
+                }
+            } else {
+                ("**", macro_target_end(source, at).unwrap_or(end))
+            }
+        } else if raw == "csname" {
+            if expanded_target {
+                let (name, end) = control_sequence(source, at);
+                (if name == "csname" { "**" } else { name }, end)
+            } else {
+                ("**", end)
+            }
+        } else {
+            (raw, end)
+        }
+    } else {
+        (
+            "**",
+            at + source[at..].chars().next().map_or(0, char::len_utf8),
+        )
+    };
+    if cmd == "futurelet" {
+        // The consumed endcsname controls blanks, not the constructed identifier.
+        let skip_blanks = source.as_bytes()[..target_end]
+            .last()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@');
+        let value = alias_token(source, target_end, skip_blanks)
+            .and_then(|(first, skip)| alias_token(source, first.end, skip))
+            .map_or(target_end..target_end, |(value, _)| value);
+        return MacroAlias {
+            name,
+            value,
+            // Both lookahead tokens execute after the assignment.
+            nonprinting_end: target_end,
+        };
+    }
+    at = super::skip_source_space(source, target_end);
+    if source.as_bytes().get(at) == Some(&b'=') {
+        expanded_value = false;
+        at = super::skip_source_space(source, at + 1);
+    }
+    let value = if expanded_value && source.as_bytes().get(at) == Some(&b'\\') {
+        let (raw, _) = command(source, at);
+        let (value, end) = control_sequence(source, at);
+        if raw != "csname" || value == "csname" {
+            name = "**";
+        }
+        at..end
+    } else {
+        alias_token(source, at, true).map_or(at..at, |(value, _)| value)
+    };
+    MacroAlias {
+        name,
+        nonprinting_end: value.end,
+        value,
+    }
+}
+
+pub(super) fn environment_end_name<'a>(
+    table: &BTreeMap<&'a str, Option<MacroDef<'a>>>,
+    environment: &str,
+) -> Option<&'a str> {
+    table
+        .range("end"..)
+        .take_while(|(name, _)| name.starts_with("end"))
+        .find_map(|(&name, _)| (name.strip_prefix("end") == Some(environment)).then_some(name))
+}
+
 pub(crate) fn macros_from_sources<'a>(
     sources: &[&'a str],
+    operation: &crate::Operation,
 ) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
-    let mut table = BTreeMap::<&'a str, Option<MacroDef<'a>>>::new();
-    let mut poison_all = false;
+    macros_from_sources_with_mode(sources, false, operation)
+}
+
+// Permissive definition hints; the native region decides whether a column is compatible.
+pub(super) fn macros_from_sources_for_guess<'a>(
+    sources: &[&'a str],
+    operation: &crate::Operation,
+) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
+    macros_from_sources_with_mode(sources, true, operation)
+}
+
+type MacroTable<'a> = BTreeMap<&'a str, Option<MacroDef<'a>>>;
+
+fn macros_from_sources_with_mode<'a>(
+    sources: &[&'a str],
+    guess: bool,
+    operation: &crate::Operation,
+) -> MacroTable<'a> {
+    let mut table = MacroTable::new();
     for &source in sources {
+        let mut nonprinting = crate::tex::nonprinting_source_spans(source).peekable();
         let mut in_preamble = true;
         let mut brace_depth = 0usize;
         let mut group_depth = 0usize;
-        let mut if_depth = 0usize;
+        let mut if_stack: Vec<Option<bool>> = Vec::new();
         let mut at = 0usize;
         while at < source.len() {
+            if operation.check().is_err() {
+                return table;
+            }
             match source.as_bytes()[at] {
                 b'%' => {
                     at += source[at..].find('\n').unwrap_or(source.len() - at);
@@ -946,44 +1471,91 @@ pub(crate) fn macros_from_sources<'a>(
                     at += 1;
                 }
                 b'$' => {
-                    if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
+                    if brace_depth == 0
+                        && group_depth == 0
+                        && if_stack.is_empty()
+                        && !nonprinting
+                            .peek()
+                            .is_some_and(|(_, span, _)| span.contains(&at))
+                    {
                         in_preamble = false;
                     }
                     at += 1;
                 }
                 b'\\' => {
-                    let (cmd, end) = command(source, at);
+                    let start = at;
+                    while nonprinting
+                        .peek()
+                        .is_some_and(|(_, span, _)| span.end <= start)
+                    {
+                        nonprinting.next();
+                    }
+                    let (cmd, end, expanded_target) = definition_command(source, at);
                     at = end;
-                    if let Some((opaque_end, _)) = opaque_command_end(source, cmd, at) {
+                    let executing = !nonprinting
+                        .peek()
+                        .is_some_and(|(_, span, _)| span.contains(&start));
+                    if !table.contains_key(cmd)
+                        && let Some(quoted_end) = quoted_token_end(source, cmd, at)
+                    {
+                        // Stored token lists balance braces before quoted tokens execute.
+                        if executing
+                            || !matches!(
+                                source.as_bytes().get(super::skip_source_space(source, at)),
+                                Some(b'{' | b'}')
+                            )
+                        {
+                            at = quoted_end;
+                        }
+                        continue;
+                    }
+                    if executing
+                        && !table.contains_key(cmd)
+                        && let Some((opaque_end, _)) = opaque_command_end(source, cmd, at)
+                    {
                         at = opaque_end;
                         continue;
                     }
-                    if matches!(cmd, "(" | "[") {
-                        if brace_depth == 0 && group_depth == 0 && if_depth == 0 {
+                    if executing && matches!(cmd, "(" | "[") {
+                        if brace_depth == 0 && group_depth == 0 && if_stack.is_empty() {
                             in_preamble = false;
                         }
                         continue;
                     }
-                    if matches!(cmd, "begingroup" | "bgroup") {
+                    if executing && matches!(cmd, "begingroup" | "bgroup") {
                         group_depth += 1;
                         continue;
                     }
-                    if matches!(cmd, "endgroup" | "egroup") {
+                    if executing && matches!(cmd, "endgroup" | "egroup") {
                         group_depth = group_depth.saturating_sub(1);
                         continue;
                     }
-                    if cmd.starts_with("if") && cmd != "iff" {
-                        if_depth += 1;
+                    if executing
+                        && cmd.starts_with("if")
+                        && cmd != "iff"
+                        && !(guess && cmd == "ifthenelse" && !table.contains_key(cmd))
+                    {
+                        if_stack.push(match cmd {
+                            "iftrue" => Some(true),
+                            "iffalse" => Some(false),
+                            _ => None,
+                        });
                         continue;
                     }
-                    if cmd == "fi" {
-                        if_depth = if_depth.saturating_sub(1);
+                    if executing && cmd == "else" {
+                        if let Some(last) = if_stack.last_mut() {
+                            *last = last.map(|value| !value);
+                        }
                         continue;
                     }
-                    if cmd == "begin" {
+                    if executing && cmd == "fi" {
+                        if_stack.pop();
+                        continue;
+                    }
+                    if executing && cmd == "begin" {
                         if let Some((env, next)) = group(source, at) {
                             if &source[env] == "document"
-                                || (brace_depth == 0 && group_depth == 0 && if_depth == 0)
+                                || (brace_depth == 0 && group_depth == 0 && if_stack.is_empty())
                             {
                                 in_preamble = false;
                             }
@@ -992,7 +1564,7 @@ pub(crate) fn macros_from_sources<'a>(
                         group_depth += 1;
                         continue;
                     }
-                    if cmd == "end" {
+                    if executing && cmd == "end" {
                         group_depth = group_depth.saturating_sub(1);
                         if let Some((_, next)) = group(source, at) {
                             at = next;
@@ -1000,36 +1572,50 @@ pub(crate) fn macros_from_sources<'a>(
                         continue;
                     }
                     if cmd == "csname" {
-                        if let Some(pos) = source[at..].find("\\endcsname") {
-                            let name = source[at..at + pos].trim();
-                            if name == "**" {
-                                poison_all = true;
-                            } else if !name.is_empty() {
-                                table.insert(name, None);
-                            }
-                            at += pos + "\\endcsname".len();
+                        continue;
+                    }
+                    if cmd == "newif" {
+                        if let Some((name, _)) = macro_target_name(source, at) {
+                            table.insert(name, None);
                         }
+                        at = macro_target_end(source, at).unwrap_or(at);
+                        continue;
+                    }
+                    if let Some((name, next)) = macro_mutation_target(source, cmd, at) {
+                        table.insert(name, None);
+                        at = next;
                         continue;
                     }
                     if matches!(cmd, "let" | "futurelet") {
-                        if let Some((name, mut next)) = macro_target_name(source, at) {
-                            table.insert(name, None);
-                            next = super::skip_source_space(source, next);
-                            if cmd == "let" && source.as_bytes().get(next) == Some(&b'=') {
-                                next = super::skip_source_space(source, next + 1);
-                            }
-                            if source.as_bytes().get(next) == Some(&b'\\') {
-                                next = command(source, next).1;
-                            } else if next < source.len() {
-                                next += source[next..].chars().next().map_or(1, char::len_utf8);
-                            }
-                            at = next;
+                        let alias = macro_alias(source, cmd, at, expanded_target);
+                        table.insert(alias.name, None);
+                        // Stored assignment tokens cannot consume their enclosing group delimiters.
+                        if executing {
+                            at = alias.nonprinting_end;
                         }
                         continue;
                     }
-                    let top_level =
-                        in_preamble && brace_depth == 0 && group_depth == 0 && if_depth == 0;
-                    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    if let Some((name, _, _)) = crate::tex::environment_definition(source, cmd, at)
+                    {
+                        if let Some(end_name) = environment_end_name(&table, name) {
+                            table.insert(end_name, None);
+                        }
+                        if let Some(entry) = table.get_mut(name) {
+                            *entry = None;
+                        }
+                        continue;
+                    }
+                    let top_level = (executing
+                        || nonprinting
+                            .peek()
+                            .is_some_and(|(head, _, _)| *head == start))
+                        && in_preamble
+                        && brace_depth == 0
+                        && group_depth == 0
+                        && if_stack.is_empty()
+                        && (expanded_target
+                            || !source[super::skip_source_space(source, at)..]
+                                .starts_with("\\csname"));
                     if matches!(
                         cmd,
                         "edef"
@@ -1038,6 +1624,10 @@ pub(crate) fn macros_from_sources<'a>(
                             | "RenewDocumentCommand"
                             | "ProvideDocumentCommand"
                             | "DeclareDocumentCommand"
+                            | "NewExpandableDocumentCommand"
+                            | "RenewExpandableDocumentCommand"
+                            | "ProvideExpandableDocumentCommand"
+                            | "DeclareExpandableDocumentCommand"
                             | "pgfmathsetmacro"
                             | "pgfmathtruncatemacro"
                     ) {
@@ -1046,6 +1636,7 @@ pub(crate) fn macros_from_sources<'a>(
                         }
                         continue;
                     }
+                    let mut optional_default = None;
                     let (name, arity) = if matches!(cmd, "def" | "gdef") {
                         let Some((name, mut next)) = macro_target_name(source, at) else {
                             continue;
@@ -1096,6 +1687,7 @@ pub(crate) fn macros_from_sources<'a>(
                                 .map(|_| opt.as_bytes()[0] - b'0');
                             next = opt_end;
                             while let Some(extra_end) = super::optional_argument_end(source, next) {
+                                optional_default.get_or_insert(next);
                                 arity = None;
                                 next = extra_end;
                             }
@@ -1110,7 +1702,7 @@ pub(crate) fn macros_from_sources<'a>(
                         table.insert(name, None);
                         continue;
                     };
-                    at = body_open;
+                    at = optional_default.unwrap_or(body_open);
                     let Some(arity) = arity.filter(|_| top_level) else {
                         table.insert(name, None);
                         continue;
@@ -1120,6 +1712,9 @@ pub(crate) fn macros_from_sources<'a>(
                     let mut seen_params = 0u16;
                     let mut used_params = 0u16;
                     for (idx, _) in body.match_indices('#') {
+                        if crate::tex::has_unescaped_backslash_before(body, idx) {
+                            continue;
+                        }
                         if let Some(d) = body
                             .as_bytes()
                             .get(idx + 1)
@@ -1138,6 +1733,7 @@ pub(crate) fn macros_from_sources<'a>(
                     let def = MacroDef {
                         arity,
                         used_params,
+                        body_source: body,
                         body: valid.then_some(body),
                     };
                     match table.get(name) {
@@ -1161,12 +1757,7 @@ pub(crate) fn macros_from_sources<'a>(
             }
         }
     }
-    if poison_all {
-        for val in table.values_mut() {
-            *val = None;
-        }
-        table.insert("**", None);
-    }
+    table.remove("**");
     table
 }
 
@@ -1231,37 +1822,22 @@ fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
 fn atoms_with_macros<'a>(
     source: &'a str,
     range: Range<usize>,
-    macros: &BTreeMap<&str, Option<MacroDef<'a>>>,
+    context: (&BTreeMap<&str, Option<MacroDef<'a>>>, &crate::Operation),
     depth: u8,
     span_override: Option<Range<usize>>,
     args: &[(&'a str, Range<usize>)],
     has_unknown: &mut bool,
 ) -> Option<Vec<Atom>> {
-    if depth >= 64 {
+    let (macros, operation) = context;
+    if operation.check().is_err() || depth >= 64 {
         return None;
     }
     let mut result = Vec::new();
     let mut i = range.start;
     let mut prev_alnum_end = None;
-    let script_arg = |pos: usize| -> Option<(Range<usize>, usize)> {
-        let pos = super::skip_source_space(source, pos).min(range.end);
-        match *source.as_bytes()[..range.end].get(pos)? {
-            b'{' => group(source, pos).filter(|(_, end)| *end <= range.end),
-            b'\\' => {
-                let (_, end) = command(source, pos);
-                (end <= range.end).then_some((pos..end, end))
-            }
-            b'#' => source.as_bytes()[..range.end]
-                .get(pos + 1)
-                .is_some_and(|b| matches!(b, b'1'..=b'9'))
-                .then_some((pos..pos + 2, pos + 2)),
-            _ => source[pos..range.end]
-                .chars()
-                .next()
-                .map(|c| (pos..pos + c.len_utf8(), pos + c.len_utf8())),
-        }
-    };
+    let script_arg = |pos| argument(source, pos, range.end, span_override.is_some());
     while i < range.end {
+        operation.check().ok()?;
         let start = i;
         let continuing = prev_alnum_end == Some(start);
         prev_alnum_end = None;
@@ -1282,7 +1858,7 @@ fn atoms_with_macros<'a>(
                     let sub = atoms_with_macros(
                         arg_src,
                         arg_rng.clone(),
-                        macros,
+                        (macros, operation),
                         depth + 1,
                         None,
                         &[],
@@ -1332,7 +1908,7 @@ fn atoms_with_macros<'a>(
                     let sub = atoms_with_macros(
                         source,
                         arg1,
-                        macros,
+                        (macros, operation),
                         depth + 1,
                         span_override.clone(),
                         args,
@@ -1353,7 +1929,7 @@ fn atoms_with_macros<'a>(
                         let sub = atoms_with_macros(
                             source,
                             arg_next,
-                            macros,
+                            (macros, operation),
                             depth + 1,
                             span_override.clone(),
                             args,
@@ -1477,15 +2053,7 @@ fn atoms_with_macros<'a>(
                     i = end;
                     continue;
                 }
-                let incomplete_macros = macros.contains_key("**");
-                let macro_entry = macros.get(name).copied().or_else(|| {
-                    (incomplete_macros
-                        && name
-                            .as_bytes()
-                            .first()
-                            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@'))
-                    .then_some(None)
-                });
+                let macro_entry = macros.get(name).copied();
                 if let Some(macro_entry) = macro_entry {
                     if let Some(def) = macro_entry
                         && depth + 16 <= 64
@@ -1528,7 +2096,7 @@ fn atoms_with_macros<'a>(
                                 let sub = atoms_with_macros(
                                     body,
                                     0..body.len(),
-                                    macros,
+                                    (macros, operation),
                                     depth + 16,
                                     Some(span.clone()),
                                     &call_args,
@@ -1666,7 +2234,7 @@ fn atoms_with_macros<'a>(
                             let sub = atoms_with_macros(
                                 source,
                                 opt_start..opt_end - 1,
-                                macros,
+                                (macros, operation),
                                 depth + 1,
                                 span_override.clone(),
                                 args,
@@ -1687,7 +2255,7 @@ fn atoms_with_macros<'a>(
                             let sub = atoms_with_macros(
                                 source,
                                 opt_start..opt_end - 1,
-                                macros,
+                                (macros, operation),
                                 depth + 1,
                                 span_override.clone(),
                                 args,
@@ -1842,7 +2410,7 @@ pub(super) fn source_location(
     offset: usize,
     prose: Option<(u32, usize, isize)>,
 ) -> Option<(u32, usize)> {
-    source_location_with_context(
+    source_location_with_context_mode(
         source,
         line,
         lines,
@@ -1852,11 +2420,18 @@ pub(super) fn source_location(
         prose,
         &[],
         &[],
+        &[],
+        &[],
+        crate::tex::WordLocationMode::Strict,
+        &crate::Operation::default(),
+        None,
     )
+    .ok()
+    .flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn source_location_with_context(
+pub(super) fn source_location_with_context_mode(
     source: &str,
     line: u32,
     lines: Range<usize>,
@@ -1866,7 +2441,13 @@ pub(super) fn source_location_with_context(
     prose: Option<(u32, usize, isize)>,
     extra_sources: &[&str],
     foreach_loops: &[crate::tex::ForeachLoop<'_>],
-) -> Option<(u32, usize)> {
+    opaque: &[Range<usize>],
+    literal_owners: &[Range<usize>],
+    mode: crate::tex::WordLocationMode,
+    operation: &crate::Operation,
+    execution_scope: Option<&Range<usize>>,
+) -> Result<Option<(u32, usize)>, ()> {
+    operation.check().map_err(|_| ())?;
     let starts: Vec<_> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
@@ -1890,10 +2471,10 @@ pub(super) fn source_location_with_context(
     }
     collapse_pdf_composites(&mut pdf);
     let Some(selected) = pdf.iter().position(|atom| atom.span.contains(&offset)) else {
-        return prose.map(|(row, byte, _)| (row, byte));
+        return Ok(prose.map(|(row, byte, _)| (row, byte)));
     };
     if matches!(pdf[selected].value, '\0'..='\x03') || private_use(pdf[selected].value) {
-        return None;
+        return Ok(None);
     }
     // A letter inside an ordinary PDF word must match that entire word, not a
     // nearby single-letter variable with the same spelling.
@@ -1906,19 +2487,25 @@ pub(super) fn source_location_with_context(
             word.end += 1;
         }
     }
-    let scope_start = *starts.get(lines.start).unwrap_or(&source.len());
-    let scope_end = *starts.get(lines.end).unwrap_or(&source.len());
+    let scope_start = execution_scope.map_or_else(
+        || *starts.get(lines.start).unwrap_or(&source.len()),
+        |scope| scope.start,
+    );
+    let scope_end = execution_scope.map_or_else(
+        || *starts.get(lines.end).unwrap_or(&source.len()),
+        |scope| scope.end,
+    );
     let active_regions: Vec<_> = regions
         .into_iter()
         .filter(|range| range.start < scope_end && range.end > scope_start)
         .collect();
     if active_regions.is_empty() {
-        return prose.map(|(row, byte, _)| (row, byte));
+        return Ok(prose.map(|(row, byte, _)| (row, byte)));
     }
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
-    let macros = macros_from_sources(&macro_sources);
+    let macros = mode.macros(&macro_sources, operation);
     let mut best = None;
     let mut tied = false;
     let mut any_unknown = false;
@@ -1926,45 +2513,59 @@ pub(super) fn source_location_with_context(
     let line_start = *starts.get(line as usize - 1).unwrap_or(&source.len());
     let line_end = *starts.get(line as usize).unwrap_or(&source.len());
     for range in active_regions {
-        let bindings = crate::tex::foreach_bindings_for_range(foreach_loops, &range)?;
+        operation.check().map_err(|_| ())?;
+        if execution_scope.is_some() && (range.start < scope_start || range.end > scope_end) {
+            // A compiler-proven body never borrows a formula crossing its header boundary.
+            return Err(());
+        }
+        let Some(bindings) = crate::tex::foreach_bindings_for_range(foreach_loops, &range) else {
+            return Ok(None);
+        };
         let mut region_unknown = false;
         let mut passes = Vec::with_capacity(bindings.len().max(1));
         if bindings.is_empty() {
-            passes.push(atoms_with_macros(
+            let Some(atoms) = atoms_with_macros(
                 source,
                 range.clone(),
-                &macros,
+                (&macros, operation),
                 0,
                 None,
                 &[],
                 &mut region_unknown,
-            )?);
+            ) else {
+                return Ok(None);
+            };
+            passes.push(atoms);
         } else {
             for binding in &bindings {
                 let mut local_macros = macros.clone();
                 for &(var, val) in binding {
                     if macros.contains_key(var) {
-                        return None;
+                        return Ok(None);
                     }
                     local_macros.insert(
                         var,
                         Some(MacroDef {
                             arity: 0,
+                            body_source: val,
                             body: Some(val),
                             used_params: 0,
                         }),
                     );
                 }
                 let mut pass_unknown = false;
-                passes.push(atoms_with_macros(
+                let Some(atoms) = atoms_with_macros(
                     source,
                     range.clone(),
-                    &local_macros,
+                    (&local_macros, operation),
                     0,
                     None,
                     &[],
                     &mut pass_unknown,
-                )?);
+                ) else {
+                    return Ok(None);
+                };
+                passes.push(atoms);
                 region_unknown |= pass_unknown;
             }
         }
@@ -1973,7 +2574,10 @@ pub(super) fn source_location_with_context(
             line_unknown |= region_unknown;
         }
         for atoms in passes {
-            let atoms = inline_context(source, &range, atoms);
+            let mut atoms = inline_context(source, &range, atoms);
+            if let Some(scope) = execution_scope {
+                atoms.retain(|atom| scope.start <= atom.span.start && atom.span.end <= scope.end);
+            }
             for (index, atom) in atoms.iter().enumerate() {
                 if !range.contains(&atom.span.start)
                     || matches!(atom.value, '\0'..='\x03')
@@ -2007,6 +2611,15 @@ pub(super) fn source_location_with_context(
                             .is_some_and(|next| next.word_join))
                 {
                     continue;
+                }
+                if opaque.iter().any(|range| range.contains(&atom.span.start))
+                    && !literal_owners.iter().any(|owner| {
+                        atoms[begin..begin + word.len()].iter().all(|atom| {
+                            owner.start <= atom.span.start && atom.span.end <= owner.end
+                        })
+                    })
+                {
+                    return Err(());
                 }
                 // Stop at the first mismatch and at this expression's boundary.
                 // Context from a different formula must not break an ambiguity tie.
@@ -2164,11 +2777,12 @@ pub(super) fn source_location_with_context(
                     continue;
                 }
                 let location = (row as u32, atom.span.start - starts[row - 1]);
-                let proximity = if within_frame || score == 0 {
-                    0
-                } else {
-                    location.0.abs_diff(line)
-                };
+                let proximity =
+                    if within_frame || score == 0 || mode == crate::tex::WordLocationMode::Guess {
+                        0
+                    } else {
+                        location.0.abs_diff(line)
+                    };
                 let rank = (
                     score,
                     lexical_score > 0,
@@ -2187,7 +2801,6 @@ pub(super) fn source_location_with_context(
             }
         }
     }
-    let incomplete_macros = macros.contains_key("**");
     let mathematical = best
         .filter(|((score, ..), location)| {
             let has_unknown = if within_frame || location.0 != line {
@@ -2195,25 +2808,51 @@ pub(super) fn source_location_with_context(
             } else {
                 line_unknown
             };
-            !tied
-                && !(incomplete_macros && has_unknown)
-                && (!has_unknown || word.len() > 1 || *score > 0)
+            !tied && (!has_unknown || word.len() > 1 || *score > 0)
         })
         .map(|(_, location)| location);
-    let prose_evidence = prose.is_some_and(|(_, _, score)| score >= 6)
+    let prose_evidence = mode == crate::tex::WordLocationMode::Strict
+        && prose.is_some_and(|(_, _, score)| score >= 6)
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
-        return prose.map(|(row, byte, _)| (row, byte));
+        return Ok(prose.map(|(row, byte, _)| (row, byte)));
     }
     if prose.is_some() && best.is_some() {
-        return None;
+        return Ok(None);
     }
-    prose.map(|(row, byte, _)| (row, byte)).or(mathematical)
+    Ok(prose.map(|(row, byte, _)| (row, byte)).or(mathematical))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_group_boundaries_preserve_lexing_and_borrowed_slice_limits() {
+        let source = "{α\\{literal% }\n{β} tail}";
+        let mut boundaries = BTreeMap::new();
+        assert_eq!(
+            group_with_boundaries(source, 0, Some(&mut boundaries), None),
+            group(source, 0),
+        );
+        assert_eq!(boundaries.len(), 2);
+        let inner = source.find("{β}").unwrap();
+        let slice = &source[inner..inner + "{β}".len()];
+        assert_eq!(
+            group_with_boundaries(slice, 0, Some(&mut boundaries), None),
+            Some((1..3, 4)),
+        );
+        assert_eq!(
+            group_with_boundaries(&slice[..slice.len() - 1], 0, Some(&mut boundaries), None),
+            None,
+        );
+        let operation = crate::Operation::default();
+        operation.cancel();
+        assert_eq!(
+            group_with_boundaries(source, 0, Some(&mut boundaries), Some(&operation)),
+            None,
+        );
+    }
 
     #[test]
     fn caption_scopes_preserve_lines_after_skipped_captions() {

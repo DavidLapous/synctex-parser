@@ -758,14 +758,18 @@ pub(crate) fn foreach_loops<'a>(
     source: &'a str,
     lines: &std::ops::Range<usize>,
     extra_sources: &[&'a str],
+    operation: &crate::Operation,
 ) -> Vec<ForeachLoop<'a>> {
+    if operation.check().is_err() {
+        return Vec::new();
+    }
     if !source.contains("\\foreach") {
         return Vec::new();
     }
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
-    let macros = math::macros_from_sources(&macro_sources);
+    let macros = math::macros_from_sources(&macro_sources, operation);
     let start_byte: usize = source
         .split_inclusive('\n')
         .take(lines.start)
@@ -835,8 +839,7 @@ pub(crate) fn foreach_loops<'a>(
                         break;
                     }
                 }
-                let clashes_with_macro =
-                    macros.contains_key("**") || vars.iter().any(|v| macros.contains_key(v));
+                let clashes_with_macro = vars.iter().any(|v| macros.contains_key(v));
                 let items = if has_options || vars.len() > 4 || body_redefines || clashes_with_macro
                 {
                     None
@@ -1121,9 +1124,88 @@ pub(crate) fn source_word_location(
     offset: usize,
     radius: u32,
 ) -> Option<(u32, usize)> {
-    source_word_location_with_sources(source, line, context, offset, radius, &[])
+    source_word_location_with_sources(
+        source,
+        line,
+        context,
+        offset,
+        radius,
+        &[],
+        &crate::Operation::default(),
+    )
+    .ok()
+    .flatten()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnverifiedWordLocation {
+    pub line: u32,
+    pub byte: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WordLocationMode {
+    Strict,
+    Guess,
+}
+
+impl WordLocationMode {
+    pub(super) fn macros<'a>(
+        self,
+        sources: &[&'a str],
+        operation: &crate::Operation,
+    ) -> std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>> {
+        match self {
+            Self::Strict => math::macros_from_sources(sources, operation),
+            Self::Guess => math::macros_from_sources_for_guess(sources, operation),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExecutionRoot<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) package_initialization: &'a [std::ops::Range<usize>],
+}
+
+impl ExecutionRoot<'_> {
+    fn package_initialization_at(self, source: &str, start: usize) -> bool {
+        (source.as_ptr() as usize + start)
+            .checked_sub(self.source.as_ptr() as usize)
+            .is_some_and(|offset| {
+                self.package_initialization
+                    .iter()
+                    .any(|range| range.contains(&offset))
+            })
+    }
+}
+
+// This result is never occurrence ownership, even when the lexical match is unique.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn source_word_guess_with_sources(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    radius: u32,
+    extra_sources: &[&str],
+    operation: &crate::Operation,
+) -> Result<Option<UnverifiedWordLocation>, ()> {
+    source_word_location_with_sources_mode(
+        source,
+        line,
+        context,
+        offset,
+        radius,
+        extra_sources,
+        WordLocationMode::Guess,
+        operation,
+    )
+    .map(|location| location.map(|(line, byte)| UnverifiedWordLocation { line, byte }))
+}
+
+// Opaque word ownership also prohibits document-metadata fallback.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn source_word_location_with_sources(
     source: &str,
     line: u32,
@@ -1131,7 +1213,32 @@ pub(crate) fn source_word_location_with_sources(
     offset: usize,
     radius: u32,
     extra_sources: &[&str],
-) -> Option<(u32, usize)> {
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize)>, ()> {
+    source_word_location_with_sources_mode(
+        source,
+        line,
+        context,
+        offset,
+        radius,
+        extra_sources,
+        WordLocationMode::Strict,
+        operation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_word_location_with_sources_mode(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    radius: u32,
+    extra_sources: &[&str],
+    mode: WordLocationMode,
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize)>, ()> {
+    operation.check().map_err(|_| ())?;
     let hidden = nonprinting_source_ranges(source);
     if let Some(tikz) = source_tikzpicture_range_with_hidden(source, line, &hidden)
         && let Some(loc) = source_word_location_in_range_with_hidden(
@@ -1142,10 +1249,12 @@ pub(crate) fn source_word_location_with_sources(
             tikz,
             true,
             extra_sources,
-            &hidden,
-        )
+            mode,
+            operation,
+            None,
+        )?
     {
-        return Some(loc);
+        return Ok(Some(loc));
     }
     let anchor = line.checked_sub(1).map(|l| l as usize);
     let scope = math::caption_lines(source, line)
@@ -1171,95 +1280,818 @@ pub(crate) fn source_word_location_with_sources(
         lines,
         within_scope,
         extra_sources,
-        &hidden,
+        mode,
+        operation,
+        None,
     )
 }
 
+struct MacroArgRanges {
+    hidden: Vec<std::ops::Range<usize>>,
+    opaque: Vec<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvocationKind {
+    Command,
+    Environment,
+    EnvironmentEnd,
+    MathDelimiter,
+    LiteralOutput,
+    GlobalDeclaration,
+}
+
+fn class_package_declaration(command: &str) -> bool {
+    matches!(command, "documentclass" | "usepackage" | "RequirePackage")
+}
+
+fn class_package_declaration_end(source: &str, mut at: usize) -> Option<usize> {
+    while let Some(end) = optional_argument_end(source, at) {
+        at = end;
+    }
+    let (_, mut end) = math::group(source, skip_source_space(source, at))?;
+    while let Some(optional_end) = optional_argument_end(source, end) {
+        end = optional_end;
+    }
+    Some(end)
+}
+
+// Potential dependencies may overapproximate; output and discards retain semantic extents.
+fn invoked_commands<'a>(
+    source: &'a str,
+    potential: bool,
+    macros: &std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    operation: &crate::Operation,
+) -> Vec<(usize, &'a str, usize, InvocationKind)> {
+    invoked_commands_with_literals(source, potential, macros, false, operation)
+}
+
+fn invoked_commands_with_literals<'a>(
+    source: &'a str,
+    potential: bool,
+    macros: &std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    include_literals: bool,
+    operation: &crate::Operation,
+) -> Vec<(usize, &'a str, usize, InvocationKind)> {
+    let mode = if include_literals {
+        WordLocationMode::Guess
+    } else {
+        WordLocationMode::Strict
+    };
+    let hidden: Vec<_> =
+        nonprinting_source_spans_with_mode(source, Some(macros), mode, Some(operation)).collect();
+    let mut hidden = hidden.iter().peekable();
+    let mut commands = Vec::new();
+    let mut at = 0;
+    while at < source.len() {
+        if operation.check().is_err() {
+            return commands;
+        }
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= at) {
+            hidden.next();
+        }
+        if let Some((_, range, _)) = hidden.peek()
+            && range.contains(&at)
+        {
+            at = range.end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => at += source[at..].find('\n').unwrap_or(source.len() - at),
+            b'\\' => {
+                let start = at;
+                let (name, end) = if potential {
+                    math::static_command(source, at)
+                } else {
+                    math::control_sequence(source, at)
+                };
+                at = end;
+                // Lexical builtin behavior cannot override an explicitly changed meaning.
+                if macros.contains_key(name)
+                    || mode == WordLocationMode::Strict
+                        && uncertain_note_invocation(name, macros, WordLocationMode::Strict)
+                {
+                    commands.push((start, name, end, InvocationKind::Command));
+                    continue;
+                }
+                if include_literals
+                    && class_package_declaration(name)
+                    && let Some((head, span, _)) = hidden.peek()
+                    && *head == start
+                    && span.start == end
+                {
+                    commands.push((start, name, span.end, InvocationKind::GlobalDeclaration));
+                    at = span.end;
+                    continue;
+                }
+                if name == "detokenize" {
+                    if let Some((_, end)) = math::group(source, at) {
+                        at = end;
+                    }
+                    if include_literals {
+                        commands.push((start, name, at, InvocationKind::LiteralOutput));
+                    }
+                    continue;
+                }
+                if let Some(quoted_end) = math::quoted_token_end(source, name, at) {
+                    if name == "noexpand" {
+                        commands.push((start, name, end, InvocationKind::Command));
+                    } else if include_literals {
+                        commands.push((start, name, quoted_end, InvocationKind::LiteralOutput));
+                    }
+                    at = quoted_end;
+                } else if let Some((end, nonprinting)) = math::opaque_command_end(source, name, at)
+                {
+                    if include_literals && !nonprinting {
+                        commands.push((start, name, end, InvocationKind::LiteralOutput));
+                    }
+                    at = end;
+                } else if matches!(name, "begin" | "end")
+                    && let Some((environment, group_end)) =
+                        math::group(source, skip_source_space(source, at))
+                {
+                    let environment = source[environment].trim();
+                    let (environment, kind) = if name == "end" {
+                        (
+                            math::environment_end_name(macros, environment).unwrap_or(environment),
+                            InvocationKind::EnvironmentEnd,
+                        )
+                    } else {
+                        (environment, InvocationKind::Environment)
+                    };
+                    commands.push((start, environment, group_end, kind));
+                    at = group_end;
+                } else {
+                    commands.push((start, name, end, InvocationKind::Command));
+                }
+            }
+            b'$' if potential => {
+                commands.push((
+                    at,
+                    &source[at..at + 1],
+                    at + 1,
+                    InvocationKind::MathDelimiter,
+                ));
+                at += 1;
+            }
+            _ => {
+                at += source.as_bytes()[at + 1..]
+                    .iter()
+                    .position(|byte| matches!(byte, b'%' | b'\\' | b'$'))
+                    .map_or(source.len() - at, |offset| offset + 1);
+            }
+        }
+    }
+    commands
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MacroContext<'a, 'b> {
+    pub macros: &'b std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    pub definitions: &'b std::collections::BTreeMap<&'a str, Vec<StoredBody<'a>>>,
+    pub operation: &'b crate::Operation,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StoredBody<'a> {
+    source: &'a str,
+    package_initialization: bool,
+}
+
+fn note_macro_definitions<'a>(
+    sources: &[&'a str],
+    note_macros: &mut std::collections::BTreeSet<&'a str>,
+    execution_root: Option<ExecutionRoot<'_>>,
+    operation: Option<&crate::Operation>,
+) -> std::collections::BTreeMap<&'a str, Vec<StoredBody<'a>>> {
+    let mut definitions = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut pending = sources.to_vec();
+    while let Some(source) = pending.pop() {
+        if operation.is_some_and(|op| op.check().is_err()) {
+            return definitions;
+        }
+        for (start, span, _) in nonprinting_source_spans(source) {
+            if operation.is_some_and(|op| op.check().is_err()) {
+                return definitions;
+            }
+            if source.as_bytes().get(start) != Some(&b'\\') {
+                continue;
+            }
+            let package_initialization =
+                execution_root.is_some_and(|root| root.package_initialization_at(source, start));
+            let (command, mut at, expanded_target) = math::definition_command(source, start);
+            if let Some((name, body, _)) = environment_definition(source, command, at) {
+                definitions.entry(name).or_default().push(StoredBody {
+                    source: body,
+                    package_initialization,
+                });
+                pending.push(body);
+                continue;
+            }
+            if !math::is_macro_definition_command(command) || command == "csname" {
+                continue;
+            }
+            let (name, body) = if matches!(command, "let" | "futurelet") {
+                let alias = math::macro_alias(source, command, at, expanded_target);
+                let body = &source[alias.value];
+                if body.starts_with('\\') {
+                    let (value, end) = math::control_sequence(body, 0);
+                    if end == body.len() && matches!(value, "note" | "csname") {
+                        // Aliases snapshot meaning before a later note redefinition.
+                        note_macros.insert(alias.name);
+                    }
+                }
+                (alias.name, body)
+            } else {
+                at = skip_source_space(source, at);
+                at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                at = skip_source_space(source, at);
+                let (name, next) = math::macro_target_name(source, at)
+                    .unwrap_or(("**", math::macro_target_end(source, at).unwrap_or(at)));
+                (name, &source[next..span.end])
+            };
+            definitions.entry(name).or_default().push(StoredBody {
+                source: body,
+                package_initialization,
+            });
+            pending.push(body);
+        }
+    }
+    definitions
+}
+
+fn uncertain_note_call_end(
+    source: &str,
+    mut at: usize,
+    limit: usize,
+    definitions: Option<&Vec<StoredBody<'_>>>,
+) -> usize {
+    if definitions.is_none() {
+        // shortcut: a missing signature cannot bound consumption within this query scope.
+        return limit;
+    }
+    // Delimited primitive definitions expose their terminator before the body.
+    if let Some(definitions) = definitions {
+        for definition in definitions {
+            let body = definition.source.trim();
+            if body.starts_with('\\') && math::control_sequence(body, 0).1 == body.len() {
+                // An alias token alone does not establish its captured signature.
+                return limit;
+            }
+            let prefix = definition.source.split('{').next().unwrap_or("");
+            let Some(parameter) = prefix.rfind('#') else {
+                continue;
+            };
+            let Some(delimiter) = prefix.get(parameter + 2..).map(str::trim) else {
+                continue;
+            };
+            if delimiter.is_empty() {
+                continue;
+            }
+            let mut cursor = at;
+            while cursor < limit {
+                if source[cursor..].starts_with(delimiter)
+                    && !(delimiter.starts_with('\\')
+                        && delimiter
+                            .as_bytes()
+                            .last()
+                            .is_some_and(u8::is_ascii_alphabetic)
+                        && source
+                            .as_bytes()
+                            .get(cursor + delimiter.len())
+                            .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@'))
+                {
+                    return cursor + delimiter.len();
+                }
+                if let Some((_, end)) = math::group(source, cursor) {
+                    cursor = end;
+                } else if source.as_bytes()[cursor] == b'%' {
+                    cursor += source[cursor..].find('\n').unwrap_or(source.len() - cursor);
+                } else {
+                    cursor += source[cursor..].chars().next().unwrap().len_utf8();
+                }
+            }
+            return limit;
+        }
+    }
+    let arguments = definitions
+        .into_iter()
+        .flatten()
+        .flat_map(|definition| {
+            definition
+                .source
+                .match_indices('#')
+                .filter_map(move |(at, _)| {
+                    definition
+                        .source
+                        .as_bytes()
+                        .get(at + 1)
+                        .copied()
+                        .filter(|digit| (b'1'..=b'9').contains(digit))
+                        .map(|digit| usize::from(digit - b'0'))
+                })
+        })
+        .max()
+        .unwrap_or(1);
+    for _ in 0..arguments {
+        let open = skip_source_space(source, at).min(limit);
+        if open == limit {
+            break;
+        }
+        at = if let Some(end) = optional_argument_end(source, open)
+            .or_else(|| overlay_argument_end(source, open))
+            .or_else(|| math::group(source, open).map(|(_, end)| end))
+        {
+            end
+        } else if source.as_bytes().get(open) == Some(&b'\\') {
+            math::command(source, open).1
+        } else {
+            open + source[open..].chars().next().map_or(0, char::len_utf8)
+        };
+    }
+    at.min(limit)
+}
+
+pub(super) fn known_formatting_switch(name: &str) -> bool {
+    matches!(
+        name,
+        "normalfont"
+            | "rmfamily"
+            | "sffamily"
+            | "ttfamily"
+            | "bfseries"
+            | "mdseries"
+            | "lfseries"
+            | "itshape"
+            | "slshape"
+            | "scshape"
+            | "upshape"
+            | "rm"
+            | "bf"
+            | "it"
+            | "sl"
+            | "sf"
+            | "tt"
+            | "sc"
+            | "tiny"
+            | "scriptsize"
+            | "footnotesize"
+            | "small"
+            | "normalsize"
+            | "large"
+            | "Large"
+            | "LARGE"
+            | "huge"
+            | "Huge"
+    )
+}
+
+fn known_note_independent_command(name: &str, mode: WordLocationMode) -> bool {
+    !matches!(
+        crate::symbols::classify_command(name),
+        crate::symbols::MathCommand::Unknown
+    ) || matches!(
+        name,
+        "begin"
+            | "end"
+            | "item"
+            | "frametitle"
+            | "framesubtitle"
+            | "title"
+            | "subtitle"
+            | "author"
+            | "date"
+            | "institute"
+            | "maketitle"
+            | "titlepage"
+            | "par"
+            | "pause"
+            | "centering"
+            | "raggedright"
+            | "raggedleft"
+            | "textbf"
+            | "textit"
+            | "emph"
+            | "textrm"
+            | "textsf"
+            | "texttt"
+            | "textnormal"
+            | "textcolor"
+            | "href"
+            | "url"
+            | "caption"
+            | "footnote"
+            | "label"
+            | "ref"
+            | "cite"
+    ) || mode == WordLocationMode::Guess
+        && (known_formatting_switch(name)
+            || matches!(
+                name,
+                "begingroup"
+                    | "endgroup"
+                    | "bgroup"
+                    | "egroup"
+                    | "smallskip"
+                    | "medskip"
+                    | "bigskip"
+                    | "part"
+                    | "chapter"
+                    | "section"
+                    | "subsection"
+                    | "subsubsection"
+                    | "paragraph"
+                    | "subparagraph"
+                    | "subref"
+                    | "noindent"
+            ))
+        || !name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+}
+
+fn uncertain_note_invocation(
+    name: &str,
+    macros: &std::collections::BTreeMap<&str, Option<math::MacroDef<'_>>>,
+    mode: WordLocationMode,
+) -> bool {
+    match mode {
+        WordLocationMode::Strict => false,
+        WordLocationMode::Guess => {
+            !matches!(macros.get(name), Some(Some(_)))
+                && (macros.contains_key(name)
+                    || name != "note" && !known_note_independent_command(name, mode))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn discarded_macro_arg_ranges(
     source: &str,
     lines: &std::ops::Range<usize>,
     extra_sources: &[&str],
-) -> Vec<std::ops::Range<usize>> {
+    mode: WordLocationMode,
+    operation: &crate::Operation,
+    execution_scope: Option<&std::ops::Range<usize>>,
+) -> Option<MacroArgRanges> {
+    operation.check().ok()?;
+    let (start_byte, end_byte) = if let Some(scope) = execution_scope {
+        (scope.start, scope.end)
+    } else {
+        let start = source
+            .split_inclusive('\n')
+            .take(lines.start)
+            .map(str::len)
+            .sum();
+        let end = start
+            + source[start..]
+                .split_inclusive('\n')
+                .take(lines.end.saturating_sub(lines.start))
+                .map(str::len)
+                .sum::<usize>();
+        (start, end)
+    };
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
-    let macros = math::macros_from_sources(&macro_sources);
-    if macros.is_empty() || macros.contains_key("**") {
-        return Vec::new();
+    let mut macros = mode.macros(&macro_sources, operation);
+    let mut note_macros = std::collections::BTreeSet::new();
+    if !matches!(macros.get("note"), Some(Some(_))) {
+        note_macros.insert("note");
     }
-    let start_byte: usize = source
-        .split_inclusive('\n')
-        .take(lines.start)
-        .map(str::len)
-        .sum();
-    let end_byte: usize = start_byte
-        + source[start_byte..]
-            .split_inclusive('\n')
-            .take(lines.end.saturating_sub(lines.start))
-            .map(str::len)
-            .sum::<usize>();
-    let mut ranges = Vec::new();
-    let mut at = start_byte;
-    while at < end_byte {
-        match source.as_bytes()[at] {
-            b'%' => {
-                at += source[at..].find('\n').unwrap_or(source.len() - at);
-            }
-            b'\\' => {
-                let (cmd, next) = math::command(source, at);
-                at = next;
-                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, at) {
-                    at = opaque_end;
+    let definitions =
+        note_macro_definitions(&macro_sources, &mut note_macros, None, Some(operation));
+    let mut discarded = Vec::new();
+    let mut updates = Vec::new();
+    for notes in [false, true] {
+        loop {
+            for (&name, entry) in &macros {
+                operation.check().ok()?;
+                let Some(def) = entry else { continue };
+                if def.used_params == 0 || !def.body_source.contains('\\') {
                     continue;
                 }
-                if math::is_macro_definition_command(cmd) {
-                    let mut def_cur =
-                        at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                    def_cur = skip_source_space(source, def_cur);
-                    if let Some((_, grp_end)) = math::group(source, def_cur) {
-                        def_cur = grp_end;
-                    } else if source.as_bytes().get(def_cur) == Some(&b'\\') {
-                        def_cur = math::command(source, def_cur).1;
-                    }
-                    while let Some(opt_end) = optional_argument_end(source, def_cur) {
-                        def_cur = opt_end;
-                    }
-                    if let Some((_, body_end)) =
-                        math::group(source, skip_source_space(source, def_cur))
-                    {
-                        at = body_end;
-                    }
+                let body = def.body_source;
+                let Some(hidden) = discarded_macro_args_with_macros(
+                    body,
+                    true,
+                    0..body.len(),
+                    MacroContext {
+                        macros: &macros,
+                        definitions: &definitions,
+                        operation,
+                    },
+                    notes,
+                    &note_macros,
+                    mode,
+                ) else {
                     continue;
-                }
-                if let Some(Some(def)) = macros.get(cmd)
-                    && def.arity > 0
-                {
-                    let mut arg_cursor = at;
-                    for idx in 0..def.arity {
-                        let open = skip_source_space(source, arg_cursor);
-                        let Some((_, arg_end)) = math::group(source, open) else {
-                            break;
-                        };
-                        if (def.used_params & (1 << idx)) == 0 {
-                            ranges.push(open..arg_end);
+                };
+                let mut used_params = 0u16;
+                let mut line_start = 0;
+                for line in body.split_inclusive('\n') {
+                    operation.check().ok()?;
+                    for (at, _) in source_line_text(line).match_indices('#') {
+                        if has_unescaped_backslash_before(line, at) {
+                            continue;
                         }
-                        arg_cursor = arg_end;
+                        if !hidden
+                            .iter()
+                            .any(|range| range.contains(&(line_start + at)))
+                            && let Some(digit) = line.as_bytes().get(at + 1)
+                            && (b'1'..=b'9').contains(digit)
+                        {
+                            used_params |= 1 << (digit - b'1');
+                        }
                     }
+                    line_start += line.len();
+                }
+                used_params &= def.used_params;
+                if used_params != def.used_params {
+                    updates.push((name, used_params));
                 }
             }
-            _ => {
-                let rest = &source.as_bytes()[at + 1..end_byte];
-                let step = rest
-                    .iter()
-                    .position(|&b| matches!(b, b'%' | b'\\'))
-                    .map_or(rest.len() + 1, |p| p + 1);
-                at += step;
+            if updates.is_empty() {
+                break;
+            }
+            // Visibility only decreases, including through nested wrappers.
+            for (name, used_params) in updates.drain(..) {
+                macros.get_mut(name).unwrap().as_mut().unwrap().used_params = used_params;
             }
         }
+        if !notes {
+            loop {
+                let mut changed = false;
+                for (&name, bodies) in &definitions {
+                    operation.check().ok()?;
+                    if note_macros.contains(name) {
+                        continue;
+                    }
+                    for body in bodies {
+                        let body = body.source;
+                        let discarded = discarded_macro_args_with_macros(
+                            body,
+                            true,
+                            0..body.len(),
+                            MacroContext {
+                                macros: &macros,
+                                definitions: &definitions,
+                                operation,
+                            },
+                            false,
+                            &note_macros,
+                            mode,
+                        )?;
+                        if invoked_commands(body, true, &macros, operation).iter().any(
+                            |(start, cmd, _, kind)| {
+                                *kind != InvocationKind::MathDelimiter
+                                    && note_macros.contains(cmd)
+                                    && !discarded.iter().any(|span| span.contains(start))
+                            },
+                        ) {
+                            note_macros.insert(name);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            discarded = discarded_macro_args_with_macros(
+                source,
+                false,
+                start_byte..end_byte,
+                MacroContext {
+                    macros: &macros,
+                    definitions: &definitions,
+                    operation,
+                },
+                false,
+                &note_macros,
+                mode,
+            )?;
+        }
     }
-    ranges
+    let mut opaque = discarded_macro_args_with_macros(
+        source,
+        false,
+        start_byte..end_byte,
+        MacroContext {
+            macros: &macros,
+            definitions: &definitions,
+            operation,
+        },
+        true,
+        &note_macros,
+        mode,
+    )?;
+    // A discarded outer argument cannot execute a note nested inside it.
+    for hidden in &discarded {
+        let mut remaining = Vec::new();
+        for range in opaque.drain(..) {
+            if range.start < hidden.start {
+                remaining.push(range.start..range.end.min(hidden.start));
+            }
+            if range.end > hidden.end {
+                remaining.push(range.start.max(hidden.end)..range.end);
+            }
+        }
+        opaque = remaining;
+    }
+    let mut hidden: Vec<_> =
+        nonprinting_source_spans_with_mode(source, Some(&macros), mode, Some(operation))
+            .map(|(_, range, _)| range)
+            .collect();
+    hidden.extend(discarded);
+    hidden.sort_unstable_by_key(|range| (range.start, range.end));
+    Some(MacroArgRanges { hidden, opaque })
 }
 
+fn note_argument(
+    source: &str,
+    mut at: usize,
+    limit: usize,
+    parameters: bool,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    loop {
+        let (arg, end) = math::argument(source, at, limit, parameters)?;
+        if end == arg.end {
+            match source.as_bytes().get(arg.start) {
+                Some(b'[') => {
+                    at = optional_argument_end(source, arg.start)?;
+                    continue;
+                }
+                Some(b'<') => {
+                    at = overlay_argument_end(source, arg.start)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Some((arg, end));
+    }
+}
+
+fn discarded_macro_args_with_macros(
+    source: &str,
+    parameters: bool,
+    range: std::ops::Range<usize>,
+    context: MacroContext<'_, '_>,
+    notes: bool,
+    note_macros: &std::collections::BTreeSet<&str>,
+    mode: WordLocationMode,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let MacroContext {
+        macros,
+        definitions,
+        operation,
+    } = context;
+    operation.check().ok()?;
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    // Without a known unused parameter, this pass cannot produce a discarded range.
+    if !notes
+        && !macros
+            .values()
+            .flatten()
+            .any(|def| (0..def.arity).any(|idx| def.used_params & (1 << idx) == 0))
+    {
+        return Some(ranges);
+    }
+    let mut note_end = range.start;
+    for (start, cmd, mut at, kind) in invoked_commands_with_literals(
+        source,
+        false,
+        macros,
+        mode == WordLocationMode::Guess,
+        operation,
+    ) {
+        operation.check().ok()?;
+        if !range.contains(&start)
+            || start < note_end
+            || ranges.iter().any(|range| range.contains(&start))
+        {
+            continue;
+        }
+        if kind == InvocationKind::EnvironmentEnd {
+            continue;
+        }
+        if kind == InvocationKind::Command && cmd == "note" && !macros.contains_key("note") {
+            let (_, end) = note_argument(source, at, range.end, parameters)?;
+            // The note owns these tokens; their heads do not execute in place.
+            note_end = end;
+            if notes {
+                ranges.push(start..end);
+            }
+            continue;
+        }
+        if notes && cmd == "csname" {
+            ranges.push(start..range.end);
+            continue;
+        }
+        if notes
+            && !matches!(macros.get(cmd), Some(Some(_)))
+            && (note_macros.contains(cmd)
+                || kind == InvocationKind::Command && uncertain_note_invocation(cmd, macros, mode))
+        {
+            let end = uncertain_note_call_end(source, at, range.end, definitions.get(cmd));
+            ranges.push(start..end);
+        }
+        if let Some(Some(def)) = macros.get(cmd)
+            && def.arity > 0
+        {
+            if notes && note_macros.contains(cmd) {
+                ranges.push(start..at);
+            }
+            for idx in 0..def.arity {
+                let Some((_, end)) = math::argument(source, at, range.end, parameters) else {
+                    break;
+                };
+                if (def.used_params & (1 << idx)) == 0 {
+                    ranges.push(at..end);
+                }
+                at = end;
+            }
+        } else if notes && note_macros.contains(cmd) && matches!(macros.get(cmd), Some(Some(_))) {
+            ranges.push(start..at);
+        }
+    }
+    Some(ranges)
+}
+
+/// Only a compiler-proven fragile body may exclude the syntactic frame header.
+pub(crate) fn source_word_location_in_frame_body_with_sources(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    extra_sources: &[&str],
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize)>, ()> {
+    operation.check().map_err(|_| ())?;
+    let frame = source_frame_range(source, line).ok_or(())?;
+    let mut body_start = frame_header_after_begin(source, frame.start).ok_or(())?;
+    loop {
+        operation.check().map_err(|_| ())?;
+        let Some(at) = skip_frame_header_space(source, body_start) else {
+            break;
+        };
+        if let Some(end) =
+            overlay_argument_end(source, at).or_else(|| optional_argument_end(source, at))
+        {
+            body_start = end;
+        } else {
+            break;
+        }
+    }
+    for _ in 0..2 {
+        operation.check().map_err(|_| ())?;
+        let Some(at) = skip_frame_header_space(source, body_start) else {
+            break;
+        };
+        if source.as_bytes().get(at) != Some(&b'{') {
+            break;
+        }
+        body_start = math::group(source, at).ok_or(())?.1;
+    }
+    let end_row_start: usize = source
+        .split_inclusive('\n')
+        .take(frame.end.checked_sub(1).ok_or(())?)
+        .map(str::len)
+        .sum();
+    let end_row = source_line_text(source[end_row_start..].split('\n').next().ok_or(())?);
+    let hidden = nonprinting_source_ranges(source);
+    let body_end = end_row
+        .match_indices("\\end")
+        .filter(|(at, _)| {
+            !has_unescaped_backslash_before(end_row, *at)
+                && !hidden
+                    .iter()
+                    .any(|range| range.contains(&(end_row_start + at)))
+        })
+        .find_map(|(at, _)| {
+            let start = end_row_start + at;
+            let (env, _) = math::group(source, start + "\\end".len())?;
+            (&source[env] == "frame").then_some(start)
+        })
+        .ok_or(())?;
+    if body_start > body_end {
+        return Err(());
+    }
+    source_word_location_in_range_with_hidden(
+        source,
+        line,
+        context,
+        offset,
+        frame,
+        true,
+        extra_sources,
+        WordLocationMode::Strict,
+        operation,
+        Some(&(body_start..body_end)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn source_word_location_in_range_with_sources(
     source: &str,
     line: u32,
@@ -1268,8 +2100,8 @@ pub(crate) fn source_word_location_in_range_with_sources(
     lines: std::ops::Range<usize>,
     within_scope: bool,
     extra_sources: &[&str],
-) -> Option<(u32, usize)> {
-    let hidden = nonprinting_source_ranges(source);
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize)>, ()> {
     source_word_location_in_range_with_hidden(
         source,
         line,
@@ -1278,8 +2110,36 @@ pub(crate) fn source_word_location_in_range_with_sources(
         lines,
         within_scope,
         extra_sources,
-        &hidden,
+        WordLocationMode::Strict,
+        operation,
+        None,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn source_word_guess_in_range_with_sources(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    lines: std::ops::Range<usize>,
+    within_scope: bool,
+    extra_sources: &[&str],
+    operation: &crate::Operation,
+) -> Result<Option<UnverifiedWordLocation>, ()> {
+    source_word_location_in_range_with_hidden(
+        source,
+        line,
+        context,
+        offset,
+        lines,
+        within_scope,
+        extra_sources,
+        WordLocationMode::Guess,
+        operation,
+        None,
+    )
+    .map(|location| location.map(|(line, byte)| UnverifiedWordLocation { line, byte }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1291,19 +2151,24 @@ fn source_word_location_in_range_with_hidden(
     lines: std::ops::Range<usize>,
     within_scope: bool,
     extra_sources: &[&str],
-    base_hidden: &[std::ops::Range<usize>],
-) -> Option<(u32, usize)> {
-    let discarded = discarded_macro_arg_ranges(source, &lines, extra_sources);
-    let mut merged_hidden = Vec::new();
-    let hidden = if discarded.is_empty() {
-        base_hidden
-    } else {
-        merged_hidden.reserve(base_hidden.len() + discarded.len());
-        merged_hidden.extend_from_slice(base_hidden);
-        merged_hidden.extend(discarded);
-        merged_hidden.sort_by_key(|r| (r.start, r.end));
-        &merged_hidden
-    };
+    mode: WordLocationMode,
+    operation: &crate::Operation,
+    execution_scope: Option<&std::ops::Range<usize>>,
+) -> Result<Option<(u32, usize)>, ()> {
+    operation.check().map_err(|_| ())?;
+    let MacroArgRanges { mut hidden, opaque } = discarded_macro_arg_ranges(
+        source,
+        &lines,
+        extra_sources,
+        mode,
+        operation,
+        execution_scope,
+    )
+    .ok_or(())?;
+    if let Some(scope) = execution_scope {
+        hidden.extend([0..scope.start, scope.end..source.len()]);
+        hidden.sort_unstable_by_key(|range| range.start);
+    }
     // A closing layout environment can alias every row to one source line.
     // A search radius alone does not identify neighboring prose or math;
     // independently established frame/caption and math scopes remain eligible.
@@ -1318,22 +2183,25 @@ fn source_word_location_in_range_with_hidden(
         })
         .unwrap_or(false);
     if !within_scope && closing_layout {
-        return None;
+        return Ok(None);
     }
-    let loops = foreach_loops(source, &lines, extra_sources);
-    let prose = source_prose_scored_location_with_loops(
+    let loops = foreach_loops(source, &lines, extra_sources, operation);
+    let prose = source_prose_scored_location_with_mode(
         source,
         line,
         context,
         offset,
         lines.clone(),
         within_scope,
-        hidden,
+        &hidden,
+        &opaque,
         None,
         &loops,
         extra_sources,
-    );
-    math::source_location_with_context(
+        mode,
+        operation,
+    )?;
+    let candidate = math::source_location_with_context_mode(
         source,
         line,
         lines.clone(),
@@ -1343,7 +2211,12 @@ fn source_word_location_in_range_with_hidden(
         prose,
         extra_sources,
         &loops,
-    )
+        &opaque,
+        &[],
+        mode,
+        operation,
+        execution_scope,
+    )?
     .and_then(|(row, byte)| {
         if !hidden.is_empty() {
             let absolute = source
@@ -1360,7 +2233,24 @@ fn source_word_location_in_range_with_hidden(
             return None;
         }
         ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
-    })
+    });
+    if candidate.is_none() && !opaque.is_empty() {
+        // An opaque tie is not evidence for document-metadata ownership.
+        return Err(());
+    }
+    if let Some((row, byte)) = candidate {
+        let absolute = source
+            .split_inclusive('\n')
+            .take(row as usize - 1)
+            .map(str::len)
+            .sum::<usize>()
+            + byte;
+        // Removing opaque candidates can make an unrelated literal look unique.
+        if opaque.iter().any(|range| range.contains(&absolute)) {
+            return Err(());
+        }
+    }
+    Ok(candidate)
 }
 
 fn has_control_word(text: &str, name: &str) -> bool {
@@ -1399,6 +2289,30 @@ fn crosses_paragraph_boundary(source: &str, line: u32, row: u32) -> bool {
     false
 }
 
+// TeX's next-token header checks stop at a paragraph, not at comment newlines.
+fn skip_frame_header_space(source: &str, mut at: usize) -> Option<usize> {
+    let mut newline = false;
+    loop {
+        match source.as_bytes().get(at) {
+            Some(b' ' | b'\t' | b'\r') => at += 1,
+            Some(b'\n') if newline => return None,
+            Some(b'\n') => {
+                newline = true;
+                at += 1;
+            }
+            Some(b'%') => {
+                if let Some(end) = source[at..].find('\n') {
+                    at += end + 1;
+                    newline = true;
+                } else {
+                    return Some(source.len());
+                }
+            }
+            _ => return Some(at),
+        }
+    }
+}
+
 pub(crate) fn skip_source_space(source: &str, mut at: usize) -> usize {
     loop {
         at += source[at..].len() - source[at..].trim_start().len();
@@ -1411,9 +2325,14 @@ pub(crate) fn skip_source_space(source: &str, mut at: usize) -> usize {
 
 /// TeX optional arguments end at the first unbraced, unescaped closing bracket.
 pub(crate) fn optional_argument_end(source: &str, start: usize) -> Option<usize> {
+    optional_argument_boundary(source, start).ok()
+}
+
+// Leave an enclosing stored-body delimiter for the outer scanner on failure.
+pub(crate) fn optional_argument_boundary(source: &str, start: usize) -> Result<usize, usize> {
     let start = skip_source_space(source, start);
     if source.as_bytes().get(start) != Some(&b'[') {
-        return None;
+        return Err(start);
     }
     let mut at = start + 1;
     while at < source.len() {
@@ -1428,15 +2347,16 @@ pub(crate) fn optional_argument_end(source: &str, start: usize) -> Option<usize>
                 continue;
             }
             b'{' => {
-                at = math::group(source, at)?.1;
+                at = math::group(source, at).ok_or(source.len())?.1;
                 continue;
             }
-            b']' => return Some(at + 1),
+            b']' => return Ok(at + 1),
+            b'}' => return Err(at),
             _ => {}
         }
-        at += source[at..].chars().next()?.len_utf8();
+        at += source[at..].chars().next().ok_or(source.len())?.len_utf8();
     }
-    None
+    Err(source.len())
 }
 
 pub(crate) fn overlay_argument_end(source: &str, start: usize) -> Option<usize> {
@@ -1718,9 +2638,21 @@ pub(crate) fn source_graphics_location(
     count: usize,
     scope_proven: bool,
 ) -> Option<(u32, usize)> {
-    source_graphics_location_with_context(source, line, index, count, scope_proven, None, &[])
+    source_graphics_location_with_context(
+        source,
+        line,
+        index,
+        count,
+        scope_proven,
+        None,
+        &[],
+        WordLocationMode::Strict,
+        None,
+        &crate::Operation::default(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn source_graphics_location_with_context(
     source: &str,
     line: u32,
@@ -1729,7 +2661,11 @@ pub(crate) fn source_graphics_location_with_context(
     scope_proven: bool,
     frame_slide: Option<u32>,
     extra_sources: &[&str],
+    mode: WordLocationMode,
+    execution_root: Option<ExecutionRoot<'_>>,
+    operation: &crate::Operation,
 ) -> Option<(u32, usize)> {
+    operation.check().ok()?;
     if count == 0 || index >= count {
         return None;
     }
@@ -1814,9 +2750,22 @@ pub(crate) fn source_graphics_location_with_context(
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
-    let macros = math::macros_from_sources(&macro_sources);
-    if macros.contains_key("**") {
-        return None;
+    let mut macros = mode.macros(&macro_sources, operation);
+    if mode == WordLocationMode::Guess {
+        let definitions = note_macro_definitions(
+            &macro_sources,
+            &mut std::collections::BTreeSet::new(),
+            execution_root,
+            Some(operation),
+        );
+        for name in ["includegraphics", "includesvg"] {
+            if definitions
+                .get(name)
+                .is_some_and(|bodies| bodies.iter().all(|body| body.package_initialization))
+            {
+                macros.remove(name);
+            }
+        }
     }
     let mut safe_macros = Vec::new();
     let mut masked = masked.into_iter().peekable();
@@ -1953,6 +2902,55 @@ pub(crate) fn source_graphics_location_with_context(
     Some((target_line, path_start - line_start))
 }
 
+pub(super) fn environment_definition_command(command: &str) -> bool {
+    matches!(
+        command,
+        "newenvironment"
+            | "renewenvironment"
+            | "provideenvironment"
+            | "NewDocumentEnvironment"
+            | "RenewDocumentEnvironment"
+            | "ProvideDocumentEnvironment"
+            | "DeclareDocumentEnvironment"
+    )
+}
+
+fn stored_definition_command(command: &str) -> bool {
+    (math::is_macro_definition_command(command) && !matches!(command, "csname" | "newif"))
+        || environment_definition_command(command)
+}
+
+pub(super) fn environment_definition<'a>(
+    source: &'a str,
+    command: &str,
+    mut at: usize,
+) -> Option<(&'a str, &'a str, usize)> {
+    if !environment_definition_command(command) {
+        return None;
+    }
+    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+    let (name, contents_start) = math::group(source, skip_source_space(source, at))?;
+    at = contents_start;
+    while let Some(end) = optional_argument_end(source, at) {
+        at = end;
+    }
+    if command.contains("Document") {
+        at = math::group(source, skip_source_space(source, at))?.1;
+    }
+    let (_, end) = math::group(source, skip_source_space(source, at))?;
+    let (_, end) = math::group(source, skip_source_space(source, end))?;
+    let name = source[name].trim_ascii();
+    let name = if !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'*' | b'-' | b'_' | b':' | b'.')
+        }) {
+        name
+    } else {
+        "**"
+    };
+    Some((name, &source[contents_start..end], end))
+}
+
 pub(crate) fn nonprinting_source_spans(
     source: &str,
 ) -> impl Iterator<
@@ -1962,11 +2960,111 @@ pub(crate) fn nonprinting_source_spans(
         Option<std::ops::Range<usize>>,
     ),
 > + '_ {
+    nonprinting_source_spans_with_mode(source, None, WordLocationMode::Strict, None)
+}
+
+fn source_document_start(
+    source: &str,
+    macros: Option<&std::collections::BTreeMap<&str, Option<math::MacroDef<'_>>>>,
+    definitions: &std::collections::BTreeMap<&str, Vec<StoredBody<'_>>>,
+    operation: Option<&crate::Operation>,
+) -> Option<usize> {
+    let mut hidden =
+        nonprinting_source_spans_with_mode(source, macros, WordLocationMode::Strict, operation)
+            .peekable();
+    let mut at = 0;
+    while at < source.len() {
+        if operation.is_some_and(|operation| operation.check().is_err()) {
+            return None;
+        }
+        while hidden.peek().is_some_and(|(_, span, _)| span.end <= at) {
+            hidden.next();
+        }
+        if let Some((head, span, _)) = hidden.peek()
+            && span.contains(&at)
+        {
+            if source.as_bytes().get(*head) == Some(&b'\\') {
+                let (raw, _) = math::command(source, *head);
+                let (command, _, _) = math::definition_command(source, *head);
+                if definitions.contains_key(raw)
+                    || definitions.contains_key(command)
+                    || macros.is_some_and(|macros| {
+                        macros.contains_key(raw) || macros.contains_key(command)
+                    })
+                {
+                    return None;
+                }
+            }
+            at = span.end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => at += source[at..].find('\n').unwrap_or(source.len() - at),
+            b'{' => return None,
+            b'\\' => {
+                let start = at;
+                let (command, end) = math::command(source, at);
+                if definitions.contains_key(command)
+                    || macros.is_some_and(|macros| macros.contains_key(command))
+                {
+                    return None;
+                }
+                if let Some(quoted_end) = math::quoted_token_end(source, command, end) {
+                    at = quoted_end;
+                } else if let Some((opaque_end, _)) = math::opaque_command_end(source, command, end)
+                {
+                    at = opaque_end;
+                } else if class_package_declaration(command) {
+                    at = class_package_declaration_end(source, end)?;
+                } else if command == "begin" {
+                    let (environment, _) = math::group(source, end)?;
+                    return (&source[environment] == "document").then_some(start);
+                } else {
+                    // shortcut: unsupported preamble execution cannot establish a body boundary.
+                    return None;
+                }
+            }
+            byte if byte.is_ascii_whitespace() => at += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn nonprinting_source_spans_with_mode<'a>(
+    source: &'a str,
+    macros: Option<&'a std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>>,
+    mode: WordLocationMode,
+    operation: Option<&'a crate::Operation>,
+) -> impl Iterator<
+    Item = (
+        usize,
+        std::ops::Range<usize>,
+        Option<std::ops::Range<usize>>,
+    ),
+> + 'a {
+    let preamble_end = if mode == WordLocationMode::Guess
+        && operation.is_none_or(|operation| operation.check().is_ok())
+        && !macros.is_some_and(|macros| macros.contains_key("begin"))
+    {
+        let definitions = note_macro_definitions(
+            &[source],
+            &mut std::collections::BTreeSet::new(),
+            None,
+            operation,
+        );
+        (!definitions.contains_key("**")
+            && operation.is_none_or(|operation| operation.check().is_ok()))
+        .then(|| source_document_start(source, macros, &definitions, operation))
+        .flatten()
+    } else {
+        None
+    };
     let mut at = 0;
     let mut pending_opt_after = None;
     std::iter::from_fn(move || {
         loop {
-            if at >= source.len() {
+            if at >= source.len() || operation.is_some_and(|operation| operation.check().is_err()) {
                 return None;
             }
             if pending_opt_after == Some(at) {
@@ -1995,13 +3093,45 @@ pub(crate) fn nonprinting_source_spans(
                 at += 1;
             } else if source.as_bytes()[at] == b'\\' {
                 let start = at;
-                let (command, end) = math::command(source, start);
+                let (raw_command, raw_end) = math::command(source, start);
+                let (command, end, expanded_target) = math::definition_command(source, start);
+                let definition = stored_definition_command(command);
+                let overridden = !definition
+                    && command != "newif"
+                    && macros.is_some_and(|macros| {
+                        macros.contains_key(command)
+                            || mode == WordLocationMode::Strict
+                                && uncertain_note_invocation(
+                                    command,
+                                    macros,
+                                    WordLocationMode::Strict,
+                                )
+                    });
+                if raw_command == "csname" && !definition && command != "newif" {
+                    at = if overridden {
+                        end
+                    } else {
+                        math::quoted_token_end(source, command, end).unwrap_or(end)
+                    };
+                    if command == "csname" {
+                        continue;
+                    }
+                    return Some((start, raw_end..end, None));
+                }
+                if overridden {
+                    at = end;
+                    continue;
+                }
                 if !command
                     .as_bytes()
                     .first()
                     .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
                 {
                     at = end;
+                    continue;
+                }
+                if let Some(quoted_end) = math::quoted_token_end(source, command, end) {
+                    at = quoted_end;
                     continue;
                 }
                 if let Some((end, nonprinting)) = math::opaque_command_end(source, command, end) {
@@ -2011,51 +3141,32 @@ pub(crate) fn nonprinting_source_spans(
                     }
                     continue;
                 }
+                if let Some((_, target_end)) = math::macro_mutation_target(source, command, end) {
+                    at = target_end;
+                    return Some((start, end..target_end, None));
+                }
                 if command == "newif" {
-                    at = skip_source_space(source, end);
-                    if let Some((_, grp_end)) = math::group(source, at) {
-                        at = grp_end;
-                    } else if source.as_bytes().get(at) == Some(&b'\\') {
-                        at = math::command(source, at).1;
-                    }
+                    at = math::macro_target_end(source, end).unwrap_or(end);
                     return Some((start, start..at, None));
                 }
                 if matches!(command, "let" | "futurelet") {
-                    at = skip_source_space(source, end);
-                    if source.as_bytes().get(at) == Some(&b'\\') {
-                        at = math::command(source, at).1;
-                    } else if at < source.len() {
-                        at += source[at..].chars().next().map_or(1, char::len_utf8);
-                    }
-                    at = skip_source_space(source, at);
-                    if command == "let" && source.as_bytes().get(at) == Some(&b'=') {
-                        at = skip_source_space(source, at + 1);
-                    }
-                    if source.as_bytes().get(at) == Some(&b'\\') {
-                        at = math::command(source, at).1;
-                    } else if at < source.len() {
-                        at += source[at..].chars().next().map_or(1, char::len_utf8);
-                    }
+                    at = math::macro_alias(source, command, end, expanded_target).nonprinting_end;
                     return Some((start, start..at, None));
                 }
+                if preamble_end.is_some_and(|boundary| start < boundary)
+                    && class_package_declaration(command)
+                    && let Some(declaration_end) = class_package_declaration_end(source, end)
+                {
+                    at = declaration_end;
+                    // Package effects stay globally unverified; their filenames are not prose.
+                    return Some((start, end..declaration_end, None));
+                }
                 at = end + usize::from(matches!(source.as_bytes().get(end), Some(b'*' | b'+')));
-                let definition = (math::is_macro_definition_command(command)
-                    && !matches!(command, "csname" | "newif"))
-                    || matches!(
-                        command,
-                        "NewExpandableDocumentCommand"
-                            | "RenewExpandableDocumentCommand"
-                            | "ProvideExpandableDocumentCommand"
-                            | "DeclareExpandableDocumentCommand"
-                            | "newenvironment"
-                            | "renewenvironment"
-                            | "provideenvironment"
-                            | "NewDocumentEnvironment"
-                            | "RenewDocumentEnvironment"
-                            | "ProvideDocumentEnvironment"
-                            | "DeclareDocumentEnvironment"
-                    );
                 if definition {
+                    if let Some((_, _, end)) = environment_definition(source, command, end) {
+                        at = end;
+                        return Some((start, start..end, None));
+                    }
                     if matches!(command, "def" | "gdef" | "edef" | "xdef") {
                         while at < source.len() && source.as_bytes()[at] != b'{' {
                             if source.as_bytes()[at] == b'\\' {
@@ -2069,10 +3180,8 @@ pub(crate) fn nonprinting_source_spans(
                         }
                     } else {
                         at = skip_source_space(source, at);
-                        if let Some((_, end)) = math::group(source, at) {
+                        if let Some(end) = math::macro_target_end(source, at) {
                             at = end;
-                        } else if source.as_bytes().get(at) == Some(&b'\\') {
-                            at = math::command(source, at).1;
                         }
                         while let Some(end) = optional_argument_end(source, at) {
                             at = end;
@@ -2225,6 +3334,7 @@ pub(crate) fn source_prose_scored_location(
     within_frame: bool,
     hidden: &[std::ops::Range<usize>],
     allowed_bytes: Option<std::ops::Range<usize>>,
+    operation: &crate::Operation,
 ) -> Option<(u32, usize, isize)> {
     source_prose_scored_location_with_loops(
         source,
@@ -2234,79 +3344,63 @@ pub(crate) fn source_prose_scored_location(
         lines,
         within_frame,
         hidden,
+        &[],
         allowed_bytes,
         &[],
         &[],
+        operation,
     )
+    .ok()
+    .flatten()
 }
 
-fn body_prints_word(
-    body: &str,
+fn body_prints_word<'a>(
+    body: &'a str,
     target_word: &str,
-    macros: &std::collections::BTreeMap<&str, Option<math::MacroDef<'_>>>,
-    depth: u8,
+    macros: &std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    visited: &mut std::collections::BTreeSet<&'a str>,
+    operation: &crate::Operation,
 ) -> bool {
-    if body.lines().any(|line| {
-        source_words(source_line_text(line))
-            .into_iter()
-            .any(|(_, _, w)| w == target_word)
-    }) {
-        return true;
-    }
-    if depth >= 8 {
-        return false;
-    }
-    let mut pos = 0usize;
-    while pos < body.len() {
-        match body.as_bytes()[pos] {
-            b'%' => pos += body[pos..].find('\n').unwrap_or(body.len() - pos),
-            b'\\' => {
-                let (cmd, next) = math::command(body, pos);
-                if next > pos + 1
-                    && let Some(def) = macros.get(cmd)
-                    && def
-                        .as_ref()
-                        .and_then(|d| d.body)
-                        .is_none_or(|mbody| body_prints_word(mbody, target_word, macros, depth + 1))
-                {
-                    return true;
-                }
-                pos = next.max(pos + 1);
-            }
-            _ => pos += 1,
+    // Exact reachability: every helper is scanned once, including cyclic graphs.
+    let mut pending = vec![body];
+    while let Some(body) = pending.pop() {
+        if operation.check().is_err() {
+            return true;
         }
-    }
-    false
-}
-
-fn source_mentions_env(
-    src: &str,
-    skip_range: Option<std::ops::Range<usize>>,
-    env_name: &str,
-) -> bool {
-    if env_name.is_empty() {
-        return false;
-    }
-    let mut line_start = 0usize;
-    for raw_line in src.split_inclusive('\n') {
-        let line = source_line_text(raw_line.trim_end_matches(['\r', '\n']));
-        for (idx, _) in line.match_indices(env_name) {
-            let abs = line_start + idx;
-            if skip_range.as_ref().is_some_and(|r| r.contains(&abs)) {
-                continue;
-            }
-            let before_ok = idx == 0
-                || !line.as_bytes()[idx - 1].is_ascii_alphabetic()
-                || (idx >= 3
-                    && &line.as_bytes()[idx - 3..idx] == b"end"
-                    && (idx == 3 || !line.as_bytes()[idx - 4].is_ascii_alphabetic()));
-            let end_idx = idx + env_name.len();
-            let after_ok = end_idx == line.len() || !line.as_bytes()[end_idx].is_ascii_alphabetic();
-            if before_ok && after_ok {
+        if body.lines().any(|line| {
+            source_words(source_line_text(line))
+                .into_iter()
+                .any(|(_, _, word)| word == target_word)
+        }) {
+            return true;
+        }
+        let mut pos = 0;
+        while pos < body.len() {
+            if operation.check().is_err() {
                 return true;
             }
+            match body.as_bytes()[pos] {
+                b'%' => pos += body[pos..].find('\n').unwrap_or(body.len() - pos),
+                b'\\' => {
+                    let (command, next) = math::command(body, pos);
+                    if visited.insert(command)
+                        && let Some(def) = macros.get(command)
+                    {
+                        let Some(body) = def.as_ref().and_then(|def| def.body) else {
+                            return true;
+                        };
+                        pending.push(body);
+                    }
+                    pos = next.max(pos + 1);
+                }
+                _ => {
+                    pos += body.as_bytes()[pos + 1..]
+                        .iter()
+                        .position(|byte| matches!(byte, b'%' | b'\\'))
+                        .map_or(body.len() - pos, |offset| offset + 1)
+                }
+            }
         }
-        line_start += raw_line.len();
     }
     false
 }
@@ -2317,6 +3411,7 @@ fn custom_env_prints_word(
     hidden: &[std::ops::Range<usize>],
     extra_sources: &[&str],
     target_word: &str,
+    operation: &crate::Operation,
 ) -> bool {
     let start_byte: usize = source
         .split_inclusive('\n')
@@ -2329,161 +3424,88 @@ fn custom_env_prints_word(
             .take(lines.end.saturating_sub(lines.start))
             .map(str::len)
             .sum::<usize>();
-    let mut invoked: Vec<&str> = Vec::new();
-    let mut h_idx = 0usize;
-    let mut at = start_byte;
-    while at < end_byte {
-        while h_idx < hidden.len() && hidden[h_idx].end <= at {
-            h_idx += 1;
-        }
-        if h_idx < hidden.len() && hidden[h_idx].start <= at {
-            at = hidden[h_idx].end;
-            continue;
-        }
-        match source.as_bytes()[at] {
-            b'%' => at += source[at..end_byte].find('\n').unwrap_or(end_byte - at),
-            b'\\' => {
-                let (cmd, next) = math::command(source, at);
-                if next == at + 1 {
-                    at = next + source[next..].chars().next().map_or(0, char::len_utf8);
-                    continue;
-                }
-                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, next) {
-                    at = opaque_end;
-                    continue;
-                }
-                if matches!(cmd, "begin" | "end")
-                    && let Some((grp, grp_end)) =
-                        math::group(source, skip_source_space(source, next))
-                {
-                    let env = source[grp].trim();
-                    if !matches!(env, "" | "document" | "frame") && !invoked.contains(&env) {
-                        invoked.push(env);
-                    }
-                    at = grp_end;
-                    continue;
-                }
-                at = next;
-            }
-            _ => {
-                at += source.as_bytes()[at + 1..end_byte]
-                    .iter()
-                    .position(|&b| matches!(b, b'%' | b'\\'))
-                    .map_or(end_byte - at, |pos| pos + 1);
-            }
-        }
-    }
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
     macro_sources.push(source);
-    let macros = math::macros_from_sources(&macro_sources);
-    for &env in &invoked {
-        let end_macro = format!("end{env}");
-        for key in [env, end_macro.as_str()] {
-            if let Some(def) = macros.get(key)
-                && def
-                    .as_ref()
-                    .and_then(|d| d.body)
-                    .is_none_or(|b| body_prints_word(b, target_word, &macros, 0))
+    let macros = math::macros_from_sources(&macro_sources, operation);
+    let definitions = note_macro_definitions(
+        &macro_sources,
+        &mut std::collections::BTreeSet::new(),
+        None,
+        Some(operation),
+    );
+    let mut invoked = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut pending = vec![(source, start_byte..end_byte, true)];
+    while let Some((body, range, original)) = pending.pop() {
+        if operation.check().is_err() {
+            return true;
+        }
+        let Some(discarded) = discarded_macro_args_with_macros(
+            body,
+            !original,
+            range.clone(),
+            MacroContext {
+                macros: &macros,
+                definitions: &definitions,
+                operation,
+            },
+            false,
+            &std::collections::BTreeSet::new(),
+            WordLocationMode::Strict,
+        ) else {
+            return true;
+        };
+        for (start, name, _, kind) in invoked_commands(body, true, &macros, operation) {
+            if !range.contains(&start)
+                || kind == InvocationKind::MathDelimiter
+                || discarded.iter().any(|span| span.contains(&start))
+                || original && hidden.iter().any(|span| span.contains(&start))
+            {
+                continue;
+            }
+            if kind != InvocationKind::Command
+                && let Some(def) = macros.get(name)
+                && def.as_ref().and_then(|def| def.body).is_none_or(|body| {
+                    body_prints_word(body, target_word, &macros, &mut visited, operation)
+                })
             {
                 return true;
             }
+            if invoked.insert(name)
+                && let Some(bodies) = definitions.get(name)
+            {
+                pending.extend(
+                    bodies
+                        .iter()
+                        .map(|body| (body.source, 0..body.source.len(), false)),
+                );
+            }
         }
     }
-    for (src_idx, &src) in macro_sources.iter().enumerate() {
-        let mut pos = 0usize;
-        while pos < src.len() {
-            match src.as_bytes()[pos] {
-                b'%' => pos += src[pos..].find('\n').unwrap_or(src.len() - pos),
-                b'\\' => {
-                    let (cmd, next) = math::command(src, pos);
-                    if next == pos + 1 {
-                        pos = next + src[next..].chars().next().map_or(0, char::len_utf8);
-                        continue;
-                    }
-                    if let Some((opaque_end, _)) = math::opaque_command_end(src, cmd, next) {
-                        pos = opaque_end;
-                        continue;
-                    }
-                    if matches!(
-                        cmd,
-                        "newenvironment"
-                            | "renewenvironment"
-                            | "provideenvironment"
-                            | "NewDocumentEnvironment"
-                            | "RenewDocumentEnvironment"
-                            | "ProvideDocumentEnvironment"
-                            | "DeclareDocumentEnvironment"
-                    ) {
-                        let def_start = pos;
-                        let mut cur = next
-                            + usize::from(matches!(src.as_bytes().get(next), Some(b'*' | b'+')));
-                        let Some((env_grp, after_env)) =
-                            math::group(src, skip_source_space(src, cur))
-                        else {
-                            pos = cur;
-                            continue;
-                        };
-                        let env_name = src[env_grp].trim();
-                        cur = after_env;
-                        let mut opt_ranges = Vec::new();
-                        while let Some(opt_end) = optional_argument_end(src, cur) {
-                            let opt_start = skip_source_space(src, cur);
-                            if opt_start < opt_end.saturating_sub(1) {
-                                opt_ranges.push(opt_start + 1..opt_end - 1);
-                            }
-                            cur = opt_end;
-                        }
-                        if cmd.contains("Document") {
-                            let Some((spec_grp, spec_end)) =
-                                math::group(src, skip_source_space(src, cur))
-                            else {
-                                pos = cur;
-                                continue;
-                            };
-                            opt_ranges.push(spec_grp);
-                            cur = spec_end;
-                        }
-                        let Some((begin_body, after_begin)) =
-                            math::group(src, skip_source_space(src, cur))
-                        else {
-                            pos = cur;
-                            continue;
-                        };
-                        let Some((end_body, after_end)) =
-                            math::group(src, skip_source_space(src, after_begin))
-                        else {
-                            pos = after_begin;
-                            continue;
-                        };
-                        let is_used = invoked.contains(&env_name)
-                            || macro_sources.iter().copied().enumerate().any(|(i, s)| {
-                                source_mentions_env(
-                                    s,
-                                    (i == src_idx).then_some(def_start..after_end),
-                                    env_name,
-                                )
-                            });
-                        if is_used
-                            && (opt_ranges
-                                .into_iter()
-                                .any(|r| body_prints_word(&src[r], target_word, &macros, 0))
-                                || body_prints_word(&src[begin_body], target_word, &macros, 0)
-                                || body_prints_word(&src[end_body], target_word, &macros, 0))
-                        {
-                            return true;
-                        }
-                        pos = after_end;
-                        continue;
-                    }
-                    pos = next;
-                }
-                _ => {
-                    pos += src.as_bytes()[pos + 1..]
-                        .iter()
-                        .position(|&b| matches!(b, b'%' | b'\\'))
-                        .map_or(src.len() - pos, |p| p + 1);
-                }
+    for src in macro_sources
+        .iter()
+        .copied()
+        .chain(definitions.values().flatten().map(|body| body.source))
+    {
+        for (start, _, _) in nonprinting_source_spans(src) {
+            if operation.check().is_err() {
+                return true;
+            }
+            if src.as_bytes().get(start) != Some(&b'\\') {
+                continue;
+            }
+            let (command, at, _) = math::definition_command(src, start);
+            let Some((name, body, _)) = environment_definition(src, command, at) else {
+                continue;
+            };
+            if (invoked.contains(name)
+                || invoked
+                    .iter()
+                    .any(|command| command.strip_prefix("end") == Some(name)))
+                && body_prints_word(body, target_word, &macros, &mut visited, operation)
+            {
+                return true;
             }
         }
     }
@@ -2499,23 +3521,68 @@ pub(crate) fn source_prose_scored_location_with_loops(
     lines: std::ops::Range<usize>,
     within_frame: bool,
     hidden: &[std::ops::Range<usize>],
+    opaque: &[std::ops::Range<usize>],
     allowed_bytes: Option<std::ops::Range<usize>>,
     loops: &[ForeachLoop<'_>],
     extra_sources: &[&str],
-) -> Option<(u32, usize, isize)> {
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize, isize)>, ()> {
+    source_prose_scored_location_with_mode(
+        source,
+        line,
+        context,
+        offset,
+        lines,
+        within_frame,
+        hidden,
+        opaque,
+        allowed_bytes,
+        loops,
+        extra_sources,
+        WordLocationMode::Strict,
+        operation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_prose_scored_location_with_mode(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    lines: std::ops::Range<usize>,
+    within_frame: bool,
+    hidden: &[std::ops::Range<usize>],
+    opaque: &[std::ops::Range<usize>],
+    allowed_bytes: Option<std::ops::Range<usize>>,
+    loops: &[ForeachLoop<'_>],
+    extra_sources: &[&str],
+    mode: WordLocationMode,
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize, isize)>, ()> {
+    operation.check().map_err(|_| ())?;
     enum ProseToken<'a> {
         Word(u32, usize, String),
         LoopVar(u32, usize, usize, &'a str),
     }
 
     if loops.len() > 2 || loops.iter().any(|lp| lp.items.is_none()) {
-        return None;
+        return Ok(None);
     }
     let pdf = words(context);
-    let selected = word_index_at(context, &pdf, offset)?;
+    let Some(selected) = word_index_at(context, &pdf, offset) else {
+        return Ok(None);
+    };
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized_word(word)).collect();
-    if custom_env_prints_word(source, &lines, hidden, extra_sources, &pdf[selected]) {
-        return None;
+    if custom_env_prints_word(
+        source,
+        &lines,
+        hidden,
+        extra_sources,
+        &pdf[selected],
+        operation,
+    ) {
+        return Ok(None);
     }
     let frame_header = within_frame
         && source
@@ -2527,6 +3594,7 @@ pub(crate) fn source_prose_scored_location_with_loops(
     let mut has_loop_var = false;
     let mut line_start = 0;
     for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
+        operation.check().map_err(|_| ())?;
         if index >= lines.start {
             let text = source_line_text(raw_row.trim_end_matches(['\r', '\n']));
             for (byte, end, word) in source_words(text) {
@@ -2543,6 +3611,10 @@ pub(crate) fn source_prose_scored_location_with_loops(
                     continue;
                 }
                 if !has_unescaped_backslash_before(text, byte) {
+                    // A better body-context score does not disambiguate displayed note text.
+                    if word == pdf[selected] && opaque.iter().any(|range| range.contains(&abs)) {
+                        return Err(());
+                    }
                     tokens.push(ProseToken::Word(index as u32 + 1, byte, word));
                 } else if let raw = &text[byte..end]
                     && loops
@@ -2581,13 +3653,15 @@ pub(crate) fn source_prose_scored_location_with_loops(
             })
             .collect();
         if active_loops.is_empty() || active_loops.len() > 2 {
-            return None;
+            return Ok(None);
         }
         let mut combinations: Vec<Vec<(std::ops::Range<usize>, &str, &str)>> = vec![Vec::new()];
         for lp in active_loops {
-            let items = lp.items.as_ref()?;
+            let Some(items) = lp.items.as_ref() else {
+                return Ok(None);
+            };
             if combinations.len().saturating_mul(items.len()) > 32 {
-                return None;
+                return Ok(None);
             }
             let mut next = Vec::new();
             for prefix in &combinations {
@@ -2595,7 +3669,7 @@ pub(crate) fn source_prose_scored_location_with_loops(
                     let mut combined = prefix.clone();
                     for (&var, val) in lp.vars.iter().zip(item.iter()) {
                         if val.contains('\\') {
-                            return None;
+                            return Ok(None);
                         }
                         combined.push((lp.body.clone(), var, val.as_str()));
                     }
@@ -2672,10 +3746,15 @@ pub(crate) fn source_prose_scored_location_with_loops(
                 }
             }
             // A collected frame/caption boundary does not favor its last occurrence.
-            let proximity = if within_frame { 0 } else { row.abs_diff(line) };
+            let proximity = if within_frame || mode == WordLocationMode::Guess {
+                0
+            } else {
+                row.abs_diff(line)
+            };
             let rank = (
                 score,
-                frame_header
+                mode == WordLocationMode::Strict
+                    && frame_header
                     && pdf.len() > 1
                     && score == 0
                     && *row as usize == lines.start + 1
@@ -2695,8 +3774,12 @@ pub(crate) fn source_prose_scored_location_with_loops(
             }
         }
     }
-    best.filter(|_| !tied)
-        .map(|(rank, row, byte)| (row, byte, rank.0))
+    if mode == WordLocationMode::Guess && tied {
+        return Err(());
+    }
+    Ok(best
+        .filter(|_| !tied)
+        .map(|(rank, row, byte)| (row, byte, rank.0)))
 }
 
 fn clean_lexical_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -2721,8 +3804,7 @@ pub(crate) fn host_owns_generated_sidecar(
 ) -> bool {
     let ext = generated.extension().and_then(|e| e.to_str()).unwrap_or("");
     let generated_clean = clean_lexical_path(generated);
-    let masked = nonprinting_source_ranges(source);
-    let mut masked_idx = 0usize;
+    let mut masked = nonprinting_source_spans(source).peekable();
     let mut if_stack: Vec<Option<bool>> = Vec::new();
     let mut at = 0usize;
     let skip_arg = |cur: usize| -> Option<usize> {
@@ -2744,11 +3826,16 @@ pub(crate) fn host_owns_generated_sidecar(
         Some(tok + source[tok..].chars().next()?.len_utf8())
     };
     while at < source.len() {
-        while masked_idx < masked.len() && masked[masked_idx].end <= at {
-            masked_idx += 1;
+        if if_stack.last() == Some(&Some(false)) {
+            return false;
         }
-        if masked_idx < masked.len() && masked[masked_idx].start <= at {
-            at = masked[masked_idx].end;
+        while masked.peek().is_some_and(|(_, span, _)| span.end <= at) {
+            masked.next();
+        }
+        if let Some((_, span, _)) = masked.peek()
+            && span.start <= at
+        {
+            at = span.end;
             continue;
         }
         match source.as_bytes()[at] {
@@ -2778,17 +3865,9 @@ pub(crate) fn host_owns_generated_sidecar(
                     at = arg_end;
                     continue;
                 }
-                if matches!(cmd, "string" | "noexpand" | "meaning") {
-                    let tok = skip_source_space(source, next);
-                    if source.as_bytes().get(tok) == Some(&b'\\') {
-                        let (_, cmd_end) = math::command(source, tok);
-                        at = if cmd_end == tok + 1 {
-                            cmd_end + source[cmd_end..].chars().next().map_or(0, char::len_utf8)
-                        } else {
-                            cmd_end
-                        };
-                        continue;
-                    }
+                if let Some(quoted_end) = math::quoted_token_end(source, cmd, next) {
+                    at = quoted_end;
+                    continue;
                 }
                 if matches!(
                     cmd,
@@ -2953,4 +4032,315 @@ pub(crate) fn host_owns_generated_sidecar(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod remaining_review_tests {
+    use super::*;
+
+    #[test]
+    fn proven_fragile_body_excludes_only_its_syntactic_header() {
+        for header in [
+            r"\begin{frame}[fragile]{\DocTitle}",
+            r"\begin{frame}<1->[<+->][fragile]{\DocTitle}{Subtitle}",
+            "\\begin{frame}\n[fragile]\n{\\DocTitle}\n{Subtitle}",
+            r"\begin{frame}[fragile]{FooterZephyr}",
+        ] {
+            for separator in ["", "\n"] {
+                let source = format!(
+                    "\\newcommand{{\\DocTitle}}{{FooterZephyr}}\n\\csname changed\\endcsname\n\\newcommand{{\\unused}}{{Quartz}}\\pretocmd{{\\unused}}{{Amber}}{{}}{{}}\n{header}{separator}Body repeats FooterZephyr as a literal word.\\end{{frame}}"
+                );
+                let word_byte = source.rfind("FooterZephyr").unwrap();
+                let row = source[..word_byte].bytes().filter(|&b| b == b'\n').count() + 1;
+                let byte = word_byte - source[..word_byte].rfind('\n').map_or(0, |at| at + 1);
+                let operation = crate::Operation::default();
+                assert_eq!(
+                    source_word_location_in_frame_body_with_sources(
+                        &source,
+                        source.lines().count() as u32,
+                        "FooterZephyr",
+                        0,
+                        &[],
+                        &operation,
+                    ),
+                    Ok(Some((row as u32, byte))),
+                    "{header:?} separator {separator:?}",
+                );
+            }
+        }
+        let source = "\\begin{frame}[fragile]{$x$}\nBody $x$\\end{frame}";
+        assert_eq!(
+            source_word_location_in_frame_body_with_sources(
+                source,
+                2,
+                "x",
+                0,
+                &[],
+                &crate::Operation::default(),
+            ),
+            Ok(Some((2, 6))),
+        );
+    }
+
+    #[test]
+    fn fragile_header_checks_stop_at_blank_lines_but_not_comment_lines() {
+        for (gap, body_group) in [
+            ("\n\n", true),
+            ("\n \t\n", true),
+            ("%comment\n\n", true),
+            ("\n%comment\n\n", true),
+            ("\n", false),
+            ("%comment\n", false),
+            ("\n%comment\n", false),
+            ("\n%comment\n%comment\n", false),
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "\\begin{{frame}}[fragile]{gap}{{\\small Amber note}} first sentence.\n\
+                     Second Amber line.\n\\end{{frame}}\n"
+                )
+                .replace('\n', newline);
+                let group_byte = source.find("Amber note").unwrap();
+                let owner = if body_group {
+                    group_byte
+                } else {
+                    source.rfind("Amber").unwrap()
+                };
+                let row = source[..owner]
+                    .bytes()
+                    .filter(|&byte| byte == b'\n')
+                    .count()
+                    + 1;
+                let byte = owner - source[..owner].rfind('\n').map_or(0, |at| at + 1);
+                assert_eq!(
+                    source_word_location_in_frame_body_with_sources(
+                        &source,
+                        source.lines().count() as u32,
+                        if body_group {
+                            "Amber note first sentence. Second Amber line."
+                        } else {
+                            "first sentence. Second Amber line."
+                        },
+                        if body_group {
+                            0
+                        } else {
+                            "first sentence. Second ".len()
+                        },
+                        &[],
+                        &crate::Operation::default(),
+                    ),
+                    Ok(Some((row as u32, byte))),
+                    "{gap:?} newline={newline:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mutation_targets_consume_tokens_and_preserve_balanced_unknown_group_ends() {
+        let raw = r"\csname \pretocmd\csname ";
+        assert_eq!(
+            math::macro_mutation_target(raw, "pretocmd", 0),
+            Some(("**", 7))
+        );
+        for n in [128, 512] {
+            let target = format!("{{{}{}}}", r"\cspreto{".repeat(n), "}".repeat(n));
+            for command in ["pretocmd", "cspreto", "AtBeginEnvironment"] {
+                assert_eq!(
+                    math::macro_mutation_target(&target, command, 0),
+                    Some(("**", target.len())),
+                    "{command} at {n}",
+                );
+            }
+            for body in [
+                r"\pretocmd\csname ".repeat(n),
+                format!("{}{}", r"\cspreto{".repeat(n), "}".repeat(n)),
+                format!("{}{}", r"\appto{\x}{".repeat(n), "}".repeat(n)),
+            ] {
+                let source = format!("\\def\\unused{{{body}}}\nQuartz");
+                assert_eq!(
+                    source_word_location(&source, 2, "Quartz", 0, 0),
+                    Some((2, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_mutator_optionals_leave_stored_delimiters_and_following_bindings() {
+        for command in ["patchcmd", "AtBeginEnvironment"] {
+            for n in [128, 512] {
+                let body = format!(r"\{command}[").repeat(n);
+                let operand = format!("[{body}}}\\newcommand{{\\later}}[1]{{#1}}");
+                let boundary = body.len() + 1;
+                assert_eq!(optional_argument_boundary(&operand, 0), Err(boundary));
+                assert_eq!(
+                    math::macro_mutation_target(&operand, command, 0),
+                    Some(("**", boundary)),
+                );
+                let source = format!(
+                    "\\def\\unused{{{body}}}\n\\newcommand{{\\emitter}}[1]{{#1}}\n\\let\\alias\\emitter\n\\renewcommand{{\\emitter}}[1]{{Copper}}\n\\newcommand{{\\fresh}}[1]{{#1}}\nQuartz"
+                );
+                let macros =
+                    math::macros_from_sources_for_guess(&[&source], &crate::Operation::default());
+                assert!(macros["alias"].is_none());
+                assert!(macros["emitter"].is_none());
+                let fresh = macros["fresh"].as_ref().unwrap();
+                assert_eq!((fresh.arity, fresh.used_params), (1, 1));
+                assert_eq!(
+                    source_word_location(&source, 6, "Quartz", 0, 0),
+                    Some((6, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_local_mutation_vetoes_stored_and_builtin_guesses() {
+        for mutation in [
+            r"\cspreto{\dynamicName}{Amber}",
+            r"\pretocmd{\csname\dynamicName\endcsname}{Amber}{}{}",
+            r"\AddToHook{\dynamicHook}{Amber}",
+        ] {
+            for body in [r"\emit{Copper}", r"\textit{Copper}", r"$\alpha$"] {
+                let source = format!("\\newcommand{{\\emit}}[1]{{#1}}\n{mutation}\n{body}");
+                let word = if body.contains("alpha") {
+                    "α"
+                } else {
+                    "Copper"
+                };
+                assert_eq!(
+                    source_word_guess_with_sources(
+                        &source,
+                        3,
+                        word,
+                        0,
+                        4,
+                        &[],
+                        &crate::Operation::default(),
+                    ),
+                    Err(()),
+                    "{mutation}: {body}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unused_unknown_mutation_does_not_poison_an_unrelated_reached_known_mutation() {
+        for known in [
+            r"\def\unused{Ghost}",
+            r"\def\unused{\cspreto{\Name}{Ghost}}",
+            r"\appto{\unused}{\cspreto{\Name}{Ghost}}",
+            r"\pretocmd{\unused}{\cspreto{\Name}{Ghost}}{}{}",
+            r"\patchcmd{\unused}{Ghost}{\cspreto{\Name}{Ghost}}{}{}",
+            r"\let\alias\Unknown",
+        ] {
+            let source = format!(
+                "\\documentclass{{beamer}}\n\\usepackage{{opaque}}\n\\def\\Name{{textit}}\n\\newcommand{{\\Unknown}}{{\\cspreto{{\\Name}}{{Amber\\space}}}}\n\\newcommand{{\\Known}}{{{known}}}\n\\Known\n\\begin{{document}}\n\\begin{{frame}}\nBody Copper.\n\\end{{frame}}\n\\end{{document}}"
+            );
+            assert_eq!(
+                source_word_guess_with_sources(
+                    &source,
+                    10,
+                    "Copper",
+                    0,
+                    4,
+                    &[],
+                    &crate::Operation::default(),
+                ),
+                Ok(Some(UnverifiedWordLocation { line: 9, byte: 5 })),
+                "{known}",
+            );
+        }
+    }
+
+    #[test]
+    fn environment_reachability_does_not_cache_cycle_negatives() {
+        let a = r"\b";
+        let b = r"\a \c";
+        let c = "Amber";
+        let macros = [("a", a), ("b", b), ("c", c)]
+            .into_iter()
+            .map(|(name, body)| {
+                (
+                    name,
+                    Some(math::MacroDef {
+                        arity: 0,
+                        used_params: 0,
+                        body_source: body,
+                        body: Some(body),
+                    }),
+                )
+            })
+            .collect();
+        let operation = crate::Operation::default();
+        assert!(body_prints_word(
+            r"\a",
+            "amber",
+            &macros,
+            &mut std::collections::BTreeSet::new(),
+            &operation
+        ));
+        assert!(!body_prints_word(
+            r"\a",
+            "copper",
+            &macros,
+            &mut std::collections::BTreeSet::new(),
+            &operation
+        ));
+    }
+
+    #[test]
+    fn guess_nonprinting_and_preamble_discovery_stop_on_cancellation_or_deadline() {
+        let source = "\\documentclass{beamer}\n\\def\\dormant{\\def\\nested{Copper}}\n\\begin{document}\nCopper nimbus.\n\\end{document}\n";
+        let operation = crate::Operation::default();
+        assert!(
+            nonprinting_source_spans_with_mode(
+                source,
+                None,
+                WordLocationMode::Guess,
+                Some(&operation),
+            )
+            .next()
+            .is_some(),
+        );
+        for cancelled in [false, true] {
+            let operation = crate::Operation::new(if cancelled {
+                std::time::Duration::from_secs(10)
+            } else {
+                std::time::Duration::ZERO
+            });
+            if cancelled {
+                operation.cancel();
+            }
+            assert!(
+                nonprinting_source_spans_with_mode(
+                    source,
+                    None,
+                    WordLocationMode::Guess,
+                    Some(&operation),
+                )
+                .next()
+                .is_none(),
+            );
+            assert_eq!(
+                source_document_start(
+                    source,
+                    None,
+                    &std::collections::BTreeMap::new(),
+                    Some(&operation),
+                ),
+                None,
+            );
+            assert_eq!(
+                operation.check().unwrap_err().kind(),
+                if cancelled {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                },
+            );
+        }
+    }
 }

@@ -40,7 +40,7 @@ fn main() -> std::io::Result<()> {
         12,
         &op,
         None,
-        false, // strict mode (set true for warned best_guess fallback)
+        false, // strict mode (set true for additional best_guess fallback)
         Some(&mut cache),
     )?;
     println!("{}:{}:{}", hit.location.file, hit.location.line, hit.location.column);
@@ -48,3 +48,20 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+## Navigation guarantees
+
+`SourceLocation.precise` means an accepted native-compatible column hint, not
+proof that a particular TeX execution printed that occurrence. Strict and
+Best Guess refinements use the same final native compatibility guard. Best Guess
+also enables lexical fallback and warned coarse anchors; a precise compatible
+fallback does not necessarily carry a separate guess warning.
+Document metadata declared outside that native support does not override a
+compiler anchor, including an anchor on `\maketitle`.
+Unresolved or truncated TeX imports do not globally invalidate column hints.
+Known macro definitions can remain available after an unresolved input; this
+does not establish the actual TeX expansion. Required source-cache errors remain
+errors.
+
+Forward candidates expose the probed `source_line`. Forward JSON requests use
+`inverse_search` for the editor's revision-bound source-map service;
+`source_snapshot` is not a request field, and unknown fields are rejected.

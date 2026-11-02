@@ -1,6 +1,262 @@
 use super::*;
 
 #[test]
+fn inverse_validation_precedes_io_and_respects_cancellation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let missing = directory.path().join("missing.pdf");
+    let snapshot = directory.path().join("missing.json");
+    let valid = InversePoint {
+        page: 1,
+        x: -1.0,
+        y_from_top: -0.0,
+        page_height_pt: f32::MIN_POSITIVE,
+    };
+    let resolve = |point, operation: &Operation| {
+        [
+            resolve_inverse_in(
+                &missing,
+                point,
+                None,
+                1,
+                operation,
+                Some(&snapshot),
+                false,
+                None,
+            ),
+            resolve_inverse_with_cache_in(
+                &missing, point, None, 1, operation, None, false, None, None,
+            ),
+        ]
+    };
+    for point in [
+        InversePoint { page: 0, ..valid },
+        InversePoint {
+            x: f32::NAN,
+            ..valid
+        },
+        InversePoint {
+            y_from_top: f32::INFINITY,
+            ..valid
+        },
+        InversePoint {
+            page_height_pt: f32::NEG_INFINITY,
+            ..valid
+        },
+        InversePoint {
+            page_height_pt: -0.0,
+            ..valid
+        },
+    ] {
+        for result in resolve(point, &Operation::default()) {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+    for result in resolve(valid, &Operation::default()) {
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+    let cancelled = Operation::default();
+    cancelled.cancel();
+    for result in resolve(InversePoint { page: 0, ..valid }, &cancelled) {
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
+    for result in resolve(valid, &Operation::new(Duration::ZERO)) {
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+}
+
+#[test]
+fn scaled_graphics_native_selection_keeps_overlay_prose() {
+    let graphics = [(3, 50), (4, 100)]
+        .map(|(line, x)| {
+            format!(
+                concat!(
+                    "(1,{line}:{x},100:30,30,0\n",
+                    "(1,{line}:{x},100:30,30,0\n",
+                    "(1,{line}:{x},100:0,30,0\n",
+                    "(1,{line}:{x},100:0,60,0\n",
+                    "(1,{line}:{x},100:200,60,0\n",
+                    "k1,{line}:{right},100:0\n",
+                    ")\n",
+                    "k1,{line}:{x},100:-200\n",
+                    ")\n)\n)\n)\n",
+                ),
+                line = line,
+                x = x,
+                right = x + 200,
+            )
+        })
+        .join("");
+    for overlay in [false, true] {
+        let prose = if overlay {
+            "(1,5:100,90:30,10,0\ng1,5:100,90\nx1,5:130,90\n)\n"
+        } else {
+            ""
+        };
+        let synctex = format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:doc.tex\nOutput:pdf\n",
+                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                "{{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n",
+                "{graphics}{prose})\n]\n}}1\nPostamble:\nCount:40\n",
+            ),
+            graphics = graphics,
+            prose = prose,
+        );
+        let candidates = inverse_candidates_from_reader(
+            synctex.as_bytes(),
+            InversePoint {
+                page: 1,
+                x: 115.0,
+                y_from_top: 85.0,
+                page_height_pt: 792.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1, "overlay={overlay}: {candidates:?}");
+        assert_eq!(candidates[0].file, "doc.tex");
+        assert_eq!(candidates[0].line, if overlay { 5 } else { 4 });
+    }
+}
+
+#[test]
+fn compatible_columns_do_not_require_macro_execution_classification() {
+    let directory = tempfile::tempdir().unwrap();
+    let pdf = directory.path().join("gnimble.pdf");
+    let file = directory.path().join("gnimble.tex");
+    for newline in ["\n", "\r\n"] {
+        let source = [
+            r"\documentclass{beamer}",
+            r"\newcommand{\zoggle}[1]{\ifnum#1>0 \expandafter\def\csname bimble#1\endcsname{}\expandafter\zoggle\expandafter{\number\numexpr#1-1\relax}\fi}",
+            r"\zoggle{2}",
+            r"\begin{document}",
+            r"\begin{frame}{Zibble}",
+            "Frumple snazzling zoggle.",
+            r"\end{frame}",
+            r"\end{document}",
+        ].join(newline);
+        fs::write(&file, source).unwrap();
+        let result = inverse_output(
+            &pdf,
+            "Input: gnimble.tex\nLine: 7\n",
+            Some(("Frumple snazzling zoggle.", 8)),
+        )
+        .unwrap();
+        assert_eq!(result.location.line, 6);
+        assert_eq!(result.location.byte_column, 8);
+        assert!(result.location.precise);
+    }
+}
+
+#[test]
+fn incompatible_neighboring_word_keeps_the_native_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let pdf = directory.path().join("gnimble.pdf");
+    fs::write(
+        directory.path().join("gnimble.tex"),
+        "Frumple snazzling zoggle.\nBrindle wuzzling troggle.\n",
+    )
+    .unwrap();
+    let result = resolve_inverse_output(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 72.0,
+            y_from_top: 120.0,
+            page_height_pt: 792.0,
+        },
+        Some(("Frumple snazzling zoggle.", 8)),
+        3,
+        &Operation::default(),
+        "Input: gnimble.tex\nLine: 2\n",
+        QuerySources::default(),
+    )
+    .unwrap();
+    assert_eq!(result.location.line, 2);
+    assert_eq!(result.location.byte_column, 0);
+    assert!(!result.location.precise);
+}
+
+#[test]
+fn inverse_title_refinement_stays_native_supported() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("paper.tex");
+    let pdf = directory.path().join("paper.pdf");
+    let context = "Computational Fluid Dynamics";
+    for (preamble, body, anchor, expected) in [
+        (
+            "\\title{Computational Fluid Dynamics}",
+            "\\begin{frame}{Computational Fluid Dynamics}\n\\end{frame}",
+            4,
+            (3, 28, true),
+        ),
+        (
+            "\\title{Computational Fluid Dynamics}",
+            "\\maketitle",
+            3,
+            (3, 0, false),
+        ),
+        (
+            "\\documentclass{beamer}",
+            "\\title[Computational Fluid Dynamics]{Computational Fluid Dynamics}\\maketitle",
+            3,
+            (3, 51, true),
+        ),
+        (
+            "\\documentclass{beamer}",
+            "\\begin{frame}\n\\title[Computational Fluid Dynamics]{Computational Fluid Dynamics}\\maketitle\n\\end{frame}",
+            5,
+            (4, 51, true),
+        ),
+    ] {
+        fs::write(
+            &source,
+            format!("{preamble}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                "SyncTeX Version:1\nInput:1:{}\n\
+                 Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+                 {{1\n[1,{anchor}:0,0:100,100,0\n(1,{anchor}:0,0:100,100,0\n)\n]\n}}1\n\
+                 Postamble:\nCount:4\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        for y_from_top in [10.0, 228.0] {
+            let result = resolve_inverse_output(
+                &pdf,
+                InversePoint {
+                    page: 1,
+                    x: 72.0,
+                    y_from_top,
+                    page_height_pt: 272.0,
+                },
+                Some((context, context.find("Fluid").unwrap())),
+                4,
+                &Operation::default(),
+                &format!("Input: paper.tex\nLine: {anchor}\n"),
+                QuerySources::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    result.location.line,
+                    result.location.byte_column,
+                    result.location.precise,
+                ),
+                expected,
+                "body={body}, y_from_top={y_from_top}",
+            );
+        }
+    }
+}
+
+#[test]
 fn caption_review_embedded_comment_end_does_not_expose_hidden_caption() {
     let source = "\\begin{comment}\nignored \\end{comment}\n\
                   \\caption{hidden\ncaption}\n\\end{comment}";
@@ -323,20 +579,6 @@ fn inverse_title_word_survives_unrelated_opaque_math() {
                   \\end{frame}";
     let context = "Let’s review this section\r\nOrdinary body words:";
     assert_eq!(
-        source_prose_scored_location(
-            source,
-            6,
-            context,
-            0,
-            0..6,
-            true,
-            &nonprinting_source_ranges(source),
-            None,
-        )
-        .map(|(row, byte, _)| (row, byte)),
-        Some((1, 23))
-    );
-    assert_eq!(
         source_word_location(source, 6, context, 0, 4),
         Some((1, 23))
     );
@@ -450,6 +692,829 @@ fn inverse_prose_excludes_nonprinting_keys_and_multiline_definitions() {
     );
     let source = "\\newcommand{\\Hidden}{$Zephyr$}\n\\Hidden\\label{Zephyr}\n";
     assert_eq!(source_word_location(source, 2, "Zephyr", 0, 4), None);
+}
+
+#[test]
+fn inverse_note_arguments_do_not_claim_slide_words() {
+    for source in [
+        "\\begin{frame}\nAmber\n\\note[item]<2>{Zephyr}\n\\end{frame}",
+        "\\newcommand{\\cue}[2]{\\note{\\textbf{#1 min.} #2}}\n\
+         \\begin{frame}\nAmber\n\\cue{1}{Zephyr}\n\\end{frame}",
+        "\\newcommand{\\inner}[1]{\\note{#1}}\n\
+         \\newcommand{\\outer}[2]{#1\\inner{#2}}\n\
+         \\begin{frame}\n\\outer{Amber}{Zephyr}\n\\end{frame}",
+        "\\newcommand{\\inner}[1]{\\note{#1#1}}\n\
+         \\newcommand{\\outer}[2]{#1\\inner{#2}\\inner{#2}}\n\
+         \\begin{frame}\n\\outer{Amber}{Zephyr}\n\\end{frame}",
+    ] {
+        let anchor = source.lines().count() as u32;
+        assert_eq!(
+            source_word_location(source, anchor, "Zephyr", 0, 10),
+            None,
+            "{source}"
+        );
+        let (row, byte) = source
+            .lines()
+            .enumerate()
+            .find_map(|(row, text)| text.find("Amber").map(|byte| (row as u32 + 1, byte)))
+            .unwrap();
+        assert_eq!(
+            source_word_location(source, anchor, "Amber", 0, 10),
+            Some((row, byte)),
+            "{source}"
+        );
+    }
+    let source = "\\newcommand{\\both}[1]{#1\\note{#1}}\n\
+                  \\begin{frame}\n\\both{Amber}\n\\end{frame}";
+    assert_eq!(
+        source_word_location(source, 4, "Amber", 0, 10),
+        Some((3, "\\both{".len()))
+    );
+    for source in [
+        "\\newcommand{\\dropone}[1]{}\n\
+         \\newcommand{\\quiet}[1]{\\note{#1}}\n\
+         \\newcommand{\\wrap}[1]{\\dropone\\quiet{#1}}\n\
+         \\begin{frame}\n\\wrap{Amber}\\\\\nAmber\n\\end{frame}",
+        "\\newcommand{\\wrap}[1]{\\def\\saved{#1}\\saved}\n\
+         \\begin{frame}\n\\wrap{Amber}\\\\\nAmber\n\\end{frame}",
+        "\\renewcommand{\\note}[1]{\\textbf{#1}}\n\
+         \\begin{frame}\n\\note{Amber}\\\\\nAmber\n\\end{frame}",
+    ] {
+        assert_eq!(
+            source_word_location(source, source.lines().count() as u32, "Amber", 0, 10),
+            None,
+            "{source}"
+        );
+    }
+    let source = "\\begin{frame}{Visible context}\nAmber note text.\n\
+                  \\note{Amber note text.}\n\\note{Amber note text.}\n\\end{frame}";
+    let context = "Visible context Amber note text.";
+    for word in ["Amber", "note", "text"] {
+        assert_eq!(
+            source_word_location(source, 5, context, context.rfind(word).unwrap(), 10),
+            None,
+            "{word}"
+        );
+    }
+    let source = "\\newcommand{\\id}[1]{#1}\n$\\id x + y$\n";
+    assert_eq!(
+        source_word_location(source, 2, "x + y", 0, 4),
+        Some((2, "$\\id ".len()))
+    );
+}
+
+#[test]
+fn inverse_opaque_note_keeps_compiler_anchor_instead_of_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("paper.tex");
+    let pdf = directory.path().join("paper.pdf");
+    for notes in [
+        "",
+        "\\drop{later}",
+        "\\drop{\\drop{later}}",
+        "\\drop{\\note{Amber note text.}}",
+        "\\drop{\\note{\\drop{Amber note text.}}}",
+        "\\dropwrap{Amber note text.}",
+        "\\dropnote{Amber note text.}",
+        "\\note{Amber note text.}",
+        "\\note{\\drop{later} Amber note text.}",
+        "\\note{Amber note text.}\n\\note{Amber note text.}",
+        "\\note{Amber note text. Amber note text.}",
+    ] {
+        let text = format!(
+            "\\documentclass{{beamer}}\n\\newcommand{{\\drop}}[1]{{}}\n\
+             \\newcommand{{\\dropwrap}}[1]{{\\drop{{#1}}}}\n\
+             \\newcommand{{\\dropnote}}[1]{{\\drop{{\\note{{#1}}}}}}\n\
+             \\title{{Amber note text}}\n\\begin{{document}}\n\
+             \\begin{{frame}}{{Other title}}\n{notes}\n\\end{{frame}}\n\\end{{document}}\n"
+        );
+        let anchor = text
+            .lines()
+            .position(|line| line == "\\end{frame}")
+            .unwrap() as u32
+            + 1;
+        fs::write(&source, &text).unwrap();
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                "SyncTeX Version:1\nInput:1:{}\n\
+                 Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+                 {{1\n[1,{anchor}:0,0:100,100,0\n(1,{anchor}:0,0:100,100,0\n)\n]\n}}1\n\
+                 Postamble:\nCount:4\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        let resolved = inverse_output(
+            &pdf,
+            &format!("Input: paper.tex\nLine: {anchor}\n"),
+            Some(("Amber note text.", 0)),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                resolved.location.line,
+                resolved.location.byte_column,
+                resolved.location.precise
+            ),
+            (anchor, 0, false),
+            "{notes}"
+        );
+    }
+}
+
+#[test]
+fn inverse_quoted_paragraph_tokens_preserve_following_declarations() {
+    for quote in [
+        "\\string",
+        "\\meaning",
+        "\\noexpand",
+        "\\csname string\\endcsname",
+        "\\csname meaning\\endcsname",
+        "\\csname noexpand\\endcsname",
+    ] {
+        for gap in [
+            "\n\n",
+            "\n \t\n",
+            "\n%comment\n\n",
+            "%comment\n\n",
+            "%comment\n%comment\n\n",
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "\\begin{{frame}}\nNimbus\n{quote}{gap}\
+                     \\newcommand{{\\cue}}[1]{{\\note{{#1}}}}\n\
+                     \\char90 ephyr \\cue{{Zephyr}} Copper\n\\end{{frame}}\n"
+                )
+                .replace('\n', newline);
+                let line = source
+                    .lines()
+                    .position(|text| text.starts_with("\\char90"))
+                    .unwrap() as u32
+                    + 1;
+                assert_eq!(
+                    source_word_location(&source, line, "Zephyr Copper", 0, 10),
+                    None,
+                    "{source}",
+                );
+                assert_eq!(
+                    source_word_location(&source, line, "Nimbus", 0, 10),
+                    Some((2, 0)),
+                    "{source}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inverse_control_tokens_keep_csname_name_whitespace() {
+    for leading in ["", " \t", "\n", "\u{a0}"] {
+        for trailing in [" ", "\n", "\r\n"] {
+            let source = format!(
+                "\\documentclass{{article}}\n\
+                 \\expandafter\\def\\csname {leading}hbox{trailing}\\endcsname#1{{}}\n\
+                 \\begin{{document}}\nAmber Zephyr \\hbox{{Zephyr}} Copper\n\
+                 \\end{{document}}\n"
+            );
+            let line = source
+                .lines()
+                .position(|text| text.starts_with("Amber"))
+                .unwrap() as u32
+                + 1;
+            let location = source_word_location(&source, line, "Amber Zephyr Zephyr Copper", 13, 2);
+            assert!(
+                location.is_none() || location == Some((line, 19)),
+                "{source}: {location:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn inverse_reviewed_conditionals_do_not_execute_stored_definitions() {
+    for definition in [
+        "\\newcommand{\\ReviewStart}{\\iffalse}\n",
+        "\\def\\ReviewStart{\\iffalse}\n",
+    ] {
+        let source = format!(
+            "\\documentclass{{beamer}}\n\
+             \\newcommand{{\\ReviewDiscard}}[1]{{}}\n{definition}\
+             \\renewcommand{{\\ReviewDiscard}}[1]{{#1}}\n\
+             \\newcommand{{\\ReviewEnd}}{{\\fi}}\n\
+             \\begin{{document}}\n\\begin{{frame}}\n\
+             \\ReviewDiscard{{Amber}}\n\\par\nNimbus\n\\par\nAmber\n\
+             \\end{{frame}}\n\\end{{document}}\n"
+        );
+        let line = source
+            .lines()
+            .position(|text| text.starts_with("\\ReviewDiscard{Amber}"))
+            .unwrap() as u32
+            + 1;
+        let byte = source
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap()
+            .find("Amber")
+            .unwrap();
+        let location = source_word_location(&source, line, "Amber", 0, 10);
+        assert!(
+            location.is_none() || location == Some((line, byte)),
+            "{source}: {location:?}",
+        );
+    }
+}
+
+#[test]
+fn inverse_reviewed_conditionals_do_not_mask_resumed_host_tokens() {
+    let host = Path::new("/synthetic/chapter.tex");
+    let generated = Path::new("/synthetic/paper.bbl");
+    for terminal in ["\\fi", "\\else"] {
+        for newline in ["\n", "\r\n"] {
+            let source = format!(
+                "\\newif\\ifReviewHidden\n{{\n\\iffalse\n\
+                 \\def\\ReviewUnused{{{terminal}\\ifReviewHidden}}\n\
+                 \\input{{paper.bbl}}\n\\fi\n{closing}}}\n",
+                closing = if terminal == "\\else" { "\\fi\n" } else { "" },
+            )
+            .replace('\n', newline);
+            assert!(
+                !crate::tex::host_owns_generated_sidecar(&source, host, generated, None),
+                "{source}",
+            );
+        }
+    }
+}
+
+#[test]
+fn inverse_reviewed_conditionals_reject_newly_stored_host_inputs() {
+    for source in [
+        concat!(
+            "{\n\\iffalse\n\\def\\ReviewUnused{\\fi\n",
+            "\\def\\ReviewStored{\\input{paper.bbl}}\n}\n",
+        ),
+        concat!(
+            "\\newif\\ifReviewNested\n\\iffalse\n",
+            "\\label[\\fi\\let\\ReviewUnused]{\\iffalse}\n\\newif\\ifReviewNested\n",
+            "\\fi\n\\input{paper.bbl}\n\\fi\n}\n",
+        ),
+    ] {
+        assert!(
+            !crate::tex::host_owns_generated_sidecar(
+                source,
+                Path::new("/synthetic/chapter.tex"),
+                Path::new("/synthetic/paper.bbl"),
+                None,
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn inverse_reviewed_conditionals_reject_deferred_caption_masks() {
+    for source in [
+        concat!(
+            "\\newif\\ifReviewHidden\n",
+            "{\\iffalse\\captionbox{\\fi}[\\ifReviewHidden]{Unused}\n",
+            "\\input{paper.bbl}\\fi\n",
+        ),
+        concat!(
+            "\\newif\\ifReviewHidden\n",
+            "{\\iffalse\\captionbox{\\fi\\let\\ReviewEat}[\\ifReviewHidden]{Unused}\n",
+            "\\input{paper.bbl}\\fi}\n",
+        ),
+    ] {
+        assert!(
+            !crate::tex::host_owns_generated_sidecar(
+                source,
+                Path::new("/synthetic/chapter.tex"),
+                Path::new("/synthetic/paper.bbl"),
+                None,
+            ),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_reviewed_conditionals_do_not_infer_control_sequence_meaning() {
+    for preamble in [
+        concat!(
+            "\\newcommand{\\ifReviewWord}{}\n",
+            "\\iffalse\n\\ifReviewWord\n\\fi\n",
+            "\\renewcommand{\\ReviewPaint}[1]{#1}\n\\let\\ReviewEat\\fi\n",
+        ),
+        concat!(
+            "\\let\\ReviewSavedFalse\\iffalse\n\\def\\iffalse{}\n\\iffalse\n",
+            "\\renewcommand{\\ReviewPaint}[1]{#1}\n\\let\\ReviewEat\\fi\n",
+            "\\let\\iffalse\\ReviewSavedFalse\n",
+        ),
+    ] {
+        let source = format!(
+            "\\documentclass{{article}}\n\\newcommand{{\\ReviewPaint}}[1]{{}}\n\
+             {preamble}\\begin{{document}}\n\
+             Amber Zephyr \\ReviewPaint{{Zephyr}} Copper\n\\end{{document}}\n",
+        );
+        let line = source
+            .lines()
+            .position(|row| row.starts_with("Amber"))
+            .unwrap() as u32
+            + 1;
+        let byte = source
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap()
+            .rfind("Zephyr")
+            .unwrap();
+        let location = source_word_location(&source, line, "Amber Zephyr Zephyr Copper", 13, 10);
+        assert!(
+            location.is_none() || location == Some((line, byte)),
+            "{source}: {location:?}",
+        );
+    }
+}
+
+#[test]
+fn inverse_raw_control_tokens_preserve_imported_note_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let main_path = directory.path().join("main.tex");
+    fs::write(
+        directory.path().join("notemacros.tex"),
+        "\\newcommand{\\cue}[1]{\\note{#1}}\n",
+    )
+    .unwrap();
+    for body in [
+        "\\csname",
+        "\\csname\\string",
+        "\\csname\\meaning",
+        "\\csname\\noexpand",
+    ] {
+        for suffix in ["", "\\newcommand{\\storedend}{\\endcsname}\n"] {
+            let source = format!(
+                "\\let\\ecs\\endcsname\n\\newcommand{{\\bcs}}{{{body}}}\n\
+                 \\input{{notemacros}}\n\\begin{{frame}}\nNimbus\n\
+                 \\char90 ephyr \\cue{{Zephyr}}\n\\end{{frame}}\n{suffix}"
+            );
+            fs::write(&main_path, &source).unwrap();
+            let spliced = macro_preamble_source(
+                &main_path,
+                None,
+                None,
+                &mut QuerySources::default(),
+                &Operation::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                crate::tex::source_word_location_with_sources(
+                    &source,
+                    7,
+                    "Zephyr",
+                    0,
+                    10,
+                    &[spliced.source.as_str()],
+                    &Operation::default()
+                ),
+                Err(()),
+                "{source}",
+            );
+            assert_eq!(
+                crate::tex::source_word_location_with_sources(
+                    &source,
+                    7,
+                    "Nimbus",
+                    0,
+                    10,
+                    &[spliced.source.as_str()],
+                    &Operation::default()
+                ),
+                Ok(Some((5, 0))),
+                "{source}",
+            );
+        }
+    }
+}
+
+#[test]
+fn inverse_raw_control_tokens_preserve_unexpandable_primitives() {
+    for definition in [
+        "\\noexpand\\def\\cue#1{\\note{#1}}",
+        "\\noexpand\\gdef\\cue#1{\\note{#1}}",
+        "\\noexpand\\let\\cue\\note",
+        "\\let\\cue\\note\\noexpand\\begingroup\\renewcommand{\\note}[1]{#1}\\noexpand\\endgroup",
+        "\\let\\cue\\note\\noexpand\\bgroup\\renewcommand{\\note}[1]{#1}\\noexpand\\egroup",
+    ] {
+        let source =
+            format!("{definition}\n\\begin{{frame}}\nNimbus\n\\cue{{Zephyr}}\n\\end{{frame}}");
+        assert_eq!(
+            crate::tex::source_word_location_with_sources(
+                &source,
+                5,
+                "Zephyr",
+                0,
+                10,
+                &[],
+                &Operation::default()
+            ),
+            Err(()),
+            "{source}",
+        );
+        assert_eq!(
+            source_word_location(&source, 5, "Nimbus", 0, 10),
+            Some((3, 0)),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_raw_control_tokens_in_unused_bodies_preserve_printing_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let main_path = directory.path().join("main.tex");
+    fs::write(
+        directory.path().join("printing.tex"),
+        "\\renewcommand{\\note}[1]{#1}\n",
+    )
+    .unwrap();
+    for declaration in [
+        "\\newcommand{\\unused}{\\string}",
+        "\\def\\unused{\\meaning}",
+        "\\NewDocumentCommand{\\unused}{}{\\string}",
+    ] {
+        let source = format!(
+            "{declaration}\n\\input{{printing}}\n\\begin{{frame}}\n\
+             \\note{{Copper}}\n\\end{{frame}}\n"
+        );
+        fs::write(&main_path, &source).unwrap();
+        let spliced = macro_preamble_source(
+            &main_path,
+            None,
+            None,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::tex::source_word_location_with_sources(
+                &source,
+                5,
+                "Copper",
+                0,
+                10,
+                &[spliced.source.as_str()],
+                &Operation::default()
+            ),
+            Ok(Some((4, 6))),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_opaque_math_vetoes_better_context_without_hiding_other_atoms() {
+    let source = "\\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
+                  \\note{$\\alpha+\\beta$}\n$\\delta+1$\n\\end{frame}";
+    for offset in [0, "α+".len()] {
+        assert_eq!(source_word_location(source, 5, "α+β=γ", offset, 10), None);
+    }
+    assert_eq!(source_word_location(source, 5, "δ+1", 0, 10), Some((4, 1)));
+    let source = "\\renewcommand{\\note}[1]{#1}\n\
+                  \\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
+                  \\note{$\\alpha+\\beta$}\n\\end{frame}";
+    assert_eq!(
+        source_word_location(source, 5, "α+β=γ", 0, 10),
+        Some((3, 1))
+    );
+}
+
+#[test]
+fn inverse_warned_guess_never_masks_body_or_unscoped_import_output() {
+    use crate::tex::source_word_guess_with_sources;
+    let package = "\\csname\\string x\\endcsname";
+    for name in ["documentclass", "usepackage", "RequirePackage"] {
+        for begin in ["\\begin{document}", "\\begin % comment\n{document}"] {
+            let source = format!(
+                "\\documentclass{{article}}\n\\usepackage{{algorithmicx}}\n{begin}\n\
+                 \\{name}{{amber}}\nQuartz amber zephyr.\n\\end{{document}}"
+            );
+            let anchor = source.lines().count() as u32 - 2;
+            assert_eq!(
+                source_word_guess_with_sources(
+                    &source,
+                    anchor,
+                    "amber",
+                    0,
+                    10,
+                    &[package],
+                    &Operation::default()
+                ),
+                Err(()),
+                "{source}",
+            );
+        }
+        for stored in ["", "\\newcommand{\\unused}{\\begin{document}}\n"] {
+            let source = format!("{stored}\\{name}{{mystery}}\ncafé Amber");
+            let anchor = source.lines().count() as u32;
+            assert_eq!(
+                source_word_guess_with_sources(
+                    &source,
+                    anchor,
+                    "Amber",
+                    0,
+                    10,
+                    &[package],
+                    &Operation::default()
+                ),
+                Err(()),
+                "{source}",
+            );
+        }
+    }
+    for (source, anchor) in [
+        ("\\usepackage[\\begin{document}]{mystery}\ncafé Amber", 2),
+        (
+            "\\documentclass{article}\n{\\begin{document}}\n\\usepackage{Amber}\n\
+             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
+            3,
+        ),
+        (
+            "\\documentclass{article}\n\
+             \\def\\pgfmathsetmacro#1#2{\\begin{document}}\n\
+             \\pgfmathsetmacro{\\relax}{x}\n\\usepackage{Amber}\n\
+             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
+            4,
+        ),
+        (
+            "\\documentclass{article}\n\
+             \\newenvironment{pgfmathsetmacro}{\\begin{document}}{}\n\
+             \\pgfmathsetmacro{\\relax}{x}\n\\usepackage{Amber}\n\
+             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
+            4,
+        ),
+        (
+            "\\documentclass{article}\nUnexpected literal text.\n\\usepackage{Amber}\n\
+             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
+            3,
+        ),
+    ] {
+        assert_eq!(
+            source_word_guess_with_sources(
+                source,
+                anchor,
+                "Amber",
+                0,
+                4,
+                &[package],
+                &Operation::default()
+            ),
+            Err(()),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_warned_guess_keeps_unresolved_local_import_targets_opaque() {
+    use crate::tex::source_word_guess_with_sources;
+    let package = "\\csname\\string x\\endcsname";
+    for definition in [
+        "\\expandafter\\def\\csname use\\pk\\endcsname#1{\\AtBeginDocument{Quartz }}",
+        "\\expandafter\\let\\csname use\\pk\\endcsname\\relax",
+    ] {
+        let source = format!(
+            "\\documentclass{{article}}\n\\usepackage{{algorithmicx}}\n\
+             \\def\\pk{{package}}\n{definition}\n\\usepackage{{foo}}\n\
+             \\begin{{document}}\nQuartz amber zephyr.\n\\end{{document}}"
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                &source,
+                7,
+                "Quartz amber zephyr.",
+                0,
+                4,
+                &[package],
+                &Operation::default()
+            ),
+            Err(()),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_warned_guess_preserves_literal_argument_owners() {
+    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
+    let package = "\\csname\\string x\\endcsname";
+    for definition in [
+        "\\newcommand{\\styled}[1]{\\textbf{#1}}",
+        "\\newcommand{\\styled}[1]{{\\large\\textbf{#1}.}}",
+        "\\newcommand{\\w}[1]{#1}\\newcommand{\\styled}[1]{\\w{\\textit{#1}}}",
+    ] {
+        let source = format!(
+            "{definition}\n\\begin{{frame}}\nQuartz \\styled{{Amber}} zephyr.\n\\end{{frame}}"
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                &source,
+                4,
+                "Quartz Amber zephyr.",
+                7,
+                10,
+                &[package],
+                &Operation::default()
+            ),
+            Ok(Some(UnverifiedWordLocation { line: 3, byte: 15 })),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_warned_guess_bounds_repeated_nonmutating_helper_graphs() {
+    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
+    let mut source = "\\def\\unused{\\let}\n\\newcommand{\\marker}{\\downarrow}\n\
+                      \\newcommand{\\helperA}{Silver}\n"
+        .to_owned();
+    for level in b'B'..=b'O' {
+        let previous = format!("\\helper{} ", char::from(level - 1)).repeat(10);
+        source.push_str(&format!(
+            "\\newcommand{{\\helper{}}}{{{previous}}}\n",
+            char::from(level)
+        ));
+    }
+    source.push_str(
+        "\\iffalse\\helperO\\fi\n\\begin{frame}\n$\\marker$\n\
+                     Quartz Amber zephyr.\n\\end{frame}",
+    );
+    let closing = source.lines().count() as u32;
+    assert_eq!(
+        source_word_guess_with_sources(
+            &source,
+            closing,
+            "Quartz Amber zephyr.",
+            7,
+            10,
+            &["\\csname\\string x\\endcsname"],
+            &Operation::default()
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: closing - 1,
+            byte: 7
+        })),
+    );
+}
+
+#[test]
+fn inverse_warned_guess_uses_context_for_repeated_prose_and_math() {
+    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
+    let package = "\\csname\\string x\\endcsname";
+    let source = "A repeated word far away.\n\
+                  Émile uses \\emph{repeated} words near fields.\nRepeated noise.\n";
+    let context = "Émile uses repeated words near ﬁelds.";
+    assert_eq!(
+        source_word_guess_with_sources(
+            source,
+            3,
+            context,
+            context.find("repeated").unwrap(),
+            4,
+            &[package],
+            &Operation::default()
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 2,
+            byte: "Émile uses \\emph{".len(),
+        })),
+    );
+    let source = "\\begin{frame}\n$\\alpha+1$\n$\\alpha+2$\n\\end{frame}";
+    for package in [
+        package,
+        "\\expandafter\\let\\csname external\\the\\count0\\endcsname\\relax",
+    ] {
+        assert_eq!(
+            source_word_guess_with_sources(
+                source,
+                4,
+                "α+1",
+                0,
+                10,
+                &[package],
+                &Operation::default()
+            ),
+            Ok(Some(UnverifiedWordLocation { line: 2, byte: 1 })),
+        );
+    }
+}
+
+#[test]
+fn inverse_warned_guess_does_not_break_context_ties_by_compiler_distance() {
+    use crate::tex::source_word_guess_with_sources;
+    let package = "\\csname\\string x\\endcsname";
+    for (source, line, context, offset) in [
+        ("Amber\nAmber", 1, "Amber", 0),
+        (
+            "same Amber value.\nsame Amber value.",
+            1,
+            "same Amber value.",
+            5,
+        ),
+        (
+            "\\begin{frame}{Amber}\nAmber\n\\end{frame}",
+            3,
+            "Else Amber nearby",
+            5,
+        ),
+        ("\\begin{frame}\n$x$\nx\n\\end{frame}", 4, "x", 0),
+        (
+            "\\begin{frame}\n$\\alpha$\n$\\alpha$\n\\end{frame}",
+            2,
+            "α",
+            0,
+        ),
+    ] {
+        assert!(
+            matches!(
+                source_word_guess_with_sources(
+                    source,
+                    line,
+                    context,
+                    offset,
+                    10,
+                    &[package],
+                    &Operation::default()
+                ),
+                Ok(None) | Err(()),
+            ),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn inverse_warned_guess_preserves_comment_quote_and_nonprinting_masks() {
+    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
+    let package = "\\csname\\string x\\endcsname";
+    for hidden in ["% Amber", "\\label{Amber}", "\\newcommand{\\unused}{Amber}"] {
+        let source = format!("\\begin{{frame}}\n{hidden}\ncafé Amber\n\\end{{frame}}");
+        assert_eq!(
+            source_word_guess_with_sources(
+                &source,
+                4,
+                "Amber",
+                0,
+                10,
+                &[package],
+                &Operation::default()
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 3,
+                byte: "café ".len()
+            })),
+            "{source}",
+        );
+    }
+    for printed in [
+        "\\detokenize{Amber}",
+        "\\verb|Amber|",
+        "\\lstinline|Amber|",
+        "\\begin{verbatim}\nAmber\n\\end{verbatim}",
+        "\\begin{Verbatim}\nAmber\n\\end{Verbatim}",
+        "\\begin{lstlisting}\nAmber\n\\end{lstlisting}",
+        "\\begin{minted}{tex}\nAmber\n\\end{minted}",
+    ] {
+        let source = format!(
+            "\\newcommand{{\\quoted}}{{Amber}}\n\\begin{{frame}}\n{printed}\ncafé Amber\n\\end{{frame}}",
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                &source,
+                source.lines().count() as u32,
+                "Amber",
+                0,
+                10,
+                &[package],
+                &Operation::default()
+            ),
+            Err(()),
+            "{source}",
+        );
+    }
+    let source = "\\title{Amber}\n\\begin{frame}\nCopper\n\\end{frame}";
+    assert_eq!(
+        source_word_guess_with_sources(
+            source,
+            4,
+            "Amber",
+            0,
+            10,
+            &[package],
+            &Operation::default()
+        ),
+        Ok(None),
+    );
 }
 
 #[test]
@@ -825,11 +1890,11 @@ fn inverse_frame_title_beats_same_words_in_document_title() {
     assert!(!metadata_beats_frame(
         source,
         5,
-        title,
-        title_offset,
+        (title, title_offset),
         10.0,
         272.0,
-        metadata_score
+        metadata_score,
+        &Operation::default()
     ));
     let footer = "Computational Fluid Dynamics\nGrid refinement application\n\
                   Numerical Analysis and Applications in Computational Fluid Dynamics";
@@ -847,11 +1912,11 @@ fn inverse_frame_title_beats_same_words_in_document_title() {
     assert!(metadata_beats_frame(
         source,
         5,
-        footer,
-        footer_offset,
+        (footer, footer_offset),
         228.0,
         272.0,
-        footer_score
+        footer_score,
+        &Operation::default()
     ));
 }
 
@@ -886,6 +1951,7 @@ fn inverse_identical_running_title_uses_click_height_for_tie() {
             true,
             &nonprinting_source_ranges(source),
             None,
+            &Operation::default()
         )
         .unwrap()
         .2
@@ -893,20 +1959,20 @@ fn inverse_identical_running_title_uses_click_height_for_tie() {
     assert!(!metadata_beats_frame(
         source,
         3,
-        context,
-        offset,
+        (context, offset),
         10.0,
         272.0,
-        metadata_score
+        metadata_score,
+        &Operation::default()
     ));
     assert!(metadata_beats_frame(
         source,
         3,
-        context,
-        offset,
+        (context, offset),
         228.0,
         272.0,
-        metadata_score
+        metadata_score,
+        &Operation::default()
     ));
 }
 
@@ -1428,10 +2494,9 @@ fn forward_geometry_preserves_top_down_coordinates_and_rejects_overflow() {
         payload.replace("\"h\":72", "\"h\":72,\"unexpected\":0"),
         payload.replace("\"h\":72", r#""h":72,"best_guess":"false""#),
         payload.replace("\"h\":72", r#""h":72,"best_guess":null"#),
-        payload.replace("\"h\":72", r#""h":72,"source_snapshot":"relative.json""#),
         payload.replace(
             "\"h\":72",
-            r#""h":72,"source_snapshot":"/cache/\u0000.json""#,
+            r#""h":72,"source_snapshot":"/cache/manifest.json""#,
         ),
         payload.replace("\"h\":72", r#""h":72,"warning":"" "#),
         payload.replace("\"h\":72", r#""h":72,"warning":"\u001b[31munsafe""#),
@@ -1484,11 +2549,11 @@ More slide text
     assert!(!metadata_beats_frame(
         article,
         3,
-        "Sample-document testing,",
-        9,
+        ("Sample-document testing,", 9),
         386.5,
         792.0,
         6,
+        &Operation::default()
     ));
     assert!(!allows_metadata_fallback(article, 3, 0, 386.5, 792.0));
     assert!(allows_metadata_fallback(article, 2, 1, 115.0, 792.0));
@@ -1578,6 +2643,7 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
             {
                 let cand = ForwardCandidate {
                     page: p,
+                    source_line: 0,
                     rect: SearchRect {
                         left: x,
                         top: y - height,
@@ -3517,6 +4583,120 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     );
     assert!(hit_scalebox.location.precise);
 
+    fs::write(
+        root.join("wobble.sty"),
+        "\\def\\WobbleName{wobble@state}\n\\expandafter\\def\\csname\\WobbleName\\endcsname{}\n",
+    )
+    .unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        synctex.replace(
+            "Output:pdf",
+            &format!("Input:2:{}\nOutput:pdf", root.join("wobble.sty").display()),
+        ),
+    )
+    .unwrap();
+    for command in ["includegraphics", "includesvg"] {
+        let uncertain = tex_source
+            .replace(
+                "\\documentclass{article}",
+                "\\documentclass{article}\\usepackage{wobble}",
+            )
+            .replace("includegraphics", command);
+        fs::write(&tex, &uncertain).unwrap();
+        for (x, filename, hint) in [
+            (60., "figs/first.pdf", Some(("Blorf", 0))),
+            (115., "figs/second.pdf", None),
+        ] {
+            let result = resolve_inverse(
+                &pdf,
+                InversePoint {
+                    page: 1,
+                    x,
+                    y_from_top: 85.,
+                    page_height_pt: 792.,
+                },
+                hint,
+                2,
+                &Operation::default(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                (result.location.line, result.location.byte_column),
+                (3, uncertain.lines().nth(2).unwrap().find(filename).unwrap()),
+                "{command} {filename}"
+            );
+            assert!(result.location.precise);
+            assert!(result.warning.is_some());
+            for setup in [
+                format!("\\renewcommand{{\\{command}}}[2][]{{}}"),
+                format!("\\newcommand{{\\WobblePatch}}{{\\def\\{command}{{}}}}\\WobblePatch"),
+            ] {
+                fs::write(
+                    &tex,
+                    uncertain.replace("\\begin{document}", &format!("{setup}\\begin{{document}}")),
+                )
+                .unwrap();
+                let veto = resolve_inverse(
+                    &pdf,
+                    InversePoint {
+                        page: 1,
+                        x,
+                        y_from_top: 85.,
+                        page_height_pt: 792.,
+                    },
+                    hint,
+                    2,
+                    &Operation::default(),
+                    None,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(
+                    (veto.location.line, veto.location.byte_column),
+                    (3, 0),
+                    "{setup}"
+                );
+            }
+            fs::write(&tex, &uncertain).unwrap();
+        }
+        fs::write(
+            root.join("wobble.sty"),
+            format!(
+                "\\def\\WobbleName{{wobble@state}}\n\
+                     \\expandafter\\def\\csname\\WobbleName\\endcsname{{}}\n\
+                     \\newcommand{{\\WobbleBox}}[1]{{\\{command}{{blorf.pdf}}}}\n"
+            ),
+        )
+        .unwrap();
+        let wrapped = uncertain
+            .replace("ProseLabel ", "\\WobbleBox{ProseLabel ")
+            .replace("figs/second.pdf}\n", "figs/second.pdf}}\n");
+        fs::write(&tex, wrapped).unwrap();
+        let veto = resolve_inverse(
+            &pdf,
+            InversePoint {
+                page: 1,
+                x: 60.,
+                y_from_top: 85.,
+                page_height_pt: 792.,
+            },
+            None,
+            2,
+            &Operation::default(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!((veto.location.line, veto.location.byte_column), (3, 0));
+        fs::write(
+            root.join("wobble.sty"),
+            "\\def\\WobbleName{wobble@state}\n\\expandafter\\def\\csname\\WobbleName\\endcsname{}\n",
+        ).unwrap();
+    }
+
     // 3. Real pdflatex integration test with \includegraphics[...]{example-image-a} and {example-image-b}.
     let real_dir = tempfile::tempdir().unwrap();
     let real_root = fs::canonicalize(real_dir.path()).unwrap();
@@ -4570,10 +5750,13 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
     .unwrap();
 
     // Redefined macro across sources is conservatively invalidated.
-    let table = crate::math::macros_from_sources(&[
-        "\\newcommand{\\ClashSym}{\\alpha}\n",
-        "\\renewcommand{\\ClashSym}{\\beta}\n",
-    ]);
+    let table = crate::math::macros_from_sources(
+        &[
+            "\\newcommand{\\ClashSym}{\\alpha}\n",
+            "\\renewcommand{\\ClashSym}{\\beta}\n",
+        ],
+        &Operation::default(),
+    );
     assert_eq!(table.get("ClashSym"), Some(&None));
 
     let synctex = format!(
@@ -4956,44 +6139,41 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
     let pdf = root.join("main.pdf");
-    let main_tex = root.join("main.tex");
     let sub_a = root.join("sub_a.tex");
     let sub_b = root.join("sub_b.tex");
-    let grouped_tex = root.join("grouped.tex");
-    let dead_tex = root.join("dead.tex");
-    let pkg_sty = root.join("localdefs.sty");
     fs::write(&pdf, b"pdf-v1").unwrap();
     fs::write(&sub_a, "\\input{sub_b}\n").unwrap();
     fs::write(&sub_b, "\\newcommand{\\DeepSym}{\\Lambda}\n").unwrap();
-    fs::write(&grouped_tex, "\\newcommand{\\GroupedSym}{\\Gamma}\n").unwrap();
-    fs::write(&dead_tex, "\\renewcommand{\\DeepSym}{\\Omega}\n").unwrap();
-    fs::write(&pkg_sty, "\\newcommand{\\PkgSym}{\\Delta}\n").unwrap();
-    fs::write(
-        &main_tex,
-        concat!(
-            "\\documentclass{article}\n",
-            "\\usepackage{localdefs}\n",
-            "\\input{sub_a}\n",
-            "{\\input{grouped}}\n",
-            "\\iffalse\n",
-            "\\input{dead}\n",
-            "\\fi\n",
-            "\\begin{document}\n",
-            "$\\DeepSym + \\PkgSym$\n",
-            "\\end{document}\n",
-        ),
-    )
-    .unwrap();
 
     let mut sources = crate::QuerySources::default();
-    let spliced =
-        crate::macro_preamble_source(&main_tex, None, None, &mut sources, &Operation::default())
-            .unwrap()
-            .unwrap();
-    let table = crate::math::macros_from_sources(&[spliced.as_str()]);
-    assert!(table.get("DeepSym").is_some_and(Option::is_some));
-    assert!(table.get("PkgSym").is_some_and(Option::is_some));
-    assert_eq!(table.get("GroupedSym"), Some(&None));
+
+    let replay_main = root.join("replay.tex");
+    fs::write(
+        &replay_main,
+        "\\futurelet\\peek\\input{sub_a}\n\\begin{document}\n$\\DeepSym+1$\n",
+    )
+    .unwrap();
+    let replay_spliced = crate::macro_preamble_source(
+        &replay_main,
+        None,
+        None,
+        &mut sources,
+        &Operation::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        crate::tex::source_word_location_with_sources(
+            "$\\DeepSym+1$\n",
+            1,
+            "Λ+1",
+            0,
+            2,
+            &[replay_spliced.source.as_str()],
+            &Operation::default()
+        ),
+        Ok(Some((1, 1))),
+    );
 
     // Compiler-recorded Input: paths disambiguate CWD-relative preamble imports when main.tex
     // lives in a subdirectory, and unrecorded ambiguous imports are poisoned.
@@ -5024,7 +6204,10 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     )
     .unwrap()
     .unwrap();
-    let compiled_table = crate::math::macros_from_sources(&[compiled_spliced.as_str()]);
+    let compiled_table = crate::math::macros_from_sources(
+        &[compiled_spliced.source.as_str()],
+        &Operation::default(),
+    );
     assert_eq!(
         compiled_table
             .get("Pick")
@@ -5041,55 +6224,11 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     )
     .unwrap()
     .unwrap();
-    let unrecorded_table = crate::math::macros_from_sources(&[unrecorded_spliced.as_str()]);
+    let unrecorded_table = crate::math::macros_from_sources(
+        &[unrecorded_spliced.source.as_str()],
+        &Operation::default(),
+    );
     assert_eq!(unrecorded_table.get("Pick"), Some(&None));
-
-    // Exceeding recursion depth poisons all macros via \csname *\endcsname so stale definitions
-    // before deep \input chains cannot survive a truncated redefinition.
-    let prev = root.join("depth_0.tex");
-    fs::write(
-        &prev,
-        "\\newcommand{\\StaleDepthSym}{\\alpha}\n\\input{depth_1}\n",
-    )
-    .unwrap();
-    for i in 1..=9 {
-        let cur = root.join(format!("depth_{i}.tex"));
-        let body = if i < 9 {
-            format!("\\input{{depth_{}}}\n", i + 1)
-        } else {
-            "\\renewcommand{\\StaleDepthSym}{\\beta}\n".to_owned()
-        };
-        fs::write(&cur, body).unwrap();
-    }
-    let deep_spliced =
-        crate::macro_preamble_source(&prev, None, None, &mut sources, &Operation::default())
-            .unwrap()
-            .unwrap();
-    let deep_table = crate::math::macros_from_sources(&[deep_spliced.as_str()]);
-    assert_eq!(deep_table.get("StaleDepthSym"), Some(&None));
-    assert_eq!(deep_table.get("**"), Some(&None));
-    assert_eq!(
-        crate::tex::source_word_location_with_sources(
-            "$\\alpha$ and $\\beta$\n",
-            1,
-            "\u{03b2} and \u{03b2}",
-            0,
-            2,
-            &[deep_spliced.as_str()],
-        ),
-        None
-    );
-    assert_eq!(
-        crate::tex::source_word_location_with_sources(
-            "$\\NewSym + 1$ and $x + 1$\n",
-            1,
-            "x + 1 and x + 1",
-            0,
-            2,
-            &[deep_spliced.as_str()],
-        ),
-        None
-    );
 
     // TEXINPUTS-style compiler provenance takes precedence over an uncompiled decoy in pdf_dir.
     let search_dir = root.join("search");
@@ -5115,7 +6254,10 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     )
     .unwrap()
     .unwrap();
-    let texinputs_table = crate::math::macros_from_sources(&[texinputs_spliced.as_str()]);
+    let texinputs_table = crate::math::macros_from_sources(
+        &[texinputs_spliced.source.as_str()],
+        &Operation::default(),
+    );
     assert_eq!(
         texinputs_table
             .get("ExtSym")
@@ -5161,6 +6303,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
             true,
             Some(2),
             &[],
+            crate::tex::WordLocationMode::Strict,
+            None,
+            &Operation::default()
         ),
         Some((3, "  \\only{\\includegraphics{".len()))
     );
@@ -5208,6 +6353,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
                 true,
                 Some(2),
                 &[],
+                crate::tex::WordLocationMode::Strict,
+                None,
+                &Operation::default()
             ),
             None
         );
@@ -5221,6 +6369,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
             true,
             Some(2),
             &["\\againframe<2>{other}"],
+            crate::tex::WordLocationMode::Strict,
+            None,
+            &Operation::default()
         ),
         None
     );
@@ -5265,10 +6416,8 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     .unwrap();
     assert_eq!(late_map.inputs.len(), 2);
 
-    // Defining the single-character control symbol \* does not trigger the "**" incomplete-macro sentinel.
+    // A single-character control symbol does not hide unrelated math.
     let star_def = "\\def\\*{\\times}\n$\\alpha + 1$ and $\\beta + 1$\n";
-    let star_table = crate::math::macros_from_sources(&[star_def]);
-    assert!(!star_table.contains_key("**"));
     assert_eq!(
         source_word_location(star_def, 2, "\u{03b2} + 1", 0, 2),
         Some((2, "$\\alpha + 1$ and $".len()))
@@ -5305,7 +6454,7 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         "$\\dyn$ and $\\alpha$\n",
     );
     assert_eq!(
-        crate::math::macros_from_sources(&[csname_src]).get("dyn"),
+        crate::math::macros_from_sources(&[csname_src], &Operation::default()).get("dyn"),
         Some(&None)
     );
     assert_eq!(source_word_location(csname_src, 3, "\u{03b1}", 0, 3), None);
@@ -6002,4 +7151,956 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
     .unwrap();
     assert_eq!(tikz_hits.len(), 1);
     assert_eq!(tikz_hits[0].line, 3);
+}
+
+#[test]
+fn stored_self_redefinitions_are_not_invocations() {
+    for definition in ["{\\let\\let\\note}", "{\\def\\def{\\note{QuartzWord}}}"] {
+        let source = format!("\\begin{{frame}}\n{definition}\nQuartzWord\n\\end{{frame}}\n");
+        assert_eq!(
+            source_word_location(&source, 4, "QuartzWord", 0, 10),
+            Some((3, 0)),
+            "{definition}"
+        );
+    }
+}
+
+#[test]
+fn overridden_constructed_quotes_do_not_execute_stored_declarations() {
+    for name in ["string", "meaning", "noexpand"] {
+        let source = format!(
+            "\\renewcommand{{\\{name}}}[1]{{#1}}\n\\begin{{frame}}\nQuartzWord\n\
+             \\csname {name}\\endcsname\\newcommand{{\\unused}}{{\\note{{QuartzWord}}}}\n\
+             \\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 5, "QuartzWord", 0, 10),
+            Some((3, 0)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn agy_v9_stored_delimiters_preserve_executing_macro_state() {
+    for token in ["\\endgroup", "\\egroup", "\\end{unused}"] {
+        let source = format!(
+            "\\begingroup\n\\newcommand{{\\unused}}{{{token}}}\n\
+             \\renewcommand{{\\textbf}}[1]{{}}\n\\endgroup\n\
+             \\begin{{frame}}\n\\textbf{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(source_word_location(&source, 8, "QuartzWord", 0, 10), None);
+    }
+    for token in [
+        "\\begingroup",
+        "\\bgroup",
+        "\\begin{document}",
+        "\\begin{unused}",
+    ] {
+        let source = format!(
+            "\\newcommand{{\\unused}}{{{token}}}\n\\newcommand{{\\drop}}[1]{{}}\n\
+             \\begin{{frame}}\n\\drop{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 6, "QuartzWord", 0, 10),
+            Some((5, 0)),
+            "{token}"
+        );
+    }
+    let source = "\\newcommand{\\drop}[1]{}\n\
+                  \\newcommand{\\unused}{\\begin{verbatim}}\n\
+                  \\renewcommand{\\drop}[1]{#1}\n\
+                  \\begin{frame}\n\\drop{QuartzWord}\nQuartzWord\n\\end{frame}\n";
+    assert_eq!(source_word_location(source, 7, "QuartzWord", 0, 10), None);
+    for default in ["$", "\\(", "\\["] {
+        let source = format!(
+            "\\newcommand{{\\unused}}[1][{default}]{{}}\n\\newcommand{{\\drop}}[1]{{}}\n\
+             \\begin{{frame}}\n\\drop{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 6, "QuartzWord", 0, 10),
+            Some((5, 0)),
+            "{default}"
+        );
+    }
+}
+
+#[test]
+fn agy_v9_stored_delimiters_preserve_preamble_import_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let main = root.join("main.tex");
+    let child = root.join("macros.tex");
+    for (prefix, definition, call, expected) in [
+        (
+            "\\newcommand{\\unused}{\\begin{document}}\n\\input{macros}\n",
+            "\\newcommand{\\drop}[1]{}\n",
+            "\\drop{QuartzWord}",
+            Some((3, 0)),
+        ),
+        (
+            "\\newcommand{\\unused}[1][$]{}\n\\input{macros}\n",
+            "\\newcommand{\\drop}[1]{}\n",
+            "\\drop{QuartzWord}",
+            Some((3, 0)),
+        ),
+        (
+            "\\begingroup\n\\newcommand{\\unused}{\\endgroup}\n\
+             \\input{macros}\n\\endgroup\n",
+            "\\renewcommand{\\textbf}[1]{}\n",
+            "\\textbf{QuartzWord}",
+            None,
+        ),
+    ] {
+        let frame = format!("\\begin{{frame}}\n{call}\nQuartzWord\n\\end{{frame}}\n");
+        fs::write(&main, format!("{prefix}\\begin{{document}}\n{frame}")).unwrap();
+        fs::write(&child, definition).unwrap();
+        let spliced = crate::macro_preamble_source(
+            &main,
+            None,
+            None,
+            &mut crate::QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::tex::source_word_location_with_sources(
+                &frame,
+                4,
+                "QuartzWord",
+                0,
+                10,
+                &[spliced.source.as_str()],
+                &Operation::default()
+            )
+            .ok()
+            .flatten(),
+            expected,
+            "{prefix}"
+        );
+    }
+}
+
+#[test]
+fn agy_v10_parameterized_environment_notes_preserve_competing_ownership() {
+    for (command, prefix, signature) in [
+        ("newenvironment", "", "[1]"),
+        ("renewenvironment", "\\newenvironment{notenv}{}{}\n", "[1]"),
+        ("provideenvironment", "", "[1]"),
+        ("NewDocumentEnvironment", "", "{m}"),
+        (
+            "RenewDocumentEnvironment",
+            "\\newenvironment{notenv}{}{}\n",
+            "{m}",
+        ),
+        ("ProvideDocumentEnvironment", "", "{m}"),
+        ("DeclareDocumentEnvironment", "", "{m}"),
+    ] {
+        for (argument, expected) in [("QuartzWord", None), ("OtherWord", Some(7))] {
+            let source = format!(
+                "{prefix}\\{command}{{notenv}}{signature}{{\\note{{Copper #1}}}}{{}}\n\
+                 \\begin{{frame}}\nCopper QuartzWord\n\
+                 \\begin{{notenv}}{{{argument}}}\\end{{notenv}}\n\\end{{frame}}\n"
+            );
+            let body_line = source
+                .lines()
+                .position(|line| line == "Copper QuartzWord")
+                .unwrap() as u32
+                + 1;
+            assert_eq!(
+                source_word_location(
+                    &source,
+                    source.lines().count() as u32,
+                    "Copper QuartzWord",
+                    7,
+                    20,
+                ),
+                expected.map(|column| (body_line, column)),
+                "{command} {argument}"
+            );
+        }
+    }
+}
+
+#[test]
+fn agy_v10_nonexecuting_environments_keep_literal_precision() {
+    for invocation in [
+        "",
+        "\\detokenize{\\begin{setup}\\end{setup}}",
+        "\\string\\begin{setup}\\string\\end{setup}",
+        "\\drop{\\begin{setup}\\end{setup}}",
+        "\\newcommand{\\unused}{\\begin{setup}\\end{setup}}",
+    ] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\
+             \\newcommand{{\\cue}}[1]{{\\note{{#1}}}}\n\
+             \\newenvironment{{setup}}{{\\csname le%\nt\\endcsname\\drop\\cue}}{{}}\n\
+             \\NewDocumentEnvironment{{badge}}{{}}{{QuartzWord}}{{}}\n\
+             \\begin{{frame}}\n{invocation}\nCopper QuartzWord\n\\end{{frame}}\n"
+        );
+        let owner = source
+            .lines()
+            .position(|line| line == "Copper QuartzWord")
+            .unwrap() as u32
+            + 1;
+        assert_eq!(
+            source_word_location(
+                &source,
+                source.lines().count() as u32,
+                "Copper QuartzWord",
+                7,
+                20,
+            ),
+            Some((owner, 7)),
+            "{invocation}"
+        );
+    }
+    let source = "\\renewcommand{\\note}[1]{}\n\
+                  \\newenvironment{notenv}[1]{\\note{Copper #1}}{}\n\
+                  \\begin{frame}\nCopper QuartzWord\n\
+                  \\begin{notenv}{QuartzWord}\\end{notenv}\n\\end{frame}\n";
+    assert_eq!(
+        source_word_location(source, 6, "Copper QuartzWord", 7, 10),
+        Some((4, 7)),
+    );
+}
+
+#[test]
+fn optional_defaults_and_stored_quotes_preserve_execution_ownership() {
+    let source = "\\newcommand{\\drop}[1]{}\n\
+                  \\newcommand{\\setup}[1][\\let\\drop\\textbf]{#1}\n\\setup\n\
+                  \\begin{frame}\n\\drop{QuartzWord}\nCopper QuartzWord\n\\end{frame}\n";
+    assert_eq!(source_word_location(source, 7, "QuartzWord", 0, 16), None);
+    for quote in [
+        "\\string\\let x",
+        "\\meaning\\def\\drop{}",
+        "\\noexpand\\input{missing}",
+    ] {
+        for signature in ["", "[1][UnprintedDefault]"] {
+            let source = format!(
+                "\\newcommand{{\\unused}}{signature}{{{quote}}}\n\
+                 \\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
+                 \\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
+            );
+            assert_eq!(
+                source_word_location(&source, 6, "Copper QuartzWord", 7, 16),
+                Some((5, 7)),
+                "{signature} {quote}"
+            );
+        }
+    }
+}
+
+#[test]
+fn discarded_environment_arguments_do_not_execute_stored_declarations() {
+    let source = "\\newcommand{\\drop}[1]{}\n\
+                  \\def\\enddrop{}\n\
+                  \\newenvironment{fresh}{}{}\n\
+                  \\newcommand{\\setup}{\\begin{drop}{\\renewenvironment{fresh}{}{}}\\end{drop}}\n\
+                  \\setup\n\\begin{frame}\nCopper QuartzWord\n\\end{frame}\n";
+    assert_eq!(
+        source_word_location(source, 8, "Copper QuartzWord", 7, 16),
+        Some((7, 7)),
+    );
+}
+
+#[test]
+fn discarded_begin_tokens_do_not_consume_following_printed_arguments() {
+    let source = "\\begin{frame}\n\
+                  \\begin{drop}\\begin{eat} {QuartzWord}\\end{drop}\n\
+                  Copper QuartzWord\n\\end{frame}\n";
+    let defs = "\\newcommand{\\drop}[1]{}\n\\def\\enddrop{}\n\
+                \\newcommand{\\eat}[1]{}\n\\def\\endeat{}\n";
+    assert!(matches!(
+        tex::source_word_location_with_sources(
+            source,
+            4,
+            "QuartzWord",
+            0,
+            16,
+            &[defs],
+            &Operation::default()
+        ),
+        Ok(None) | Err(()),
+    ));
+}
+
+#[test]
+fn closing_environment_parameters_do_not_consume_physical_source() {
+    for signature in ["", "#1", "#1#2"] {
+        let source = format!(
+            "\\def\\badge{{}}\n\\def\\endbadge{signature}{{}}\n\\begin{{frame}}\n\
+             \\begin{{badge}}\\end{{badge}}{{QuartzWord}}{{}}\n\
+             Copper QuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(source_word_location(&source, 6, "QuartzWord", 0, 16), None);
+    }
+}
+
+#[test]
+fn incomplete_information_does_not_execute_unrebound_builtin_arguments() {
+    for command in ["\\includegraphics{\\figdir/plot}", "\\label{\\figdir}"] {
+        let source = format!(
+            "\\newcommand{{\\defalias}}[1]{{\\expandafter\\let\\csname #1\\endcsname\\relax}}\n\
+             \\newcommand{{\\figdir}}{{figs}}\n\\begin{{frame}}\n{command}\n\\end{{frame}}\n\
+             \\begin{{frame}}\nCopper QuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 8, "Copper QuartzWord", 7, 16),
+            Some((7, 7)),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn discarded_arguments_preserve_paragraph_and_unicode_token_boundaries() {
+    for boundary in ["\n\n", "% comment\n\n", "\r\n\r\n", "\u{a0}", "\u{2003}"] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
+             Copper QuartzWord\n\\drop{boundary}QuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, source.lines().count() as u32, "QuartzWord", 0, 16),
+            None,
+            "{boundary:?}"
+        );
+    }
+    let source = "\\newcommand{\\drop}[1]{}\n\\begin{frame}\n\
+                  \\drop \n{QuartzWord}\nCopper QuartzWord\n\\end{frame}\n";
+    assert_eq!(
+        source_word_location(source, 6, "Copper QuartzWord", 7, 16),
+        Some((5, 7)),
+    );
+}
+
+#[test]
+fn rebound_opaque_commands_do_not_hide_executed_redefinitions() {
+    for command in ["url", "path", "string", "detokenize"] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\\renewcommand{{\\{command}}}[1]{{#1}}\n\
+             \\{command}{{\\renewcommand{{\\drop}}[1]{{#1}}}}\n\
+             \\begin{{frame}}\n\\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(source_word_location(&source, 7, "QuartzWord", 0, 16), None);
+    }
+}
+
+#[test]
+fn unused_import_defaults_do_not_read_or_change_macro_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let main = root.join("main.tex");
+    fs::write(root.join("child.tex"), "\\renewcommand{\\drop}[1]{#1}\n").unwrap();
+    for imported in ["child", "missing"] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\
+             \\newcommand{{\\setup}}[1][\\input{{{imported}}}]{{#1}}\n\n\
+             \\begin{{frame}}\n\\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
+        );
+        fs::write(&main, &source).unwrap();
+        let spliced = macro_preamble_source(
+            &main,
+            None,
+            Some(&root),
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let actual = tex::source_word_location_with_sources(
+            &source,
+            7,
+            "Copper QuartzWord",
+            7,
+            16,
+            &[&spliced.source],
+            &Operation::default(),
+        );
+        assert_eq!(actual, Ok(Some((6, 7))), "{imported}");
+    }
+}
+
+#[test]
+fn discarded_raw_hash_does_not_consume_the_following_digit() {
+    let source = "\\newcommand{\\drop}[1]{}\n\\begin{frame}\n\
+                  \\drop#1QuartzWord\nCopper 1QuartzWord\n\\end{frame}\n";
+    assert_eq!(source_word_location(source, 5, "1QuartzWord", 0, 16), None);
+    for discarded in ["\\begingroup", "\\input{missing}"] {
+        let source = format!(
+            "\\newcommand{{\\dropTwo}}[2]{{}}\n\
+             \\newcommand{{\\setup}}[1]{{\\dropTwo#1{discarded}}}\n\\setup A\n\
+             \\begin{{frame}}\nCopper QuartzWord\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 6, "Copper QuartzWord", 7, 16),
+            Some((5, 7)),
+            "{discarded}"
+        );
+    }
+}
+
+#[test]
+fn builtin_note_math_remains_target_sensitive_with_optional_arguments() {
+    for math in ["$\\alpha$", "\\(\\alpha\\)", "\\[\\alpha\\]"] {
+        for options in ["", "<1>[item]"] {
+            let source = format!(
+                "\\newcommand{{\\cue}}{{\\note{options}{{{math}}}}}\n\
+                 \\begin{{frame}}\nNimbus\n\\cue\n\\end{{frame}}\n"
+            );
+            assert_eq!(
+                source_word_location(&source, 5, "Nimbus", 0, 16),
+                Some((3, 0)),
+                "{options} {math}"
+            );
+        }
+    }
+}
+
+#[test]
+fn note_consumed_command_does_not_discard_following_printed_word() {
+    for options in ["", "<1>", "[item]", "<1>[item]"] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
+             Copper QuartzWord\n\\note{options}\\drop QuartzWord\n\\end{{frame}}\n"
+        );
+        let byte = source.lines().nth(3).unwrap().find("QuartzWord").unwrap();
+        let actual = source_word_location(&source, 5, "Copper QuartzWord QuartzWord", 18, 16);
+        assert!(
+            actual.is_none() || actual == Some((4, byte)),
+            "{options}: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn forward_guess_words_require_valid_unchanged_printing_source() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let source = root.join("doc.tex");
+    let sidecar = pdf.with_extension("synctex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &source,
+        "\\documentclass{article}\n\\begin{document}\ncafé Amber\n\\end{document}\n",
+    )
+    .unwrap();
+    fs::write(
+        &sidecar,
+        format!(
+            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
+            source.display(),
+        ),
+    ).unwrap();
+    let set_time = |path: &Path, seconds| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    };
+    set_time(&source, 1000);
+    set_time(&sidecar, 2000);
+    let resolve = |context, column| {
+        resolve_forward_with_selector(&pdf, &source, 3, column, context, |_, _, _, anchor| {
+            Ok(anchor)
+        })
+    };
+    let strict = resolve(ForwardSource::default(), 6).unwrap();
+    let strict_hint = strict.word.as_ref().unwrap();
+    assert_eq!(strict_hint.words[strict_hint.selected], "Amber");
+    let context = ForwardSource {
+        best_guess: true,
+        ..ForwardSource::default()
+    };
+    let guess = resolve(context, 6).unwrap();
+    let hint = guess.word.as_ref().unwrap();
+    assert_eq!(hint.words[hint.selected], "Amber");
+    assert_eq!(
+        (guess.page, guess.h, guess.v, guess.width, guess.height),
+        (strict.page, strict.h, strict.v, strict.width, strict.height)
+    );
+    let anchor = resolve(
+        ForwardSource {
+            anchor_only: true,
+            ..context
+        },
+        6,
+    )
+    .unwrap();
+    assert!(anchor.word.is_none());
+    assert!(resolve(context, 999).is_err());
+
+    set_time(&source, 3000);
+    let changed_strict = resolve(ForwardSource::default(), 6).unwrap();
+    assert!(changed_strict.word.is_none());
+    assert_eq!(
+        (changed_strict.page, changed_strict.h, changed_strict.v),
+        (strict.page, strict.h, strict.v)
+    );
+    let changed = resolve(context, 6).unwrap();
+    assert!(changed.word.is_none());
+    assert!(resolve(context, 999).is_err());
+    assert_eq!(
+        (changed.page, changed.h, changed.v),
+        (strict.page, strict.h, strict.v)
+    );
+
+    fs::write(
+        &source,
+        "\\documentclass{article}\n\\newcommand{\\stash}{\nInvisible\n}\n\\begin{document}\nVisible\n\\end{document}\n",
+    ).unwrap();
+    set_time(&source, 1000);
+    let hidden = resolve(context, 3).unwrap();
+    assert!(hidden.word.is_none());
+
+    for (bytes, kind) in [
+        (
+            b"\\documentclass{article}\n\\begin{document}\ncaf\xe9 Amber\n\\end{document}\n"
+                .to_vec(),
+            io::ErrorKind::InvalidData,
+        ),
+        (vec![b'x'; 2 * 1024 * 1024 + 1], io::ErrorKind::FileTooLarge),
+    ] {
+        fs::write(&source, bytes).unwrap();
+        set_time(&source, 1000);
+        assert_eq!(
+            resolve(ForwardSource::default(), 6).unwrap_err().kind(),
+            kind
+        );
+        let unsupported = resolve(context, 6).unwrap();
+        assert!(unsupported.word.is_none());
+        assert!(unsupported.warning.is_some());
+        assert_eq!(
+            (unsupported.page, unsupported.h, unsupported.v),
+            (strict.page, strict.h, strict.v),
+        );
+    }
+    let missing_snapshot = root.join("missing.synctex.sources.json");
+    assert!(
+        resolve(
+            ForwardSource {
+                snapshot: Some(&missing_snapshot),
+                ..context
+            },
+            6,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn strict_fixed_output_inspection_preserves_unrelated_words() {
+    for body in ["{\\small #1}", "#1\\xspace", "\\LaTeX{} #1"] {
+        let source = format!(
+            "\\newcommand{{\\aside}}[1]{{{body}}}\n\
+             \\begin{{frame}}\n\
+             Quartz zephyr.\n\
+             \\aside{{Copper}}\n\
+             \\end{{frame}}"
+        );
+        assert_eq!(
+            source_word_location_with_sources(
+                &source,
+                5,
+                "Quartz zephyr.",
+                0,
+                10,
+                &[],
+                &Operation::default()
+            ),
+            Ok(Some((3, 0))),
+            "{body}",
+        );
+    }
+}
+
+#[test]
+fn strict_fixed_output_nested_helpers_preserve_roots_and_original_owners() {
+    for (source, anchor, context, offset, expected) in [
+        (
+            "\\newcommand{\\unused}{\\def\\pick{Amber}}\n\
+             \\newcommand{\\pick}[1]{\\textbf{#1}}\n\
+             \\newcommand{\\outer}[1]{\\pick{#1}}\n\
+             \\begin{frame}\n\
+             Quartz \\outer{Silver} zephyr.\n\
+             Amber stays here.\n\
+             \\end{frame}",
+            7,
+            "Amber stays here.",
+            0,
+            (6, 0),
+        ),
+        (
+            "\\providecommand{\\inner}[1]{\\textbf{#1}}\n\
+             \\newcommand{\\outer}[1]{\\inner{#1}}\n\
+             \\begin{frame}\n\
+             Quartz \\outer{Silver} zephyr.\n\
+             \\end{frame}",
+            5,
+            "Quartz Silver zephyr.",
+            7,
+            (4, 14),
+        ),
+    ] {
+        assert_eq!(
+            source_word_location_with_sources(
+                source,
+                anchor,
+                context,
+                offset,
+                10,
+                &[],
+                &Operation::default()
+            ),
+            Ok(Some(expected)),
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn environment_helper_reachability_has_no_depth_cutoff_or_fanout_revisits() {
+    let operation = Operation::default();
+    for fanout in [1, 10] {
+        let mut source = "\\newcommand{\\hA}{Amber}\n".to_string();
+        for level in 1..10u8 {
+            let name = char::from(b'A' + level);
+            let previous = char::from(b'A' + level - 1);
+            source.push_str(&format!(
+                "\\newcommand{{\\h{name}}}{{{}}}\n",
+                format!("\\h{previous} ").repeat(fanout)
+            ));
+        }
+        source.push_str("\\newenvironment{wrap}{\\hJ}{}\n\\begin{frame}\n\
+                         Quartz \\begin{wrap}\\end{wrap} zephyr.\nAmber stays here.\nCopper nimbus.\n\\end{frame}");
+        let anchor = source.lines().count() as u32;
+        assert_eq!(
+            source_word_location_with_sources(
+                &source,
+                anchor,
+                "Copper nimbus.",
+                0,
+                10,
+                &[],
+                &operation
+            ),
+            Ok(Some((anchor - 1, 0))),
+        );
+        assert_eq!(
+            source_word_location_with_sources(
+                &source,
+                anchor,
+                "Quartz Amber zephyr.",
+                7,
+                10,
+                &[],
+                &operation
+            )
+            .unwrap_or(None),
+            None,
+        );
+    }
+}
+
+#[test]
+fn equation_helper_graph_reuses_root_context_and_preserves_literal_owner() {
+    let mut source = "\\newcommand{\\eqA}{\\begin{equation}x\\end{equation}}\n".to_string();
+    for level in 1..4u8 {
+        let name = char::from(b'A' + level);
+        let previous = char::from(b'A' + level - 1);
+        source.push_str(&format!(
+            "\\newcommand{{\\eq{name}}}{{{}}}\n",
+            format!("\\eq{previous} ").repeat(10)
+        ));
+    }
+    source.push_str(&"% unused context padding without an executed macro\n".repeat(22_000));
+    source.push_str("\\begin{frame}\nQuartz \\eqD{} zephyr.\nCopper nimbus.\n\\end{frame}");
+    let anchor = source.lines().count() as u32;
+    assert_eq!(
+        source_word_location_with_sources(
+            &source,
+            anchor,
+            "Copper nimbus.",
+            0,
+            10,
+            &[],
+            &Operation::default()
+        ),
+        Ok(Some((anchor - 1, 0))),
+    );
+}
+
+#[test]
+fn cancelled_source_refinement_does_not_return_a_literal_owner() {
+    let operation = Operation::default();
+    operation.cancel();
+    assert_eq!(
+        source_word_location_with_sources(
+            "Copper nimbus.",
+            1,
+            "Copper nimbus.",
+            0,
+            1,
+            &[],
+            &operation
+        ),
+        Err(()),
+    );
+    assert_eq!(
+        tex::source_word_guess_with_sources(
+            "Copper nimbus.",
+            1,
+            "Copper nimbus.",
+            0,
+            1,
+            &[r"\csname\string x\endcsname"],
+            &operation
+        ),
+        Err(()),
+    );
+}
+
+#[test]
+fn guess_context_prefix_requires_transparent_once_only_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let main = root.join("main.tex");
+    let chapter = root.join("chapter.tex");
+    let nested = root.join("nested.tex");
+    let helper = root.join("helper.tex");
+    fs::write(&chapter, "\\textit{Copper} and Amber literal.\n").unwrap();
+    fs::write(&nested, "\\input{chapter}\n").unwrap();
+    fs::write(&helper, "\\newcommand{\\Run}[3]{#3#1{#2}}\n").unwrap();
+    for (label, preamble, body, prefix) in [
+        ("plain", "", "\\input{chapter}", true),
+        ("nested literal", "", "\\input{nested}", true),
+        (
+            "unverified package frontend reaching the input",
+            "",
+            "\\PackageFrontend\\input{chapter}",
+            false,
+        ),
+        (
+            "unverified package frontend beyond nine arguments",
+            "",
+            "\\PackageFrontend{a}{b}{c}{d}{e}{f}{g}{h}{i}\n\\input{chapter}",
+            true,
+        ),
+        (
+            "modeled literal argument",
+            "\\newcommand{\\Run}[1]{#1}",
+            "\\Run{Title}\\input{chapter}",
+            true,
+        ),
+        (
+            "unused imported local definition",
+            "\\input{helper}",
+            "\\input{chapter}",
+            true,
+        ),
+        ("group", "", "{\\input{chapter}}", false),
+        ("conditional", "", "\\iftrue\\input{chapter}\\fi", false),
+        (
+            "environment body",
+            "",
+            "\\begin{custom}\\input{chapter}\\end{custom}",
+            false,
+        ),
+        (
+            "braced reordered arguments",
+            "\\newcommand{\\Run}[2]{#2#1}",
+            "\\Run{\\input{chapter}}{\\Mutate}",
+            false,
+        ),
+        (
+            "unbraced reordered arguments",
+            "\\newcommand{\\Run}[3]{#3#1{#2}}",
+            "\\Run\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "nested parameter forwarding",
+            "\\newcommand{\\Run}[1]{#1}\\newcommand{\\Reorder}[3]{#3#1{#2}}",
+            "\\Run\\Reorder\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "tail forwarding",
+            "\\newcommand{\\Run}{\\Reorder}\\newcommand{\\Reorder}[3]{#3#1{#2}}",
+            "\\Run\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "local environment end",
+            "\\newenvironment{Run}{}{\\Reorder}",
+            "\\begin{Run}\\end{Run}\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "deferred arguments",
+            "\\newcommand{\\Run}[3]{#3#1{#2}}",
+            "\\afterassignment\\Run\\let\\Unused\\relax\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "imported local definition",
+            "\\input{helper}",
+            "\\Run\\input{chapter}{\\Mutate}",
+            false,
+        ),
+        (
+            "missing earlier input",
+            "\\input{missing}",
+            "\\input{chapter}",
+            false,
+        ),
+        (
+            "dynamic earlier input",
+            "\\input{\\Unknown}",
+            "\\input{chapter}",
+            false,
+        ),
+        ("repeated", "", "\\input{chapter}\\input{chapter}", false),
+        ("omitted", "", "\\subfile{chapter}", false),
+    ] {
+        fs::write(
+            &main,
+            format!(
+                "\\documentclass{{article}}\n{preamble}\n\
+                     \\begin{{document}}\n{body}\nLATER_SENTINEL\n\\end{{document}}\n"
+            ),
+        )
+        .unwrap();
+        let mut spliced = macro_preamble_source(
+            &main,
+            None,
+            None,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spliced.inputs.len(), spliced.input_ends.len(), "{label}");
+        let guessed = spliced.guess_source(&chapter);
+        assert_eq!(guessed.len() < spliced.source.len(), prefix, "{label}");
+        assert_eq!(guessed.as_ptr(), spliced.source.as_ptr(), "{label}");
+        assert_eq!(!guessed.contains("LATER_SENTINEL"), prefix, "{label}");
+        assert_eq!(spliced.guess_source(&main), spliced.source, "{label}");
+        assert_eq!(
+            spliced.guess_source(&root.join("absent.tex")),
+            spliced.source,
+            "{label}"
+        );
+        spliced.ambiguous_inputs = true;
+        assert_eq!(spliced.guess_source(&chapter), spliced.source, "{label}");
+    }
+}
+
+#[test]
+fn guess_context_prefix_counts_unresolved_compiler_openings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let main = root.join("main.tex");
+    let chapter = root.join("chapter.tex");
+    fs::write(&chapter, "Copper and Amber literal.\n").unwrap();
+    fs::write(
+        &main,
+        "\\begin{document}\n\\input{chapter}\nLATER_SENTINEL\n\\end{document}\n",
+    )
+    .unwrap();
+    for (compiled, prefix) in [
+        (None, true),
+        (Some(vec![]), false),
+        (Some(vec![main.clone(), chapter.clone()]), true),
+        (Some(vec![chapter.clone(), chapter.clone()]), false),
+        (
+            Some(vec![chapter.clone(), root.join("missing/chapter.tex")]),
+            false,
+        ),
+        (
+            Some(vec![chapter.clone(), root.join("missing/unrelated.tex")]),
+            true,
+        ),
+    ] {
+        let spliced = macro_preamble_source(
+            &main,
+            compiled.as_deref(),
+            None,
+            &mut QuerySources::default(),
+            &Operation::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            !spliced.guess_source(&chapter).contains("LATER_SENTINEL"),
+            prefix,
+            "{compiled:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_inverse_keeps_first_compiler_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("paper.tex");
+    let pdf = dir.path().join("paper.pdf");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        format!(
+            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\n\
+             Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,6:0,0:30000000,40000000,0\n\
+             (1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n\
+             }}1\nPostamble:\nCount:4\n",
+            main.display(),
+        ),
+    )
+    .unwrap();
+    for prefix in ["\\textit{Copper} ", ""] {
+        fs::write(
+            &main,
+            format!(
+                "\\csname\\string x\\endcsname\n\\begin{{document}}\n\
+                 {prefix}Amber literal.\n\n{prefix}Amber literal.\n\\end{{document}}\n",
+            ),
+        )
+        .unwrap();
+        for lines in [[3, 5, 3], [5, 3, 5]] {
+            let output = format!(
+                "Input:paper.tex\nLine:{}\nColumn:1\n\
+                 Input:paper.tex\nLine:{}\nColumn:1\n\
+                 Input:paper.tex\nLine:{}\nColumn:2\n",
+                lines[0], lines[1], lines[2],
+            );
+            let result = resolve_inverse_output(
+                &pdf,
+                InversePoint {
+                    page: 1,
+                    x: 72.0,
+                    y_from_top: 120.0,
+                    page_height_pt: 792.0,
+                },
+                Some(("Amber literal.", 0)),
+                0,
+                &Operation::default(),
+                &output,
+                QuerySources {
+                    best_guess: true,
+                    ..QuerySources::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                (result.location.line, result.location.byte_column),
+                (lines[0], 0)
+            );
+            assert!(!result.location.precise);
+            assert!(result.warning.is_some());
+        }
+    }
 }
