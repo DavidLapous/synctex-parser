@@ -65,3 +65,22 @@ errors.
 Forward candidates expose the probed `source_line`. Forward JSON requests use
 `inverse_search` for the editor's revision-bound source-map service;
 `source_snapshot` is not a request field, and unknown fields are rejected.
+
+## Manual theorem-title reproducer
+
+`scripts/fixtures/theorem-title/` isolates a local theorem definition, optional
+heading math and nested inputs. From the repository root, with `pdflatex`, the
+Python oracle dependencies and a built sibling `pdfterm`:
+
+```sh
+mkdir -p target/theorem-title
+TEXINPUTS="$PWD/scripts/fixtures/theorem-title/:" pdflatex \
+  -interaction=nonstopmode -halt-on-error -synctex=1 -recorder \
+  -output-directory=target/theorem-title scripts/fixtures/theorem-title/main.tex
+python3 scripts/synctex_fuzz.py target/theorem-title/main.pdf \
+  --source scripts/fixtures/theorem-title/snazzle.tex \
+  --binary ../pdfterm/target/release/pdfterm --seed 20261020 --lines 20
+```
+
+The full oracle currently reports failures on this case. It is a diagnostic
+reproducer, not a passing regression test or a positive precision control.

@@ -5,10 +5,11 @@ Forward probes compare pdfterm's page with raw SyncTeX results. Inverse probes
 enumerate painted PDF words with PyMuPDF, then send all selected word centers
 through pdfterm's PDFium + inverse resolver batch diagnostic. File/line identity
 is checked even for coarse results; fragile frames use the clicked sheet's
-original source-map box, never the final reused .vrb contents. Precision is
-checked against literal printed source spans; unsupported math remains separate.
-The report is one JSON object with exact probe failures and deterministic
-coverage totals. Any failed probe exits nonzero.
+original source-map box, never the final reused .vrb contents. Precision checks
+unique eligible literal spellings, not arbitrary TeX execution ownership.
+Unknown expansions and repeated occurrences are explicitly unverified.
+Failures exit 1; an enabled best-guess inverse run with no verified precision
+exits 2 (inconclusive). Disabled inverse probing and text-free pages are exempt.
 
 Usage: synctex_fuzz.py PDF [--source TEX] [--lines N] [--page N ...]
        [--pages N] [--words N] [--seed N] [--allow-stale]
@@ -20,6 +21,7 @@ probe exact one-based pages (for example, --page 27 --page 28).
 """
 
 import argparse
+import bisect
 import concurrent.futures
 import functools
 import gzip
@@ -27,9 +29,12 @@ import json
 import math
 import random
 import re
+import string
 import subprocess
+import struct
 import sys
 import unicodedata
+from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -40,6 +45,7 @@ PDFTERM_BINARY = Path(
         Path(__file__).resolve().parents[2] / "pdfterm" / "target" / "release" / "pdfterm",
     )
 )
+BUILD_DIRECTORY: Path | None = None
 
 
 def usable_forward_record(record: dict[str, int | float]) -> bool:
@@ -57,7 +63,7 @@ def usable_forward_record(record: dict[str, int | float]) -> bool:
     )
 
 
-def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
+def raw_forward_records(pdf: Path, source: Path, line: int, column: int = 1) -> list[dict]:
     result = subprocess.run(
         ["synctex", "view", "-i", f"{line}:{column}:{source}", "-o", str(pdf)],
         capture_output=True,
@@ -67,13 +73,13 @@ def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
     )
     if result.returncode:
         raise RuntimeError(f"synctex view: {result.stderr.strip()[:200]}")
-    pages, record = set(), {}
+    records, record = [], {}
     for row in [*result.stdout.splitlines(), ""]:
         key, sep, value = row.strip().partition(":")
         if sep and key in {"Page", "h", "v", "W", "H"}:
             if key == "Page" and "Page" in record:
                 if usable_forward_record(record):
-                    pages.add(int(record["Page"]))
+                    records.append(record)
                 record = {}
             try:
                 record[key] = int(value) if key == "Page" else float(value)
@@ -81,9 +87,13 @@ def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
                 pass
         elif not row.strip() or row.strip().startswith("SyncTeX result end"):
             if usable_forward_record(record):
-                pages.add(int(record["Page"]))
+                records.append(record)
             record = {}
-    return pages
+    return records
+
+
+def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
+    return {int(record["Page"]) for record in raw_forward_records(pdf, source, line, column)}
 
 
 def raw_inverse(pdf: Path, x: float, y: float, page: int) -> list[tuple[int, str]]:
@@ -112,6 +122,17 @@ def raw_inverse(pdf: Path, x: float, y: float, page: int) -> list[tuple[int, str
     return records
 
 
+def source_lines(text: str, keepends: bool = False) -> list[str]:
+    """Match Rust source.lines(): LF/CRLF only, with no trailing empty line."""
+    parts = text.split("\n")
+    rows = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        rows.append(parts[-1])
+    if keepends:
+        return rows
+    return [row[:-2] if row.endswith("\r\n") else row.removesuffix("\n") for row in rows]
+
+
 def source_line_text(text: str) -> str:
     escaped = False
     for index, char in enumerate(text):
@@ -128,7 +149,7 @@ def sample_source_positions(
     source: str, rng: random.Random, count: int
 ) -> list[tuple[int, int]]:
     candidates = []
-    for line, row in enumerate(source.splitlines(), 1):
+    for line, row in enumerate(source_lines(source), 1):
         if not row.strip() or row.lstrip().startswith("%"):
             continue
         row = source_line_text(row)
@@ -214,6 +235,30 @@ def is_generated_input(path: Path, pdf_stem: str) -> bool:
     ) or path.suffix.lower() in GENERATED_GRAPHICS_EXTENSIONS
 
 
+def source_context_hint(text: str, line: int, column: int) -> dict | None:
+    rows = source_lines(text, keepends=True)
+    if not (1 <= line <= len(rows) and column >= 1):
+        return None
+    start = sum(len(row) for row in rows[:line - 1])
+    end = start + len(source_lines(rows[line - 1])[0])
+    position = start + column - 1
+    if position >= end:
+        return None
+    literals, uncertain, opaque_words, _ = lexical_words(text)
+    if any(lo < end and hi > start for lo, hi in uncertain):
+        return None
+    tokens = sorted(
+        (lo, hi, word)
+        for word, spans in literals.items()
+        for lo, hi in spans
+        if start <= lo and hi <= end
+    )
+    for selected, (lo, hi, word) in enumerate(tokens):
+        if lo <= position < hi and word not in opaque_words:
+            return {"words": [token[2] for token in tokens], "selected": selected}
+    return None
+
+
 def forward(
     pdf: Path,
     source: Path,
@@ -228,6 +273,10 @@ def forward(
     if source_map is None and positions:
         source_map = read_source_map(pdf)
     source_resolved = source.resolve()
+    if source_map is not None and source_resolved not in source_map["inputs"].values():
+        for line, column in positions:
+            yield {"direction": "forward", "line": line, "column": column, "ok": False, "error": "source is absent from compiler inputs"}
+        return
     for line, column in positions:
         view_line = (
             collected_env_closing_line(source_text, line, column)
@@ -342,42 +391,36 @@ def forward(
             "raw_page_match": page in expected,
             "raw_unmapped": not expected,
         }
-        if (
-            valid
-            and visible_words is not None
-            and (not expected or len(expected) > 1)
-            and got.get("word")
-        ):
-            try:
-                hint = got["word"]
-                chosen_score = context_score(visible_words[page - 1], hint)
-                if not expected:
-                    elsewhere = chosen_score is None and any(
-                        context_score(words, hint) is not None
-                        for words in visible_words
-                    )
-                    entry["visible_checked"] = chosen_score is not None or elsewhere
-                    if elsewhere:
-                        entry["ok"] = False
-                        entry["error"] = "raw SyncTeX has no page and selected word is absent from chosen PDF page"
-                elif page in expected:
-                    entry["visible_checked"] = True
-                    better = [
+        if valid and (not expected or len(expected) > 1):
+            hint = source_context_hint(source_text, line, column)
+            entry["mapping_ok"] = True
+            entry["visible_checked"] = False
+            if visible_words is None or hint is None:
+                entry.update(ok=False, abstained=True, reason="unverified_forward_source_context")
+            else:
+                try:
+                    chosen_score = context_score(visible_words[page - 1], hint)
+                    alternatives = [
                         candidate
-                        for candidate in expected
+                        for candidate in (expected or range(1, page_count + 1))
                         if candidate != page
                         and 1 <= candidate <= page_count
-                        and (context_score(visible_words[candidate - 1], hint) or 0) > 0
+                        and (score := context_score(visible_words[candidate - 1], hint)) is not None
+                        and (not expected or score > 0)
                     ]
-                    if chosen_score is None and better:
-                        entry["ok"] = False
-                        entry["error"] = (
-                            "selected word absent from chosen page but present with source context on another SyncTeX page"
+                    if chosen_score is None and alternatives:
+                        entry.update(
+                            ok=False, visible_checked=True,
+                            error="source word absent from chosen PDF page but present on another candidate page",
+                            visible_alternatives=sorted(alternatives),
                         )
-                        entry["visible_alternatives"] = sorted(better)
-            except (IndexError, KeyError, TypeError, ValueError) as error:
-                entry["ok"] = False
-                entry["error"] = f"invalid forward word or PDF page: {error}"
+                    elif chosen_score is None:
+                        entry.update(ok=False, abstained=True, reason="unverified_forward_source_context")
+                    else:
+                        entry["visible_checked"] = True
+                except (IndexError, KeyError, TypeError, ValueError) as error:
+                    entry["ok"] = False
+                    entry["error"] = f"invalid independent source context or PDF page: {error}"
         yield entry
 
 
@@ -386,6 +429,13 @@ def read_source_map(pdf: Path) -> dict:
     if companion is None:
         raise RuntimeError("missing SyncTeX source map")
     opener = gzip.open if companion.suffix == ".gz" else open
+    build_dir = BUILD_DIRECTORY
+    recorder = pdf.with_suffix(".fls")
+    if build_dir is None and recorder.is_file():
+        recorded = [row[4:] for row in recorder.read_text().splitlines() if row.startswith("PWD ")]
+        if len(set(recorded)) != 1 or not Path(recorded[0]).is_absolute():
+            raise RuntimeError("compiler recorder has no unique absolute PWD; pass --build-dir")
+        build_dir = Path(recorded[0])
     inputs, origins, page_inputs, page_lines, host_origins = {}, {}, {}, {}, {}
     page = None
     box_stack: list[tuple[int, int]] = []
@@ -398,7 +448,9 @@ def read_source_map(pdf: Path) -> dict:
             if row.startswith("Input:"):
                 tag, _, name = row[len("Input:"):].rstrip("\r\n").partition(":")
                 path = Path(name)
-                inputs[int(tag)] = (path if path.is_absolute() else pdf.parent / path).resolve()
+                if not path.is_absolute() and build_dir is None:
+                    raise RuntimeError("relative compiler input requires .fls PWD or --build-dir")
+                inputs[int(tag)] = (path if path.is_absolute() else build_dir / path).resolve()
             elif re.fullmatch(r"\{\d+\s*", row):
                 page = int(row[1:])
                 page_inputs[page] = set()
@@ -436,40 +488,13 @@ def read_source_map(pdf: Path) -> dict:
                         box_stack.append((tag, line))
     if page is not None or 1 not in inputs:
         raise RuntimeError("SyncTeX source map is incomplete or has no main input")
-    adjacent_origins = {}
-    sorted_pages = sorted(origins)
-    prev_by_page, next_by_page = {}, {}
-    last_host = None
-    for p in sorted_pages:
-        prev_by_page[p] = last_host
-        otag = origins[p][0]
-        if otag in inputs and not is_compiler_sidecar_or_graphics(inputs[otag]):
-            last_host = origins[p]
-    next_host = None
-    for p in reversed(sorted_pages):
-        next_by_page[p] = next_host
-        otag = origins[p][0]
-        if otag in inputs and not is_compiler_sidecar_or_graphics(inputs[otag]):
-            next_host = origins[p]
-    for p, (otag, oline) in origins.items():
-        if (
-            otag in inputs
-            and is_compiler_sidecar_or_graphics(inputs[otag])
-            and inputs[otag].suffix.lower() != ".vrb"
-        ):
-            prev_orig, next_orig = prev_by_page[p], next_by_page[p]
-            adjacent_origins[p] = (
-                [next_orig, prev_orig]
-                if (prev_orig and next_orig and next_orig[0] == prev_orig[0])
-                else [orig for orig in (prev_orig, next_orig) if orig is not None]
-            )
     return {
         "inputs": inputs,
         "origins": origins,
-        "adjacent_origins": adjacent_origins,
         "host_origins": host_origins,
         "page_inputs": page_inputs,
         "page_lines": page_lines,
+        "build_dir": build_dir,
     }
 
 
@@ -562,7 +587,7 @@ def opaque_command_end(text: str, command: str, at: int) -> tuple[int, bool] | N
         if nl < 0:
             return (len(text), True)
         pos = nl + 1
-        for row in text[pos:].splitlines(keepends=True):
+        for row in source_lines(text[pos:], keepends=True):
             pos += len(row)
             if row.rstrip("\r\n").rstrip(" ") == f"\\end{{{env}}}":
                 return (pos, True)
@@ -572,7 +597,7 @@ def opaque_command_end(text: str, command: str, at: int) -> tuple[int, bool] | N
         if nl < 0:
             return (len(text), False)
         pos = nl + 1
-        for row in text[pos:].splitlines(keepends=True):
+        for row in source_lines(text[pos:], keepends=True):
             pos += len(row)
             idx = row.find("\\end{")
             if idx >= 0 and row[idx + 5 :].startswith(f"{env}}}"):
@@ -582,7 +607,18 @@ def opaque_command_end(text: str, command: str, at: int) -> tuple[int, bool] | N
     return (len(text) if close < 0 else close + len(env) + 6, False)
 
 
-def nonprinting_ranges(text: str, graphics_starts: set[int] | None = None) -> list[tuple[int, int]]:
+REFERENCE_COMMANDS = {
+    "ref", "eqref", "pageref", "autoref", "cref", "Cref", "cite",
+    "citep", "citet", "parencite", "textcite", "autocite", "footcite",
+}
+NONPRINTING_KEYS = REFERENCE_COMMANDS | {
+    "label", "nocite", "bibitem", "href", "includegraphics", "includesvg",
+    "input", "include", "bibliography", "addbibresource", "textcolor", "color",
+}
+
+
+@functools.lru_cache(maxsize=32)
+def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
     definitions = {
         "newcommand", "renewcommand", "providecommand", "DeclareRobustCommand",
         "DeclareMathOperator", "pgfmathsetmacro", "pgfmathtruncatemacro",
@@ -594,16 +630,11 @@ def nonprinting_ranges(text: str, graphics_starts: set[int] | None = None) -> li
         "ProvideDocumentEnvironment", "DeclareDocumentEnvironment",
         "def", "gdef", "edef", "xdef",
     }
-    keys = {
-        "label", "ref", "eqref", "pageref", "autoref", "cref", "Cref", "cite",
-        "citep", "citet", "parencite", "textcite", "autocite", "footcite",
-        "nocite", "bibitem", "href", "includegraphics", "includesvg", "input",
-        "include", "bibliography", "addbibresource", "textcolor", "color",
-    }
     hidden, at = [], 0
     while at < len(text):
         if text[at] == "%":
             end = text.find("\n", at)
+            hidden.append((at, len(text) if end < 0 else end))
             at = len(text) if end < 0 else end
             continue
         if text[at] == "<" and at > 0 and text[at - 1] in "}]":
@@ -680,45 +711,91 @@ def nonprinting_ranges(text: str, graphics_starts: set[int] | None = None) -> li
             if command.endswith("environment") or command.endswith("Environment"):
                 at = tex_group_end(text, at) or at
             hidden.append((start, at))
-        elif command in keys:
+        elif command in NONPRINTING_KEYS:
             while (end := tex_group_end(text, at, "[") or overlay_end(text, at)) is not None:
                 at = end
             body = tex_space_end(text, at)
             end = tex_group_end(text, body)
             if end is not None:
-                if command in {"includegraphics", "includesvg"} and graphics_starts is not None:
-                    graphics_starts.add(body + 1)
                 hidden.append((start if command in {"includegraphics", "includesvg"} else body, end))
                 at = end
         elif command in {"begin", "end"}:
             body = tex_space_end(text, at)
             if (end := tex_group_end(text, body)) is not None:
                 env = text[body + 1 : end - 1].strip()
-                if env in {"tabularx", "tabular*", "tabular", "array"}:
-                    at = end
-                    if command == "begin":
-                        if env in {"tabularx", "tabular*"} and (w_end := tex_group_end(text, at)) is not None:
-                            at = w_end
-                        if (opt_end := tex_group_end(text, at, "[")) is not None:
-                            at = opt_end
-                        if (col_end := tex_group_end(text, at)) is not None:
-                            at = col_end
-                    hidden.append((body, at))
+                if command == "end" and env == "document":
+                    hidden.append((start, len(text)))
+                    break
+                at = end
+                if command == "begin":
+                    if (over := overlay_end(text, tex_space_end(text, at))) is not None:
+                        at = over
+                    if env in {"tabularx", "tabular*"} and (w_end := tex_group_end(text, at)) is not None:
+                        at = w_end
+                    if (opt_end := tex_group_end(text, at, "[")) is not None:
+                        at = opt_end
+                    if env in {"tabularx", "tabular*", "tabular", "array"}:
+                        at = tex_group_end(text, at) or at
+                hidden.append((body, at))
+        elif command in {"caption", "title", "subtitle", "author", "date", "institute", "frametitle", "framesubtitle", "note"}:
+            at = tex_space_end(text, at)
+            if (over := overlay_end(text, at)) is not None:
+                at = tex_space_end(text, over)
+            while (end := tex_group_end(text, at, "[")) is not None:
+                hidden.append((at, end))
+                at = tex_space_end(text, end)
+            if command == "note" and (end := tex_group_end(text, at)) is not None:
+                hidden.append((start, end))
+                at = end
+        elif command in {"phantom", "hphantom", "vphantom", "typeout", "message", "errmessage", "wlog"}:
+            if (end := tex_group_end(text, at)) is not None:
+                hidden.append((start, end))
+                at = end
+        elif command == "foreach":
+            body = text.find("{", at)
+            if body >= 0 and (end := tex_group_end(text, body)) is not None:
+                hidden.append((start, end))
+                at = end
+        elif command == "endinput":
+            hidden.append((start, len(text)))
+            break
         elif (end := overlay_end(text, at)) is not None:
             hidden.append((cmd_end, end))
             at = end
     return hidden
 
 
-def input_path(name: str, pdf: Path, source: Path) -> Path:
+def _merged_ranges(ranges) -> tuple[tuple[int, int], ...]:
+    merged = []
+    for lo, hi in sorted(ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return tuple(merged)
+
+
+def _range_contains(ranges: tuple[tuple[int, int], ...], position: int) -> bool:
+    index = bisect.bisect_right(ranges, (position, math.inf)) - 1
+    return index >= 0 and position < ranges[index][1]
+
+
+@functools.lru_cache(maxsize=32)
+def _nonprinting_index(text: str) -> tuple[tuple[int, int], ...]:
+    return _merged_ranges(nonprinting_ranges(text))
+
+
+def input_path(name: str, source_map: dict) -> Path:
     path = Path(name)
-    if path.is_absolute():
-        return path.resolve()
-    for root in (pdf.parent, source.parent):
-        candidate = (root / path).resolve()
-        if candidate.is_file():
-            return candidate
-    return (pdf.parent / path).resolve()
+    if not path.is_absolute():
+        build_dir = source_map.get("build_dir")
+        if build_dir is None:
+            raise RuntimeError("relative raw compiler input requires .fls PWD or --build-dir")
+        path = build_dir / path
+    path = path.resolve()
+    if path not in source_map["inputs"].values():
+        raise RuntimeError(f"raw compiler input is absent from source map: {name}")
+    return path
 
 
 TEX_ACCENT_RE = re.compile(
@@ -732,8 +809,8 @@ def strip_tex_accents(text: str) -> str:
 
 def line_has_word(line: str, word: str) -> bool:
     text = source_line_text(line)
-    hidden = nonprinting_ranges(text)
-    text = "".join(" " if any(start <= at < end for start, end in hidden) else char for at, char in enumerate(text))
+    hidden = _nonprinting_index(text)
+    text = "".join(" " if _range_contains(hidden, at) else char for at, char in enumerate(text))
     text = strip_tex_accents(text).replace("$", "")
     text = re.sub(r"\\\\|\\[A-Za-z@]+\*?|_+", " ", text)
     needle = normalized_words(word)
@@ -742,12 +819,11 @@ def line_has_word(line: str, word: str) -> bool:
 
 def metadata_spans(text: str) -> list[tuple[int, int]]:
     spans, start = [], 0
-    for raw_row in text.splitlines(keepends=True):
+    for raw_row in source_lines(text, keepends=True):
         visible = source_line_text(raw_row.rstrip("\r\n"))
         for match in re.finditer(r"\\(?:title|subtitle|author|date|institute)(?![A-Za-z@])\*?", visible):
             at = start + match.end()
             while (opt_end := tex_group_end(text, at, "[")) is not None:
-                spans.append((tex_space_end(text, at) + 1, opt_end - 1))
                 at = opt_end
             body = tex_space_end(text, at)
             if (end := tex_group_end(text, body)) is not None:
@@ -778,18 +854,18 @@ def _ignored_env_ranges(text: str) -> tuple[tuple[int, int], ...]:
         else:
             scan += 1
     ignored.extend(nonprinting_ranges(text))
-    return tuple(ignored)
+    return _merged_ranges(ignored)
 
 
-def environment_bounds(text: str, line_number: int, environment: str) -> tuple[int, int] | None:
-    anchor = line_number - 1
-    if anchor < 0 or f"{{{environment}}}" not in text:
-        return None
+@functools.lru_cache(maxsize=32)
+def _environment_ranges(text: str, environment: str) -> tuple[tuple[int, int], ...]:
+    if f"{{{environment}}}" not in text:
+        return ()
     ignored = _ignored_env_ranges(text)
-    start, line_offset = None, 0
+    ranges, start, line_offset = [], None, 0
     begin_re = re.compile(rf"begin\s*\{{{re.escape(environment)}\}}")
     end_re = re.compile(rf"end\s*\{{{re.escape(environment)}\}}")
-    for index, raw_row in enumerate(text.splitlines(keepends=True)):
+    for index, raw_row in enumerate(source_lines(text, keepends=True)):
         visible = source_line_text(raw_row.rstrip("\r\n"))
         cursor = 0
         while (rel := visible.find("\\", cursor)) >= 0:
@@ -799,25 +875,33 @@ def environment_bounds(text: str, line_number: int, environment: str) -> tuple[i
             if visible.startswith("\\", cursor):
                 cursor += 1
                 continue
-            if any(lo <= abs_pos < hi for lo, hi in ignored):
+            if _range_contains(ignored, abs_pos):
                 continue
             rest = visible[cursor:]
             if (m := begin_re.match(rest)) is not None:
                 cursor += m.end()
                 if start is not None:
-                    return None
+                    return tuple(ranges)
                 start = index
             elif (m := end_re.match(rest)) is not None:
                 cursor += m.end()
                 if start is not None:
-                    begin, start = start, None
-                    if begin <= anchor <= index:
-                        return begin, index
-                elif environment == "frame" and anchor <= index:
-                    return index, index
+                    ranges.append((start, index + 1))
+                    start = None
+                elif environment == "frame":
+                    ranges.append((index, index + 1))
         line_offset += len(raw_row)
-        if index >= anchor and start is None:
-            return None
+    return tuple(ranges)
+
+
+def environment_bounds(text: str, line_number: int, environment: str) -> tuple[int, int] | None:
+    anchor = line_number - 1
+    ranges = _environment_ranges(text, environment)
+    index = bisect.bisect_right(ranges, (anchor, math.inf)) - 1
+    while index > 0 and anchor < ranges[index - 1][1]:
+        index -= 1
+    if index >= 0 and anchor < ranges[index][1]:
+        return ranges[index][0], ranges[index][1] - 1
     return None
 
 
@@ -852,21 +936,19 @@ def collected_env_bounds(text: str, line_number: int) -> tuple[int, int] | None:
 
 
 def collected_env_closing_line(text: str, line: int, column: int = 1) -> int | None:
-    if bounds := (frame_bounds(text, line) or environment_bounds(text, line, "tabularx")):
-        return bounds[1] + 1
-    for env in DISPLAY_MATH_ENVS:
+    for env in ("frame", "tabularx", *DISPLAY_MATH_ENVS):
         bounds = environment_bounds(text, line, env)
-        if bounds is None or bounds[0] == bounds[1]:
+        if bounds is None:
             continue
         if line - 1 == bounds[0]:
-            rows = text.splitlines(keepends=True)
+            rows = source_lines(text, keepends=True)
             line_start = sum(len(r) for r in rows[: bounds[0]])
             visible = source_line_text(rows[bounds[0]].rstrip("\r\n"))
             ignored = _ignored_env_ranges(text)
             begin_col = None
             for m in re.finditer(rf"(?<!\\)(?:\\\\)*\\begin\s*\{{{re.escape(env)}\}}", visible):
                 slash = m.end() - len(m.group(0).lstrip("\\")) - 1
-                if not any(lo <= line_start + slash < hi for lo, hi in ignored):
+                if not _range_contains(ignored, line_start + slash):
                     begin_col = slash
                     break
             if begin_col is not None and visible[:begin_col].strip() and max(0, column - 1) < begin_col:
@@ -888,86 +970,75 @@ def caption_argument(text: str, at: int) -> tuple[int, int, int] | None:
     return (body + 1, end - 1, end) if end is not None else None
 
 
+def _caption_arguments(text: str, position: int | None = None) -> Iterator[tuple[int, int, int]]:
+    if "\\caption" not in text:
+        return
+    hidden = nonprinting_ranges(text)
+    h_idx, at, candidate = 0, 0, None
+    limit = len(text) - 1 if position is None else position
+    while at <= limit:
+        while h_idx < len(hidden) and hidden[h_idx][1] <= at:
+            h_idx += 1
+        if h_idx < len(hidden) and hidden[h_idx][0] <= at:
+            at = hidden[h_idx][1]
+            if position is not None and position < at:
+                return
+            continue
+        if text[at] == "%":
+            end = text.find("\n", at)
+            at = len(text) if end < 0 else end
+            if position is not None and position < at:
+                return
+        elif text[at] == "\\":
+            match = re.match(r"\\([A-Za-z]+|.)", text[at:], re.DOTALL)
+            if match is None:
+                return
+            name, at = match[1], at + match.end()
+            if (opaque := opaque_command_end(text, name, at)) is not None:
+                at = opaque[0]
+                if position is not None and position < at:
+                    return
+            elif name == "caption" and (arg := caption_argument(text, at)) is not None:
+                body_start, body_stop, arg_end = arg
+                if position is None:
+                    yield arg
+                    at = arg_end
+                elif body_start <= position < body_stop:
+                    # A cursor inside the body still needs its lexical visibility checked.
+                    candidate, at = arg, body_start
+                else:
+                    at = arg_end
+        else:
+            at += 1
+    if candidate is not None:
+        yield candidate
+
+
 def caption_bounds(text: str, line_number: int) -> tuple[int, int] | None:
     target = line_number - 1
-    if target < 0 or "\\caption" not in text:
+    if target < 0:
         return None
-    hidden = nonprinting_ranges(text)
-    h_idx, i = 0, 0
-    while i < len(text):
-        while h_idx < len(hidden) and hidden[h_idx][1] <= i:
-            h_idx += 1
-        if h_idx < len(hidden) and hidden[h_idx][0] <= i:
-            i = hidden[h_idx][1]
-            continue
-        if text[i] == "%":
-            end = text.find("\n", i)
-            i = len(text) if end < 0 else end
-        elif text[i] == "\\":
-            match = re.match(r"\\([A-Za-z]+|.)", text[i:], re.DOTALL)
-            if match is None:
-                return None
-            name, i = match[1], i + match.end()
-            if (opaque := opaque_command_end(text, name, i)) is not None:
-                i = opaque[0]
-            elif name == "caption" and (arg := caption_argument(text, i)) is not None:
-                body_start, _, arg_end = arg
-                first = text.count("\n", 0, body_start)
-                last = first + text.count("\n", body_start, arg_end)
-                if first <= target <= last:
-                    return first, last
-                if first > target:
-                    return None
-                i = arg_end
-        else:
-            i += 1
+    for body_start, _, arg_end in _caption_arguments(text):
+        first = text.count("\n", 0, body_start)
+        last = first + text.count("\n", body_start, arg_end)
+        if first <= target <= last:
+            return first, last
+        if first > target:
+            break
     return None
 
 
 def caption_closing_line(text: str, line: int, column: int) -> int | None:
-    if "\\caption" not in text:
-        return None
-    rows = text.splitlines(keepends=True)
+    rows = source_lines(text, keepends=True)
     if not (1 <= line <= len(rows) and column >= 1):
         return None
     row = rows[line - 1].rstrip("\r\n")
     if column - 1 >= len(row):
         return None
     pos = sum(len(r) for r in rows[: line - 1]) + (column - 1)
-    hidden = nonprinting_ranges(text)
-    h_idx, body_end, at = 0, None, 0
-    while at <= pos:
-        while h_idx < len(hidden) and hidden[h_idx][1] <= at:
-            h_idx += 1
-        if h_idx < len(hidden) and hidden[h_idx][0] <= at:
-            at = hidden[h_idx][1]
-            if pos < at:
-                return None
-            continue
-        if text[at] == "%":
-            end = text.find("\n", at)
-            at = len(text) if end < 0 else end
-            if pos < at:
-                return None
-        elif text[at] == "\\":
-            match = re.match(r"\\([A-Za-z]+|.)", text[at:], re.DOTALL)
-            if match is None:
-                return None
-            name, at = match[1], at + match.end()
-            if (opaque := opaque_command_end(text, name, at)) is not None:
-                at = opaque[0]
-                if pos < at:
-                    return None
-            elif name == "caption" and (arg := caption_argument(text, at)) is not None:
-                body_start, body_stop, arg_end = arg
-                if body_start <= pos < body_stop:
-                    at = body_start
-                    body_end = body_stop
-                else:
-                    at = arg_end
-        else:
-            at += 1
-    return text.count("\n", 0, body_end) + 1 if body_end is not None else None
+    for _, body_stop, _ in _caption_arguments(text, pos):
+        return text.count("\n", 0, body_stop) + 1
+    return None
 
 
 def fragile_frame(text: str, starts: list[int], lines: list[str], bounds: tuple[int, int]) -> bool:
@@ -994,171 +1065,113 @@ def fragile_frame(text: str, starts: list[int], lines: list[str], bounds: tuple[
     return any(
         (opt := source_line_text(line).strip()) == "fragile" or opt.startswith("fragile=")
         for part in options.split(",")
-        for line in part.splitlines()
+        for line in source_lines(part)
     )
 
 
-def host_owns_generated_sidecar(
-    text: str,
-    hidden: list[tuple[int, int]],
-    host_path: Path,
-    generated: Path,
-    main_dir: Path | None = None,
-) -> bool:
-    ext = generated.suffix.lstrip(".").lower()
-    generated_resolved = generated.resolve()
-    def skip_arg(cur: int) -> int | None:
-        tok = tex_space_end(text, cur)
-        if tok >= len(text):
-            return None
-        if (grp_end := tex_group_end(text, tok)) is not None:
-            return grp_end
-        if text[tok] == "\\":
-            tok_match = re.match(r"\\([A-Za-z@]+|.)", text[tok:], re.DOTALL)
-            return tok + (tok_match.end() if tok_match is not None else 1)
-        return tok + 1
+MATH_COMMANDS = {
+    "alpha", "beta", "gamma", "sum", "xi", "eta", "Omega", "theta", "lambda",
+    "Delta", "mu", "nu", "Phi", "kappa", "sigma",
+}
 
-    if_stack: list[bool | None] = []
-    h_idx, at = 0, 0
-    while at < len(text):
-        while h_idx < len(hidden) and hidden[h_idx][1] <= at:
-            h_idx += 1
-        if h_idx < len(hidden) and hidden[h_idx][0] <= at:
-            at = hidden[h_idx][1]
+
+def same_point_value(key: str, value, expected) -> bool:
+    if key == "page":
+        return type(value) is int and value == expected
+    if type(value) not in (int, float):
+        return False
+    try:
+        if not math.isfinite(value) or not math.isfinite(expected):
+            return False
+        return struct.pack("!f", value) == struct.pack("!f", expected)
+    except (OverflowError, struct.error):
+        return False
+
+
+@functools.lru_cache(maxsize=32)
+def _math_ranges(text: str):
+    hidden = _nonprinting_index(text)
+    inline, opening, expansion = [], None, False
+    closers = {"$": "$", "$$": "$$", "\\(": "\\)", "\\[": "\\]"}
+    for token in re.finditer(r"\\(?:[A-Za-z@]+|.)|\$\$?", text, re.DOTALL):
+        if _range_contains(hidden, token.start()):
             continue
-        if text[at] == "%":
-            end = text.find("\n", at)
-            at = len(text) if end < 0 else end
-        elif text[at] == "=" and all(branch is True for branch in if_stack):
-            grp_end = tex_group_end(text, tex_space_end(text, at + 1))
-            at = grp_end if grp_end is not None else at + 1
-        elif text[at] == "\\":
-            match = re.match(r"\\([A-Za-z@]+|.)", text[at:], re.DOTALL)
-            if match is None:
-                at += 1
-                continue
-            cmd, next_at = match[1], at + match.end()
-            if not (cmd.isalpha() or "@" in cmd):
-                at = next_at
-                continue
-            if (opaque := opaque_command_end(text, cmd, next_at)) is not None:
-                at = opaque[0]
-                continue
-            if cmd in {"gobble", "@gobble"} and (arg_end := skip_arg(next_at)) is not None:
-                at = arg_end
-                continue
-            if cmd in {"string", "noexpand", "meaning"}:
-                tok = tex_space_end(text, next_at)
-                if tok < len(text) and text[tok] == "\\":
-                    tok_match = re.match(r"\\([A-Za-z@]+|.)", text[tok:], re.DOTALL)
-                    at = tok + (tok_match.end() if tok_match is not None else 1)
-                    continue
-            if cmd in {
-                "detokenize",
-                "unexpanded",
-                "typeout",
-                "message",
-                "errmessage",
-                "wlog",
-                "pdfescapestring",
-                "phantom",
-                "hphantom",
-                "vphantom",
-                "sbox",
-                "savebox",
-            } and (grp_end := tex_group_end(text, tex_space_end(text, next_at))) is not None:
-                at = grp_end
-                continue
-            skip_args = (
-                2
-                if cmd
-                in {
-                    "@firstoftwo",
-                    "@secondoftwo",
-                    "@gobbletwo",
-                    "IfBooleanT",
-                    "IfBooleanF",
-                    "IfValueT",
-                    "IfValueF",
-                    "IfNoValueT",
-                    "IfNoValueF",
-                }
-                else (3 if cmd in {"IfBooleanTF", "IfNoValueTF", "IfValueTF", "@ifnextchar"} else 0)
-            )
-            if skip_args > 0:
-                cur = next_at
-                for _ in range(skip_args):
-                    if (arg_end := skip_arg(cur)) is not None:
-                        cur = arg_end
-                    else:
-                        break
-                if cur > next_at:
-                    at = cur
-                    continue
-            if cmd.startswith(("toks", "every")):
-                cur = next_at
-                while cur < len(text) and text[cur].isdigit():
-                    cur += 1
-                cur = tex_space_end(text, cur)
-                if cur < len(text) and text[cur] == "=":
-                    cur = tex_space_end(text, cur + 1)
-                if (grp_end := tex_group_end(text, cur)) is not None:
-                    at = grp_end
-                    continue
-            if cmd == "iffalse":
-                if_stack.append(False)
-                at = next_at
-                continue
-            if cmd == "iftrue":
-                if_stack.append(True)
-                at = next_at
-                continue
-            if cmd.startswith("if") and cmd != "iff":
-                if_stack.append(None)
-                at = next_at
-                continue
-            if cmd == "else":
-                if if_stack:
-                    if_stack[-1] = None if if_stack[-1] is None else (not if_stack[-1])
-                at = next_at
-                continue
-            if cmd == "fi":
-                if if_stack:
-                    if_stack.pop()
-                at = next_at
-                continue
-            if all(branch is True for branch in if_stack):
-                if cmd == "endinput":
-                    break
-                arg_start = tex_space_end(text, next_at)
-                arg_end = tex_group_end(text, arg_start)
-                if cmd in {"begin", "end"} and arg_end is not None:
-                    at = arg_end
-                    continue
-                arg = text[arg_start + 1 : arg_end - 1].strip() if arg_end is not None else None
-                if cmd in {"input", "include", "InputIfFileExists"} and arg:
-                    arg_path = Path(arg)
-                    bases = [host_path.parent] + ([main_dir] if main_dir is not None else [])
-                    for base in bases:
-                        cand = arg_path if arg_path.is_absolute() else (base / arg_path)
-                        if cand.resolve() == generated_resolved:
-                            return True
-                        if not cand.suffix and cand.with_suffix(".tex").resolve() == generated_resolved:
-                            return True
-                if ext == "bbl" and cmd in {
-                    "bibliography",
-                    "printbibliography",
-                    "nobibliography",
-                    "putbib",
-                    "bibbysection",
-                }:
-                    return True
-                if ext == "toc" and cmd == "tableofcontents":
-                    return True
-            at = next_at
-        else:
-            at += 1
-    return False
+        if opening is None:
+            if token[0] in closers:
+                opening, expansion = token, False
+        elif token[0] == closers[opening[0]]:
+            inline.append((opening.end(), token.start(), expansion))
+            opening = None
+        elif token[0].startswith("\\") and (token[0][1:].isalpha() or "@" in token[0]):
+            expansion = True
+    display = _merged_ranges(
+        (lo + 1, hi + 1) for env in DISPLAY_MATH_ENVS for lo, hi in _environment_ranges(text, env)
+    )
+    return tuple(inline), display
+
+
+def math_expansion_at(text: str, position: int) -> bool:
+    """Recognize conventional math context, not the producer's symbol decoding."""
+    inline, display = _math_ranges(text)
+    index = bisect.bisect_right(inline, (position, math.inf)) - 1
+    if index >= 0 and position < inline[index][1]:
+        return inline[index][2]
+    return _range_contains(display, text.count("\n", 0, position) + 1)
+
+
+@functools.lru_cache(maxsize=32)
+def lexical_words(text: str) -> tuple[dict[str, list[tuple[int, int]]], list[tuple[int, int]], set[str], list[tuple[int, int]]]:
+    """Index literal spellings; unknown macro arguments remain unverified."""
+    hidden = nonprinting_ranges(text)
+    hidden_index = _nonprinting_index(text)
+    uncertain = []
+    opaque = [
+        (lo, hi) for lo, hi in hidden
+        if re.match(r"\\(?:note|(?:re)?newcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|pgfmath(?:trunc)?setmacro|[gex]?def|(?:re)?newenvironment|provideenvironment|(?:New|Renew|Provide|Declare)(?:Expandable)?Document(?:Command|Environment))\b", text[lo:])
+    ]
+    defined = set()
+    for lo, _ in hidden:
+        definition = re.match(r"\\(?:(?:re)?newcommand|providecommand|DeclareRobustCommand|[gex]?def|let|futurelet|(?:New|Renew|Provide|Declare)(?:Expandable)?DocumentCommand)\*?", text[lo:])
+        if definition:
+            at = tex_space_end(text, lo + definition.end())
+            at = tex_space_end(text, at + 1) if at < len(text) and text[at] == "{" else at
+            name = re.match(r"\\([A-Za-z@]+|.)", text[at:], re.DOTALL)
+            if name:
+                defined.add(name[1])
+    # Conventional syntax only; local redefinitions and unknown calls stay opaque.
+    prose = {
+        "begin", "end", "caption", "title", "subtitle", "author", "date", "institute",
+        "frametitle", "framesubtitle", "section", "subsection", "subsubsection",
+        "textbf", "textit", "texttt", "textrm", "textsf", "textnormal", "emph",
+        "underline", "footnote", "footnotetext", "href", "textcolor", "item",
+        "centering", "hline", "par", "relax", "noindent", "maketitle", "titlepage",
+    } | MATH_COMMANDS | NONPRINTING_KEYS
+    for command in re.finditer(r"\\([A-Za-z@]+|.)\*?", text, re.DOTALL):
+        if command[1][0] not in string.ascii_letters and command[1][0] != "@" and command[1] not in defined:
+            continue
+        if _range_contains(hidden_index, command.start()):
+            continue
+        if (command[1] in prose or TEX_ACCENT_RE.match(text, command.start())) and command[1] not in defined:
+            continue
+        uncertain.append((command.start(), command.end()))
+        at = tex_space_end(text, command.end())
+        while (end := tex_group_end(text, at, "[") or tex_group_end(text, at)) is not None:
+            uncertain.append((at, end))
+            at = tex_space_end(text, end)
+    words = defaultdict(list)
+    for token in re.finditer(rf"(?P<word>(?:[^\W_]|{TEX_ACCENT_RE.pattern})+)|\\(?:[A-Za-z@]+|.)\*?", text, re.DOTALL):
+        if token["word"] is None:
+            continue
+        if _range_contains(hidden_index, token.start()):
+            continue
+        normalized = normalized_words(strip_tex_accents(token[0]))
+        if len(normalized) == 1:
+            words[normalized[0]].append(token.span())
+    opaque_words = {
+        word for lo, hi in opaque + uncertain for word in normalized_words(strip_tex_accents(text[lo:hi]))
+    }
+    known_nonprinting = [span for span in hidden if span not in opaque]
+    return dict(words), uncertain + opaque, opaque_words, known_nonprinting
 
 
 def inverse(
@@ -1170,8 +1183,9 @@ def inverse(
     points = []
     for page, words in word_points.items():
         for word, box, page_height in words:
-            x = (box[0] + box[2]) / 2
-            y = (box[1] + box[3]) / 2
+            # Submit exact f32 values: decimal midpoints can round differently in Rust's JSON parser.
+            x = struct.unpack("!f", struct.pack("!f", (box[0] + box[2]) / 2))[0]
+            y = struct.unpack("!f", struct.pack("!f", (box[1] + box[3]) / 2))[0]
             points.append({"page": page, "x": x, "y": y, "word": word, "box": box, "page_height": page_height})
     if not points:
         return
@@ -1192,6 +1206,8 @@ def inverse(
             rows.append(json.loads(line))
         except json.JSONDecodeError as error:
             raise RuntimeError(f"invalid batch JSON: {error}: {line[:200]}") from error
+        if not isinstance(rows[-1], dict) or type(rows[-1].get("ok")) is not bool:
+            raise RuntimeError("batch response must be an object with a boolean ok field")
     if len(rows) != len(points):
         raise RuntimeError(f"batch returned {len(rows)} results for {len(points)} points")
     source_map = read_source_map(pdf)
@@ -1200,24 +1216,24 @@ def inverse(
 
     def source_info(path: Path) -> tuple[str, list[str], list[tuple[int, int]], list[int], list[tuple[int, int]]]:
         if path not in sources:
-            text = path.read_text()
+            with path.open(newline="") as stream:
+                text = stream.read()
             starts, at = [], 0
-            for row in text.splitlines(keepends=True):
+            for row in source_lines(text, keepends=True):
                 starts.append(at)
                 at += len(row)
-            graphics_starts: set[int] = set()
             sources[path] = (
                 text,
-                text.splitlines(),
-                nonprinting_ranges(text, graphics_starts),
+                source_lines(text),
+                nonprinting_ranges(text),
                 starts,
                 metadata_spans(text),
-                graphics_starts,
             )
         return sources[path]
 
+    @functools.lru_cache(maxsize=32)
     def candidate_anchor(page: int, raw: tuple[int, str]):
-        raw_file = input_path(raw[1], pdf, source)
+        raw_file = input_path(raw[1], source_map)
         expected_file, expected_anchor = raw_file, raw[0]
         bounds = None
         remapped = False
@@ -1238,31 +1254,7 @@ def inverse(
                 else source_map["origins"].get(page)
             )
             generated_on_page = raw_tag is not None
-            origin_file = source_map["inputs"].get(origin[0]) if origin else None
-            if (
-                generated_on_page
-                and not is_pdf_tex
-                and raw_file.suffix != ".vrb"
-                and (origin_file is None or is_compiler_sidecar_or_graphics(origin_file))
-            ):
-                origin = None
-                for adj_orig in source_map["adjacent_origins"].get(page, []):
-                    adj_file = source_map["inputs"].get(adj_orig[0])
-                    if (
-                        adj_file
-                        and adj_file.is_file()
-                        and not is_compiler_sidecar_or_graphics(adj_file)
-                    ):
-                        adj_text, adj_lines, adj_hidden, *_ = source_info(adj_file)
-                        if 1 <= adj_orig[1] <= len(adj_lines) and host_owns_generated_sidecar(
-                            adj_text,
-                            adj_hidden,
-                            adj_file,
-                            raw_file,
-                            source_map["inputs"][1].parent if 1 in source_map["inputs"] else None,
-                        ):
-                            origin = adj_orig
-                            break
+            # Adjacent source mentions are not compiler execution ownership.
             if origin and generated_on_page and origin[0] in source_map["inputs"]:
                 original = source_map["inputs"][origin[0]]
                 if not is_compiler_sidecar_or_graphics(original):
@@ -1280,55 +1272,38 @@ def inverse(
                         expected_file, expected_anchor = original, origin[1]
                         bounds, remapped = original_bounds, True
         else:
-            origin = source_map["origins"].get(page)
-            vrb_file = pdf.with_suffix(".vrb").resolve()
-            vrb_on_page = any(
-                source_map["inputs"].get(tag) == vrb_file
-                for tag in source_map["page_inputs"].get(page, set())
+            raw_text = source_info(expected_file)[0]
+            bounds = (
+                caption_bounds(raw_text, raw[0])
+                or collected_env_bounds(raw_text, raw[0])
+                or environment_bounds(raw_text, raw[0], "tikzpicture")
             )
-            if origin and vrb_on_page and source_map["inputs"].get(origin[0]) == raw_file:
-                original_text, original_lines, _, original_starts, *_ = source_info(raw_file)
-                original_bounds = frame_bounds(original_text, origin[1])
-                if (
-                    original_bounds
-                    and origin[1] == original_bounds[1] + 1
-                    and fragile_frame(original_text, original_starts, original_lines, original_bounds)
-                    and not (original_bounds[0] + 1 <= raw[0] <= original_bounds[1] + 1)
-                ):
-                    expected_anchor, bounds, remapped, generated = origin[1], original_bounds, True, True
-            if not remapped:
-                page_files_for_line = {
-                    path
-                    for tag, line in source_map["page_lines"].get(page, set())
-                    for path in [source_map["inputs"].get(tag)]
-                    if line == raw[0]
-                    and path is not None
-                    and path.is_file()
-                    and not is_compiler_sidecar_or_graphics(path)
-                }
-                if expected_file not in page_files_for_line and len(page_files_for_line) == 1:
-                    expected_file = next(iter(page_files_for_line))
-                raw_text = source_info(expected_file)[0]
-                bounds = (
-                    caption_bounds(raw_text, raw[0])
-                    or collected_env_bounds(raw_text, raw[0])
-                    or environment_bounds(raw_text, raw[0], "tikzpicture")
-                )
         return raw, expected_file, expected_anchor, bounds, remapped, generated
 
-    page_collected_envs = {}
+    @functools.lru_cache(maxsize=32)
+    def collected_boxes(page: int) -> tuple:
+        boxes = []
+        queried = set()
+        for tag, line in sorted(source_map["page_lines"].get(page, set())):
+            path = source_map["inputs"].get(tag)
+            if path is None:
+                raise RuntimeError(f"SyncTeX page {page} references unknown input tag {tag}")
+            if is_compiler_sidecar_or_graphics(path) or (path, line) in queried:
+                continue
+            text, lines, *_ = source_info(path)
+            if not 1 <= line <= len(lines):
+                continue
+            if "\\end" not in source_line_text(lines[line - 1]):
+                continue
+            collected = collected_env_bounds(text, line)
+            if collected is None or line != collected[1] + 1:
+                continue
+            queried.add((path, line))
+            for record in raw_forward_records(pdf, path, line):
+                if record["Page"] == page:
+                    boxes.append((line, path, record["h"], record["v"], record["W"], record["H"]))
+        return tuple(boxes)
 
-    def collected_env_candidates(page: int) -> list:
-        if page not in page_collected_envs:
-            items = []
-            for tag, line in sorted(source_map["page_lines"].get(page, set())):
-                path = source_map["inputs"].get(tag)
-                if path and path.is_file():
-                    bounds = environment_bounds(source_info(path)[0], line, "tabularx")
-                    if bounds is not None:
-                        items.append(((line, str(path)), path, line, bounds, False, False))
-            page_collected_envs[page] = items
-        return page_collected_envs[page]
 
     def safe_raw_inverse(point: dict) -> tuple[list[tuple[int, str]] | None, Exception | None]:
         try:
@@ -1352,6 +1327,21 @@ def inverse(
             "warning": batch.get("warning"),
             "ok": False,
         }
+        if any(key in batch and not same_point_value(key, batch[key], point[key]) for key in ("page", "x", "y")):
+            entry["error"] = "batch response point identity differs from the submitted point"
+            yield entry
+            continue
+        if "input" in batch:
+            try:
+                echoed = json.loads(batch["input"])
+            except (TypeError, ValueError):
+                echoed = None
+            if not isinstance(echoed, dict) or set(echoed) != {"page", "x", "y"} or any(
+                not same_point_value(key, echoed[key], point[key]) for key in ("page", "x", "y")
+            ):
+                entry["error"] = "batch error input differs from the submitted point"
+                yield entry
+                continue
         # Warnings/coarse results do not exempt file, line or remap identity.
         if raw_error is not None:
             entry["error"] = f"raw SyncTeX edit failed: {raw_error}"
@@ -1365,9 +1355,19 @@ def inverse(
                 entry["error"] = "raw SyncTeX edit returned no match"
             yield entry
             continue
-        candidates = [candidate_anchor(page, item) for item in raw_records] + collected_env_candidates(page)
+        candidates = [candidate_anchor(page, item) for item in raw_records]
+        point_anchors = sorted({
+            (line, str(path)) for line, path, h, v, width, height in collected_boxes(page)
+            if h <= point["x"] <= h + width and v - height <= point["y"] <= v
+        })
+        entry["point_anchors"] = [{"line": line, "file": path} for line, path in point_anchors]
+        candidates.extend(candidate_anchor(page, item) for item in point_anchors if item not in raw_records)
         raw, expected_file, expected_anchor, bounds, remapped, generated = candidates[0]
         entry["raw_anchor"] = {"line": raw[0], "file": raw[1]}
+        entry["raw_anchors"] = [{"line": item[0], "file": item[1]} for item in raw_records]
+        entry["expected_anchors"] = [
+            {"file": str(cand[1]), "line": cand[2], "remapped": cand[4]} for cand in candidates
+        ]
         if not batch.get("ok"):
             error = batch.get("error", "batch returned no result")
             if "no text near point" in error or "hit-test failed" in error:
@@ -1379,23 +1379,6 @@ def inverse(
             yield entry
             continue
         location = batch.get("location")
-        if isinstance(location, dict) and len(candidates) > 1:
-            resolved_file = Path(location["file"]).resolve()
-            resolved_line = int(location["line"])
-            matching = [
-                cand
-                for cand in candidates
-                if cand[1] == resolved_file
-                and (
-                    (cand[3] and cand[3][0] + 1 <= resolved_line <= cand[3][1] + 1)
-                    or abs(resolved_line - cand[2]) <= 4
-                )
-            ]
-            if matching:
-                raw, expected_file, expected_anchor, bounds, remapped, generated = min(
-                    matching, key=lambda cand: abs(resolved_line - cand[2])
-                )
-                entry["raw_anchor"] = {"line": raw[0], "file": raw[1]}
         entry["expected_anchor"] = {"file": str(expected_file), "line": expected_anchor, "remapped": remapped}
         if not (generated and not remapped) and not 1 <= expected_anchor <= len(source_info(expected_file)[1]):
             entry["error"] = "page-proven source anchor is outside its source file"
@@ -1405,25 +1388,29 @@ def inverse(
             entry["error"] = "successful batch has no source location"
             yield entry
             continue
+        if not isinstance(location.get("file"), str) or type(location.get("line")) is not int or type(location.get("precise")) is not bool:
+            entry["error"] = "batch source location has invalid file, line or precision fields"
+            yield entry
+            continue
         resolved_file = Path(location["file"]).resolve()
-        resolved_line = int(location["line"])
+        resolved_line = location["line"]
         precise = location["precise"]
         warning = batch.get("warning") or ""
         if best_guess:
             for baseline in (
-                "best-guess navigation: compiled source history unavailable; assuming saved source is unchanged since compilation",
+                "best-guess navigation: assuming saved source is unchanged since compilation",
                 "best-guess navigation: no literal source position was qualified; using the compiler line anchor",
             ):
                 warning = warning.replace(baseline, "")
             warning = warning.strip("; ")
         if precise is False:
-            raw_path = input_path(raw[1], pdf, source)
+            raw_path = input_path(raw[1], source_map)
             unremapped_pdf_tex_ok = (
                 raw_path.suffix.lower() in GENERATED_GRAPHICS_EXTENSIONS
                 and resolved_file == raw_path
                 and resolved_line == raw[0]
             )
-            if (resolved_file != expected_file or resolved_line != expected_anchor) and not unremapped_pdf_tex_ok:
+            if not any(resolved_file == cand[1] and resolved_line == cand[2] for cand in candidates) and not unremapped_pdf_tex_ok:
                 entry["error"] = "coarse inverse result changed the source file or page-proven anchor"
                 yield entry
                 continue
@@ -1439,14 +1426,16 @@ def inverse(
             entry["error"] = "inverse result selected a file absent from the source map"
             yield entry
             continue
-        _, resolved_lines, hidden, starts, meta_spans, graphics_starts = source_info(resolved_file)
+        resolved_text, resolved_lines, hidden, starts, meta_spans = source_info(resolved_file)
         if not 1 <= resolved_line <= len(resolved_lines):
             entry["error"] = "SyncTeX source line is invalid"
             yield entry
             continue
         resolved_row = resolved_lines[resolved_line - 1]
-        byte = int(location["byte_column"])
         try:
+            if any(type(location.get(key)) is not int for key in ("byte_column", "column", "column_char")):
+                raise ValueError("source columns must be integers")
+            byte = location["byte_column"]
             if byte < 0 or byte > len(resolved_row.encode("utf-8")):
                 raise ValueError("source byte column is outside its line")
             prefix = resolved_row.encode("utf-8")[:byte].decode("utf-8")
@@ -1457,130 +1446,96 @@ def inverse(
             yield entry
             continue
         absolute_column = starts[resolved_line - 1] + len(prefix)
-        if any(start <= absolute_column < end for start, end in hidden) and absolute_column not in graphics_starts:
+        literals, uncertain, opaque_words, known_nonprinting = lexical_words(resolved_text)
+        if any(start <= absolute_column < end for start, end in known_nonprinting):
             entry["error"] = "precise inverse result selected a known nonprinting argument or definition"
             yield entry
             continue
         pdf_word = batch.get("pdf_word")
         entry["pdfium_word"] = pdf_word
-        selected_word = pdf_word or word
         expected_lines = source_info(expected_file)[1]
-        allows_meta = (
-            bounds is not None
-            or point["y"] <= point["page_height"] * 0.12
-            or point["y"] >= point["page_height"] * 0.88
-            or any(
-                "\\maketitle" in row or "\\titlepage" in row
-                for row in expected_lines[max(0, expected_anchor - 5):expected_anchor + 4]
-            )
-            or any(
-                start <= starts[expected_anchor - 1] < end
-                for start, end in meta_spans
-                if resolved_file == expected_file and 1 <= expected_anchor <= len(starts)
-            )
-        )
+        # Metadata must have its own compiler context, not just a frame or margin.
         metadata = (
-            allows_meta
-            and any(start <= absolute_column < end for start, end in meta_spans)
-            and line_has_word(resolved_row, selected_word)
+            resolved_file == expected_file == source_map["inputs"][1]
+            and any(lo <= absolute_column < hi for lo, hi in meta_spans)
+            and (
+                any(lo <= starts[expected_anchor - 1] < hi for lo, hi in meta_spans)
+                or any(
+                    re.search(r"\\(?:maketitle|titlepage)\b", source_line_text(row))
+                    for row in expected_lines[max(0, expected_anchor - 5):expected_anchor + 4]
+                )
+            )
         )
-        if resolved_file != expected_file and not metadata:
+        if resolved_file not in {cand[1] for cand in candidates}:
             entry["error"] = "inverse result changed the page-proven source file"
             yield entry
             continue
-        if bounds and not metadata and not bounds[0] + 1 <= resolved_line <= bounds[1] + 1:
-            entry["error"] = "inverse result escaped the page-proven original frame"
-            yield entry
-            continue
-        if not bounds and not metadata and abs(resolved_line - expected_anchor) > 4:
-            entry["error"] = "inverse result escaped the source context radius"
+        in_scope = any(
+            resolved_file == cand[1] and (
+                cand[3][0] + 1 <= resolved_line <= cand[3][1] + 1
+                if cand[3] else abs(resolved_line - cand[2]) <= 4
+            )
+            for cand in candidates
+        )
+        if not metadata and not in_scope:
+            entry["error"] = "inverse result escaped the page-proven source scope"
             yield entry
             continue
         entry["mapping_ok"] = True
-        math_tok = (
-            re.match(
-                r"([A-Za-z0-9]+)_\{?([A-Za-z0-9]+)\}?",
-                resolved_row[len(prefix) :],
-            )
-            if not prefix.endswith("\\")
-            else None
-        )
-        math_words = (
-            normalized_words("".join(g for g in math_tok.groups() if g))
-            if math_tok
-            else []
-        )
-        if warning:
-            entry.update(abstained=True, reason="resolver_warning")
-        elif absolute_column in graphics_starts:
-            entry.update(ok=True, match="graphics_argument")
-        elif not pdf_word:
-            entry.update(abstained=True, reason="pdfium_selected_no_word")
-        elif normalized_words(pdf_word) != normalized_words(word):
-            entry.update(abstained=True, reason="pdfium_word_mismatch")
-        elif line_has_word(resolved_row, pdf_word):
-            literal = []
-            for char in strip_tex_accents(resolved_row[len(prefix):]).replace("$", ""):
-                if char.isalnum() or literal and unicodedata.combining(char):
-                    literal.append(char)
-                else:
-                    break
-            enclosing = []
-            for char in reversed(strip_tex_accents(prefix).replace("$", "")):
-                if char.isalnum() or unicodedata.combining(char):
-                    enclosing.append(char)
-                else:
-                    break
-            enclosing = list(reversed(enclosing)) + literal
-            alpha_word = len(pdf_word) >= 2 and pdf_word.isascii() and pdf_word.isalpha()
-            if (
-                normalized_words("".join(literal)) != normalized_words(pdf_word)
-                and (alpha_word or normalized_words("".join(enclosing)) != normalized_words(pdf_word))
-            ):
-                if math_words and math_words == normalized_words(pdf_word):
-                    entry.update(abstained=True, reason="precision_not_literal_math_or_expansion")
-                else:
-                    entry["error"] = "precise inverse column does not select the PDF word"
-            else:
-                entry.update(ok=True, match="document_metadata" if metadata else "literal_frame_word" if bounds else "literal_source")
+        scopes = {(cand[1], cand[3] or (cand[2], cand[2])) for cand in candidates}
+        if len(scopes) > 1:
+            entry.update(abstained=True, reason="ambiguous_compiler_ownership")
         else:
-            expected_lines = source_info(expected_file)[1]
-            eligible = (
-                expected_lines[bounds[0]:bounds[1] + 1]
-                if bounds
-                else expected_lines[max(0, expected_anchor - 5):expected_anchor + 4]
-            )
-            selected_token = re.match(
-                r"(?:\\[A-Za-z@]+\*?|[A-Za-z0-9]+)(?:\s*[_^]\s*(?:\{[^{}]*\}|\\[A-Za-z@]+\*?|[A-Za-z0-9]))*",
-                resolved_row[len(prefix):],
-            )
-            anchor_row = (
-                source_line_text(expected_lines[expected_anchor - 1])
-                if 1 <= expected_anchor <= len(expected_lines)
-                else ""
-            )
-            if any(line_has_word(row, pdf_word) for row in eligible) and not (
-                math_words and math_words == normalized_words(pdf_word)
+            needle = normalized_words(word)
+            occurrences = literals.get(needle[0], []) if len(needle) == 1 else []
+            opaque_word = len(needle) == 1 and needle[0] in opaque_words
+            scope_first, scope_last = bounds or (max(0, expected_anchor - 5), min(len(resolved_lines) - 1, expected_anchor + 3))
+            scope_lo = starts[scope_first]
+            scope_hi = starts[scope_last] + len(resolved_lines[scope_last])
+            unknown_scope = any(scope_lo <= lo < scope_hi for lo, _ in uncertain)
+            if unknown_scope or any(lo <= absolute_column < hi for lo, hi in uncertain) or opaque_word:
+                entry.update(abstained=True, reason="unverified_execution_ownership")
+            elif len(occurrences) > 1:
+                entry.update(abstained=True, reason="ambiguous_repeated_occurrence")
+            elif len(occurrences) == 1 and occurrences[0][0] == absolute_column:
+                if warning:
+                    entry.update(abstained=True, reason="resolver_warning")
+                elif not pdf_word:
+                    entry.update(abstained=True, reason="pdfium_selected_no_word")
+                elif normalized_words(pdf_word) != needle:
+                    entry.update(abstained=True, reason="pdfium_word_mismatch")
+                else:
+                    entry.update(
+                        ok=True, precision_checked=True,
+                        match="document_metadata" if metadata else "literal_frame_word" if bounds else "literal_source",
+                        ownership="unique_lexical_literal_not_execution_trace",
+                    )
+            elif not occurrences and (
+                math_expansion_at(resolved_text, absolute_column)
+                or (
+                    (command := re.match(r"\\([A-Za-z@]+)", resolved_row[len(prefix):]))
+                    and command[1] in MATH_COMMANDS | REFERENCE_COMMANDS
+                )
             ):
-                entry["error"] = "inverse refinement missed a literal printed word in its original source scope"
-            elif (
-                not bounds
-                and resolved_line != expected_anchor
-                and selected_token
-                and not re.match(r"\s*\\(?:end\b|caption\b)", anchor_row)
-                and selected_token.group(0) in anchor_row
-            ):
-                entry["error"] = "inverse refinement jumped away from raw anchor line containing the same math token"
-            else:
+                # Actual math/reference expansion is evidence; a wrong plain word is not.
                 entry.update(abstained=True, reason="precision_not_literal_math_or_expansion")
+            else:
+                entry["error"] = "precise inverse column does not select the PDF word"
         yield entry
+
+
+def compiler_word_box(page, rect) -> tuple[float, float, float, float]:
+    """PyMuPDF words are unrotated crop coordinates, not page.rect coordinates."""
+    # PyMuPDF's transformation_matrix drops crop translation on rotated pages.
+    crop, media = page.cropbox, page.mediabox
+    return rect.x0 + crop.x0, rect.y0 + crop.y0 - media.y0, rect.x1 + crop.x0, rect.y1 + crop.y0 - media.y0
 
 
 def painted_word_points(
     pdf: Path, page_count: int, page_limit: int | None, word_limit: int,
     rng: random.Random, specific_pages: list[int] | None,
 ) -> tuple[dict[int, list[WordPoint]], dict]:
-    """Return every on-page word made from visible painted text characters."""
+    """Return on-page words with painted glyphs (not an occlusion proof)."""
     if page_limit == 0 and specific_pages is None:
         return {}, {
             "eligible_pages": None,
@@ -1607,27 +1562,39 @@ def painted_word_points(
         raw_extracted = 0
         for page_number, page in enumerate(document, 1):
             words = []
-            painted = [
-                (chr(codepoint), pymupdf.Rect(bounds))
-                for span in page.get_texttrace()
-                if span["type"] in (0, 1) and span["opacity"] > 0
-                for codepoint, _, _, bounds in span["chars"]
-                if 0 < codepoint <= 0x10FFFF
-            ]
+            cells = defaultdict(list)
+            seen_glyphs = set()
+            order = 0
+            for span in page.get_texttrace():
+                if span["type"] not in (0, 1) or span["opacity"] <= 0:
+                    continue
+                for codepoint, _, _, bounds in span["chars"]:
+                    key = (codepoint, *bounds)
+                    if not 0 < codepoint <= 0x10FFFF or key in seen_glyphs:
+                        continue
+                    seen_glyphs.add(key)
+                    x, y = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
+                    cells[(math.floor(x / 32), math.floor(y / 32))].append((order, chr(codepoint), x, y))
+                    order += 1
             text_words = page.get_text("words")
             raw_extracted += len(text_words)
             for x0, y0, x1, y1, word, *_ in text_words:
                 rect = pymupdf.Rect(x0, y0, x1, y1)
                 if rect.width <= 0 or rect.height <= 0:
                     continue
-                if not page.rect.contains(rect.tl + (rect.br - rect.tl) / 2):
+                rotated = rect * page.rotation_matrix
+                if not page.rect.contains(rotated.tl + (rotated.br - rotated.tl) / 2):
                     continue
-                painted_word = "".join(
-                    char for char, glyph in painted
-                    if rect.contains(glyph.tl + (glyph.br - glyph.tl) / 2)
-                )
+                glyphs = [
+                    glyph
+                    for cx in range(math.floor(x0 / 32), math.floor(x1 / 32) + 1)
+                    for cy in range(math.floor(y0 / 32), math.floor(y1 / 32) + 1)
+                    for glyph in cells.get((cx, cy), ())
+                    if x0 <= glyph[2] <= x1 and y0 <= glyph[3] <= y1
+                ]
+                painted_word = "".join(glyph[1] for glyph in sorted(glyphs))
                 if normalized_words(word) and normalized_words(word) == normalized_words(painted_word):
-                    words.append((word, tuple(rect), page.rect.height))
+                    words.append((word, compiler_word_box(page, rect), page.mediabox.height))
             if words:
                 eligible_by_page[page_number] = words
     candidates = sorted(eligible_by_page)
@@ -1657,7 +1624,7 @@ def painted_word_points(
 
 def pdf_page_count(pdf: Path) -> int:
     result = subprocess.run(
-        ["pdfinfo", str(pdf)], capture_output=True, text=True, errors="replace", check=False
+        ["pdfinfo", str(pdf)], capture_output=True, text=True, errors="replace", timeout=30, check=False
     )
     if result.returncode:
         raise SystemExit(f"pdfinfo: {result.stderr.strip()[:200]}")
@@ -1673,8 +1640,23 @@ def pdfterm_bin() -> Path:
     raise SystemExit(f"missing {PDFTERM_BINARY}; build pdfterm or pass --binary PATH")
 
 
+def validate_sources(pdf: Path, companion: Path, source_map: dict, source: Path, allow_stale: bool) -> None:
+    if source not in source_map["inputs"].values():
+        raise RuntimeError("--source is absent from the compiler inputs")
+    inputs = {
+        path for path in source_map["inputs"].values()
+        if not is_compiler_sidecar_or_graphics(path)
+    } | {source}
+    built = min(pdf.stat().st_mtime_ns, companion.stat().st_mtime_ns)
+    for path in inputs:
+        if not path.is_file():
+            raise RuntimeError(f"missing compiler source: {path}")
+        if not allow_stale and path.stat().st_mtime_ns > built:
+            raise RuntimeError(f"PDF/SyncTeX pair predates compiler source {path}; rebuild or pass --allow-stale")
+
+
 def main() -> None:
-    global PDFTERM_BINARY
+    global PDFTERM_BINARY, BUILD_DIRECTORY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path)
     parser.add_argument("--binary", type=Path, default=PDFTERM_BINARY, help="pdfterm executable to probe")
@@ -1683,6 +1665,8 @@ def main() -> None:
         type=Path,
         help="source file to sample (default: main input recorded in SyncTeX)",
     )
+    parser.add_argument("--build-dir", type=Path, help="actual compiler working directory (otherwise recorded .fls PWD)")
+    parser.add_argument("--require-precision-word", action="append", default=[], help="known printed positive control; require a successful literal precision check (repeatable)")
     parser.add_argument("--page", type=int, action="append", help="probe this one-based page; repeatable")
     parser.add_argument("--lines", type=int, default=100, help="source lines to sample")
     parser.add_argument("--pages", type=int, help="seed-selected inverse page cap; default probes all pages")
@@ -1692,6 +1676,7 @@ def main() -> None:
     parser.add_argument("--best-guess", action="store_true", help="pass --synctex-best-guess to pdfterm")
     args = parser.parse_args()
     PDFTERM_BINARY = args.binary.resolve()
+    BUILD_DIRECTORY = args.build_dir.resolve() if args.build_dir else None
     if (
         min(args.lines, args.words) < 0
         or (args.pages is not None and args.pages < 0)
@@ -1710,18 +1695,14 @@ def main() -> None:
     )
     if not pdf.is_file() or companion is None:
         raise SystemExit("missing PDF or matching SyncTeX sidecar")
-    source_file = (args.source or read_source_map(pdf)["inputs"][1]).resolve()
-    if not source_file.is_file():
-        raise SystemExit(f"missing source {source_file}; pass --source PATH")
-    if (
-        not args.allow_stale
-        and min(pdf.stat().st_mtime_ns, companion.stat().st_mtime_ns)
-        < source_file.stat().st_mtime_ns
-    ):
-        raise SystemExit(
-            "PDF/SyncTeX pair predates the TeX source; rebuild or pass --allow-stale"
-        )
-    source = source_file.read_text()
+    try:
+        source_map = read_source_map(pdf)
+        source_file = (args.source or source_map["inputs"][1]).resolve()
+        validate_sources(pdf, companion, source_map, source_file, args.allow_stale)
+        with source_file.open(newline="") as stream:
+            source = stream.read()
+    except (OSError, RuntimeError, UnicodeError) as error:
+        raise SystemExit(str(error)) from error
 
     rng = random.Random(args.seed)
     forward_positions = sample_source_positions(source, rng, args.lines)
@@ -1735,7 +1716,7 @@ def main() -> None:
     if visible_words and len(visible_words) != page_count:
         raise SystemExit("pdftotext page count differs from pdfinfo")
 
-    results = list(forward(pdf, source_file, source, forward_positions, page_count, visible_words, args.best_guess))
+    results = list(forward(pdf, source_file, source, forward_positions, page_count, visible_words, args.best_guess, source_map))
     batch_error = None
     try:
         results.extend(inverse(pdf, source_file, word_points, args.best_guess))
@@ -1755,16 +1736,28 @@ def main() -> None:
     abstained = sum(bool(probe.get("abstained")) for probe in inverse_results)
     inverse_coverage.update({
         "probed": len(inverse_results),
-        "checked": len(inverse_results) - abstained,
+        "checked": sum(bool(probe.get("precision_checked")) for probe in inverse_results),
         "abstained": abstained,
         "mapping_checked": sum(bool(probe.get("mapping_ok")) for probe in inverse_results),
         "reasons": reasons,
         "failed": sum(not probe["ok"] and not probe.get("abstained") for probe in inverse_results) + bool(batch_error),
         "document_metadata_matches": sum(probe.get("match") == "document_metadata" for probe in inverse_results),
+        "coarse_valid": sum(bool(probe.get("mapping_ok")) and probe.get("reason") in {"coarse_source_refinement", "resolver_warning"} and not (probe.get("location") or {}).get("precise") for probe in inverse_results),
+        "unsupported_or_ambiguous": sum(bool(probe.get("abstained")) and bool((probe.get("location") or {}).get("precise", True)) for probe in inverse_results),
     })
+    missing_controls = [
+        word for word in args.require_precision_word
+        if not any(probe.get("precision_checked") and normalized_words(probe["word"]) == normalized_words(word) for probe in inverse_results)
+    ]
+    failures += len(missing_controls)
+    inconclusive = bool(args.best_guess and inverse_coverage["selected"] and not inverse_coverage["checked"] and not failures)
     print(json.dumps({
         "pdf": str(pdf),
         "source": str(source_file),
+        "revision_verified": False,
+        "freshness_check": "disabled" if args.allow_stale else "all_recorded_sources_mtime_only",
+        "precision_status": "verified_controls" if inverse_coverage["checked"] else "unverified" if inverse_coverage["selected"] else "not_requested_or_no_eligible_text",
+        "missing_precision_controls": missing_controls,
         "probes": len(results),
         "fails": failures,
         "stopped_early": bool(batch_error),
@@ -1773,7 +1766,7 @@ def main() -> None:
         "visible_checked": sum(bool(probe.get("visible_checked")) for probe in results),
         "results": results,
     }, indent=2))
-    sys.exit(1 if failures else 0)
+    sys.exit(1 if failures else 2 if inconclusive else 0)
 
 
 if __name__ == "__main__":

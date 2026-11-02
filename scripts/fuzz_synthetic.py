@@ -10,12 +10,16 @@ verifies both forward and inverse SyncTeX resolution via synctex_fuzz.py.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 LOREM_WORDS = [
@@ -36,6 +40,10 @@ GIBBERISH_FORMULAS = [
     r"\Delta_r = \mu_r + \nu_r",
     r"\Phi(u, v) = \kappa u + \sigma v",
 ]
+PRECISION_WORDS = {
+    "article_tabularx": "Quartzpositivearticle",
+    "beamer_tabularx": "Quartzpositivebeamer",
+}
 
 
 def sentence(rng: random.Random, length: int = 7) -> str:
@@ -55,6 +63,7 @@ def build_article_tabularx(rng: random.Random, directory: Path) -> tuple[Path, P
     sub_body = "\n".join([
         r"\section{Lorem Ipsum Section}",
         sentence(rng, 10),
+        r"\par\noindent " + PRECISION_WORDS["article_tabularx"] + r"\par",
         r"\begin{table}[h]",
         r"\centering",
         r"\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{2.5cm}cX}",
@@ -96,6 +105,7 @@ def build_beamer_deck(rng: random.Random, directory: Path) -> tuple[Path, Path]:
         r"\begin{document}",
         r"\begin{frame}{First Frame}",
         sentence(rng, 8),
+        r"\par\noindent " + PRECISION_WORDS["beamer_tabularx"] + r"\par",
         r"\begin{tabularx}{\textwidth}{lX}",
         f"{' '.join(rng.sample(LOREM_WORDS, 2))} & {sentence(rng, 6)} \\\\",
         f"${rng.choice(GIBBERISH_FORMULAS)}$ & {sentence(rng, 6)} \\\\",
@@ -116,17 +126,104 @@ def build_beamer_deck(rng: random.Random, directory: Path) -> tuple[Path, Path]:
 
 def compile_tex(tex: Path) -> Path:
     for _ in range(2):
-        proc = subprocess.run(
-            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "-synctex=1", tex.name],
-            cwd=tex.parent,
-            capture_output=True,
-            text=True,
+        proc = run_oracle(
+            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "-synctex=1", "-recorder", tex.name],
             timeout=60,
-            check=False,
+            cwd=tex.parent,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"pdflatex failed on {tex.name}:\n{proc.stdout[-500:]}\n{proc.stderr[-500:]}")
     return tex.with_suffix(".pdf")
+
+
+def run_oracle(
+    command: list[str], timeout: float = 600, cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    if os.name != "posix":
+        raise RuntimeError("synthetic fuzz requires POSIX process-group supervision")
+    process = None
+    group_signaled = False
+    previous_handler = signal.getsignal(signal.SIGINT)
+    if previous_handler is None:
+        raise RuntimeError("cannot supervise SIGINT with an unknown native signal handler")
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+    def kill_group():
+        nonlocal group_signaled
+        if process is not None and process.returncode is None and not group_signaled:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+                if not group_signaled:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    group_signaled = True
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    def interrupt(signum, frame):
+        # Owned leaders are only reaped with SIGINT blocked through status publication.
+        kill_group()
+        if callable(previous_handler):
+            previous_handler(signum, frame)
+        else:
+            raise KeyboardInterrupt
+
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        if previous_handler != signal.SIG_IGN:
+            signal.signal(signal.SIGINT, interrupt)
+        # Keep SIGINT pending until ownership is recorded; exec restores the child's mask.
+        launch = [
+            sys.executable, "-I", "-c",
+            "import json,os,signal,sys; "
+            "signal.pthread_sigmask(signal.SIG_SETMASK,json.loads(sys.argv[1])); "
+            "os.execvp(sys.argv[2],sys.argv[2:])",
+            json.dumps(list(previous_mask)), *command,
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as readers, subprocess.Popen(
+            launch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True, cwd=cwd,
+        ) as process:
+            try:
+                deadline = time.monotonic() + timeout
+                # Readers keep SIGINT blocked and decode before wait() releases the group ID.
+                output = [readers.submit(pipe.read) for pipe in (process.stdout, process.stderr)]
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                try:
+                    for result in concurrent.futures.as_completed(
+                        output, timeout=max(0, deadline - time.monotonic()),
+                    ):
+                        result.result()
+                except concurrent.futures.TimeoutError as error:
+                    raise subprocess.TimeoutExpired(command, timeout) from error
+                while True:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+                        status = process.poll()
+                    finally:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    if status is not None:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    time.sleep(min(0.01, remaining))
+            except BaseException:
+                kill_group()
+                process.wait()
+                raise
+            return subprocess.CompletedProcess(command, process.returncode, *(result.result() for result in output))
+    finally:
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        finally:
+            try:
+                if previous_handler != signal.SIG_IGN:
+                    signal.signal(signal.SIGINT, previous_handler)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def main() -> None:
@@ -141,6 +238,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20261020)
     parser.add_argument("--binary", type=Path, default=default_binary, help="pdfterm executable path")
     args = parser.parse_args()
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
 
     if shutil.which("pdflatex") is None:
         raise SystemExit("pdflatex is required in PATH to compile synthetic TeX fixtures")
@@ -163,16 +262,23 @@ def main() -> None:
                     str(pdf),
                     "--source",
                     str(probe_tex),
+                    "--build-dir",
+                    str(main_tex.parent),
+                    "--require-precision-word",
+                    PRECISION_WORDS[kind],
                     "--best-guess",
                     "--seed",
                     str(args.seed + i),
                 ]
                 if args.binary is not None:
                     cmd.extend(["--binary", str(args.binary)])
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                try:
+                    proc = run_oracle(cmd, timeout=600)
+                except subprocess.TimeoutExpired as error:
+                    raise SystemExit(f"synthetic fuzz exceeded 600 seconds on {kind}_{i}") from error
                 try:
                     report = json.loads(proc.stdout)
-                except Exception:
+                except json.JSONDecodeError:
                     sys.stderr.write(proc.stdout)
                     sys.stderr.write(proc.stderr)
                     raise SystemExit(f"synthetic fuzz failed on {kind}_{i}")
@@ -184,11 +290,18 @@ def main() -> None:
                     sys.stderr.write(json.dumps(failed_probes, indent=2) + "\n")
                     sys.stderr.write(proc.stderr)
                     raise SystemExit(f"synthetic fuzz failed on {kind}_{i}")
+                if not any(
+                    probe.get("precision_checked") and probe.get("ok")
+                    and probe.get("word", "").casefold() == PRECISION_WORDS[kind].casefold()
+                    for probe in report.get("results", [])
+                ):
+                    raise SystemExit(f"synthetic fuzz lost printed precision control {PRECISION_WORDS[kind]} on {kind}_{i}")
                 summaries.append({
                     "case": f"{kind}_{i}",
                     "probes": report["probes"],
                     "fails": report["fails"],
                     "checked": report["inverse_coverage"]["checked"],
+                    "precision_control": PRECISION_WORDS[kind],
                 })
 
     print(json.dumps({"ok": True, "cases": len(summaries), "summaries": summaries}, indent=2))
