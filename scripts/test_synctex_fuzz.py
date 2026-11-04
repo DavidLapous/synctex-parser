@@ -3,6 +3,7 @@
 
 import contextlib
 import io
+import hashlib
 import json
 import os
 import random
@@ -15,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pymupdf
 import fuzz_synthetic as synthetic
@@ -25,6 +27,8 @@ _DEFAULT_PDF_WORD = object()
 
 class OracleTests(unittest.TestCase):
     def setUp(self):
+        for name in ("PDFTERM_BINARY", "BUILD_DIRECTORY", "REPLAY_CAPTURE"):
+            self.addCleanup(setattr, oracle, name, getattr(oracle, name))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
@@ -40,7 +44,7 @@ class OracleTests(unittest.TestCase):
                 "page_lines": {1: page_lines or {(1, anchor)}}}
 
     def probe(self, text, word, offset, anchor=2, precise=True, pdf_word=_DEFAULT_PDF_WORD, mapping=None,
-              box=(40, 190, 60, 210), columns=None, **echo):
+              box=(40, 190, 60, 210), columns=None, raw_records=None, **echo):
         self.source.write_text(text)
         prefix = text[:offset]
         line = prefix.count("\n") + 1
@@ -55,9 +59,231 @@ class OracleTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, json.dumps(batch) + "\n", "")
         with patch.object(oracle, "read_source_map", return_value=mapping or self.mapping(anchor)), \
              patch.object(oracle, "pdfterm_bin", return_value=Path("unused")), \
-             patch.object(oracle, "raw_inverse", return_value=[(anchor, str(self.source))]), \
+             patch.object(oracle, "raw_inverse", return_value=raw_records or [(anchor, str(self.source))]), \
              patch.object(oracle.subprocess, "run", return_value=result):
             return list(oracle.inverse(self.pdf, self.source, {1: [(word, box, 800)]}, True))[0]
+
+    def write_graphics_pdf(self, content, forms):
+        """A 600x800 page drawing 100x100 forms named as resources; a form's file name may be absent."""
+        with pymupdf.open() as document:
+            page = document.new_page(width=600, height=800)
+            resources = []
+            for name, recorded in forms.items():
+                form = document.get_new_xref()
+                info = f"/PTEX.FileName({recorded})" if recorded else ""
+                document.update_object(form, f"<</Type/XObject/Subtype/Form/BBox[0 0 100 100]{info}>>")
+                document.update_stream(form, b"0 0 m")
+                resources.append(f"/{name} {form} 0 R")
+            document.xref_set_key(page.xref, "Resources", (
+                f"<</XObject<<{''.join(resources)}>>/Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>>>>>"
+            ))
+            contents = document.get_new_xref()
+            document.update_object(contents, "<<>>")
+            document.update_stream(contents, content)
+            document.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+            document.save(self.pdf)
+
+    def test_full_forward_sampling_keeps_all_eligible_positions(self):
+        source = "% Skipword\nAlphaone Betatwo\n\\command Quartzword % Hiddenword\n"
+        expected = [(2, 1), (2, 10), (3, 1), (3, 10)]
+        for seed in (0, 913):
+            self.assertEqual(oracle.sample_source_positions(source, random.Random(seed), None), expected)
+
+    def test_full_gate_rejects_unreviewed_or_changed_binary_before_replay(self):
+        binary = self.root / "consumer"
+        binary.write_bytes(b"reviewed consumer")
+        for options in (
+            ["--full"],
+            ["--full", "--capture", str(self.root / "capture"), "--reviewed-binary-sha256", "0" * 64],
+        ):
+            with self.subTest(options=options), patch.object(sys, "argv", [
+                "synctex_fuzz.py", str(self.pdf), "--binary", str(binary), *options
+            ]), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+                oracle.main()
+            self.assertEqual(stopped.exception.code, 2)
+            self.assertFalse((self.root / "capture").exists())
+
+    def workflow_fixture(self, scenario="good"):
+        self.source.write_text("Quartzbody\n")
+        with pymupdf.open() as document:
+            document.new_page().insert_text((72, 72), "Quartzbody")
+            document.save(self.pdf)
+        self.map.write_text(f"Input:1:{self.source}\n{{1\n[1,1:0,0:0,0,0\n]\n}}1\n")
+        tools = self.root / "tools"
+        tools.mkdir()
+        log = self.root / "calls"
+        producer = textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, pathlib, sys
+            root = pathlib.Path({str(self.root)!r})
+            source = root / "main.tex"
+            tool = pathlib.Path(sys.argv[0]).name
+            scenario = {scenario!r}
+            with (root / "calls").open("a") as stream:
+                stream.write(tool + "\\n")
+            if tool == "pdfinfo":
+                print("Pages: 1")
+            elif tool == "pdftotext":
+                print("Quartzbody\\f", end="")
+            elif tool == "synctex":
+                if sys.argv[1] == "edit":
+                    print(f"Input:{{source}}\\nLine:1")
+                elif scenario == "transport":
+                    print("native view unavailable", file=sys.stderr)
+                    sys.exit(3)
+                else:
+                    print("Page:1\\nh:72\\nv:72\\nW:60\\nH:12")
+            elif "--synctex-edit-batch" in sys.argv:
+                for row in sys.stdin:
+                    point = json.loads(row)
+                    print(json.dumps(dict(point, ok=True, pdf_word="Quartzbody", warning=None,
+                        location=dict(file=str(source), line=1, precise=True,
+                                      byte_column=0, column_char=1, column=1))))
+            else:
+                if scenario == "freeze":
+                    source.write_text("Changedbody\\n")
+                print(json.dumps(dict(pdf=str(root / "main.pdf"),
+                    page=2 if scenario == "diagnostic" else 1, h=72, v=72, width=60, height=12)))
+        """)
+        for name in ("consumer", "synctex", "pdfinfo", "pdftotext"):
+            path = tools / name
+            path.write_text(producer)
+            path.chmod(0o755)
+        self.enterContext(patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}))
+        return tools / "consumer", log
+
+    def workflow_main(self, binary, *options):
+        output = io.StringIO()
+        with patch.object(sys, "argv", [
+            "synctex_fuzz.py", str(self.pdf), "--binary", str(binary),
+            "--best-guess", *map(str, options),
+        ]), contextlib.redirect_stdout(output):
+            try:
+                oracle.main()
+            except SystemExit as stopped:
+                if not output.getvalue():
+                    raise
+                return stopped.code, json.loads(output.getvalue())
+        self.fail("oracle.main did not exit")
+
+    def test_main_capture_replay_runs_real_protocol_and_reclassifies_diagnostics(self):
+        binary, log = self.workflow_fixture("diagnostic")
+        directory = self.root / "capture"
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        options = ["--full", "--reviewed-binary-sha256", digest]
+        code, captured = self.workflow_main(binary, *options, "--capture", directory)
+        self.assertEqual(code, 1)
+        self.assertGreater(captured["fails"], 0)
+        self.assertTrue(captured["capture_complete"])
+        self.assertFalse(captured["stopped_early"])
+        self.assertEqual(captured["inverse_coverage"]["checked"], 1, captured)
+        self.assertEqual(len(captured["oracle_code_sha256"]), 2)
+        manifest = json.loads((directory / "manifest.json").read_text())["payload"]
+        self.assertEqual(manifest["identity"]["pymupdf_version"], list(pymupdf.version))
+        self.assertNotIn("oracle_code_sha256", manifest["identity"])
+        self.assertEqual(set(log.read_text().splitlines()), {"consumer", "synctex", "pdfinfo", "pdftotext"})
+        calls = log.read_bytes()
+        with patch.object(oracle.subprocess, "run", side_effect=AssertionError("replay launched a producer")):
+            replay_code, replayed = self.workflow_main(binary, *options, "--replay", directory)
+        self.assertEqual((replay_code, replayed), (code, captured))
+        self.assertEqual(log.read_bytes(), calls)
+
+    def test_main_transport_failure_reports_incomplete_capture_without_batch_exception(self):
+        binary, _ = self.workflow_fixture("transport")
+        directory = self.root / "capture"
+        code, report = self.workflow_main(binary, "--capture", directory)
+        self.assertEqual(code, 1)
+        self.assertTrue(report["stopped_early"])
+        self.assertFalse(report["capture_complete"])
+        self.assertIsNone(report["batch_error"])
+        self.assertTrue(any(row.get("transport_error") for row in report["results"]))
+        self.assertFalse(json.loads((directory / "manifest.json").read_text())["payload"]["complete"])
+
+    def test_main_refuses_completion_after_frozen_source_changes(self):
+        binary, _ = self.workflow_fixture("freeze")
+        directory = self.root / "capture"
+        with self.assertRaisesRegex(RuntimeError, "frozen replay inputs"):
+            self.workflow_main(binary, "--capture", directory)
+        self.assertFalse(json.loads((directory / "manifest.json").read_text())["payload"]["complete"])
+
+    def test_main_refuses_initialization_race_before_producers(self):
+        binary, log = self.workflow_fixture()
+        directory = self.root / "capture"
+        declarations = oracle.recorded_theorem_names
+        def changed(source_map):
+            names = declarations(source_map)
+            self.source.write_text("Changedbody\n")
+            return names
+        with patch.object(oracle, "recorded_theorem_names", side_effect=changed), \
+             self.assertRaisesRegex(SystemExit, "inputs changed during initialization"):
+            self.workflow_main(binary, "--capture", directory)
+        self.assertFalse(directory.exists())
+        self.assertFalse(log.exists())
+
+    def test_main_checks_loaded_code_at_initialization_and_capture_completion_only(self):
+        binary, log = self.workflow_fixture()
+        code_file = self.root / "loaded-oracle.py"
+        page_count = oracle.pdf_page_count
+        for phase in ("initial", "completion", "focused"):
+            with self.subTest(phase=phase):
+                code_file.write_bytes(b"loaded source")
+                hashes = {**oracle.ORACLE_CODE_SHA256,
+                          str(code_file): hashlib.sha256(code_file.read_bytes()).hexdigest()}
+                def changed(pdf):
+                    count = page_count(pdf)
+                    code_file.write_bytes(b"edited source")
+                    return count
+                directory = self.root / phase
+                with patch.object(oracle, "ORACLE_CODE_SHA256", hashes), \
+                     patch.object(oracle, "pdf_page_count", side_effect=changed):
+                    if phase == "initial":
+                        code_file.write_bytes(b"edited before initialization")
+                        with self.assertRaisesRegex(SystemExit, "loaded oracle code changed"):
+                            self.workflow_main(binary, "--capture", directory)
+                        self.assertFalse(directory.exists())
+                        self.assertFalse(log.exists())
+                    elif phase == "completion":
+                        with self.assertRaisesRegex(RuntimeError, "loaded oracle code changed"):
+                            self.workflow_main(binary, "--capture", directory)
+                        self.assertFalse(json.loads((directory / "manifest.json").read_text())["payload"]["complete"])
+                    else:
+                        code, report = self.workflow_main(binary)
+                        self.assertEqual(code, 0, report)
+                        self.assertFalse(report["capture_complete"])
+
+    def test_loaded_oracle_hashes_reject_changed_source_in_each_module(self):
+        for path in oracle.ORACLE_CODE_SHA256:
+            with self.subTest(path=path), patch.object(oracle, "ORACLE_CODE_SHA256", {
+                **oracle.ORACLE_CODE_SHA256, path: "0" * 64,
+            }), self.assertRaisesRegex(RuntimeError, "loaded oracle code changed"):
+                oracle.validate_oracle_code()
+
+    def test_replay_identity_pins_word_extractor_only_when_inverse_enabled(self):
+        binary, _ = self.workflow_fixture()
+        args = SimpleNamespace(seed=1, lines=1, pages=1, words=1, page=None,
+                               best_guess=True, allow_stale=False, full=False, preflight=False)
+        with patch.object(oracle, "PDFTERM_BINARY", binary):
+            mapping = oracle.read_source_map(self.pdf)
+            before = oracle.replay_identity(args, self.pdf, self.map, mapping, self.source)
+            with patch.object(pymupdf, "version", ("changed", "changed", None)):
+                after = oracle.replay_identity(args, self.pdf, self.map, mapping, self.source)
+                self.assertNotEqual(before, after)
+                args.pages = 0
+                self.assertIsNone(oracle.replay_identity(args, self.pdf, self.map, mapping, self.source)["pymupdf_version"])
+
+    def test_native_inverse_timeout_is_an_operational_failure(self):
+        self.source.write_text("Quartzbody.\n")
+        response = subprocess.CompletedProcess([], 0, json.dumps({
+            "ok": False, "error": "synctex edit returned no match",
+        }) + "\n", "")
+        with patch.object(oracle, "read_source_map", return_value=self.mapping(1)), \
+             patch.object(oracle, "pdfterm_bin", return_value=Path("unused")), \
+             patch.object(oracle.subprocess, "run", return_value=response), \
+             patch.object(oracle, "raw_inverse", side_effect=subprocess.TimeoutExpired("synctex", 30)):
+            result = list(oracle.inverse(self.pdf, self.source, {1: [("Quartzbody", (1, 1, 9, 9), 800)]}))[0]
+        self.assertTrue(result["transport_error"], result)
+        self.assertFalse(result["ok"], result)
+        self.assertFalse(result.get("abstained"), result)
 
     def test_ordinary_printed_title_caption_and_prose_are_checked(self):
         for text, word in [
@@ -69,10 +295,91 @@ class OracleTests(unittest.TestCase):
                 result = self.probe(text, word, text.index(word), anchor=1 if "caption" in text else 3)
                 self.assertTrue(result.get("precision_checked"), result)
 
+    def test_optional_theorem_heading_literals_remain_positive_controls(self):
+        text = "\\begin{zibble}[Quartztitle $Q_kz$]\nQuartzbody.\n\\end{zibble}\n"
+        style = Path(__file__).resolve().parent / "fixtures/theorem-title/zoggle.sty"
+        mapping = self.mapping(3, inputs={1: self.source, 2: style})
+        for word, offset in (("Quartztitle", text.index("Quartztitle")), ("Q", text.index("$Q") + 1),
+                             ("kz", text.index("kz")), ("Quartzbody", text.index("Quartzbody"))):
+            with self.subTest(word=word):
+                result = self.probe(text, word, offset, anchor=3, mapping=mapping)
+                self.assertTrue(result.get("precision_checked"), result)
+
+    def test_non_utf8_recorded_package_preserves_ascii_theorem_context(self):
+        style = self.root / "quartzliterals.sty"
+        style.write_bytes(
+            b"% \xe9 \\newtheorem{Quartzcomment}{Hidden}\n"
+            b"\\verb|\\newtheorem{Quartzopaque}{Hidden}|\n"
+            b"\\newtheorem{\xa0Quartznonascii}{Hidden}\n"
+            b"\\newtheorem{zibble}{Zibble}\n"
+        )
+        self.assertEqual(oracle.declared_theorem_names(style.read_bytes().decode("ascii", "surrogateescape")),
+                         frozenset({"zibble"}))
+        text = "\\begin{zibble}[Quartztitle]\nQuartzbody.\n\\end{zibble}\n"
+        mapping = self.mapping(3, inputs={1: self.source, 2: style})
+        result = self.probe(text, "Quartztitle", text.index("Quartztitle"), anchor=3, mapping=mapping)
+        self.assertTrue(result.get("precision_checked"), result)
+
+    def test_known_nonprinting_inside_optional_theorem_heading_still_fails(self):
+        text = "\\begin{zibble}[Quartztitle\\label{Quartzkey}]\nQuartzbody.\n\\end{zibble}\n"
+        style = Path(__file__).resolve().parent / "fixtures/theorem-title/zoggle.sty"
+        mapping = self.mapping(3, inputs={1: self.source, 2: style})
+        for word in ("zibble", "Quartzkey"):
+            with self.subTest(word=word):
+                result = self.probe(text, word, text.index(word), anchor=3, mapping=mapping)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("nonprinting", result.get("error", ""), result)
+
+    def test_theorem_declarations_ignore_comments_and_macro_bodies(self):
+        text = "% \\newtheorem{Quarzcomment}{Hidden}\n\\newcommand{\\quartz}{\\newtheorem{Quartzmacro}{Hidden}}\n\\newtheorem*{Quartztitled}{Printed}\n"
+        self.assertEqual(oracle.declared_theorem_names(text), frozenset({"Quartztitled"}))
+
+    def test_theorem_declarations_ignore_escaped_quoted_and_opaque_commands(self):
+        declaration = r"\newtheorem{zibble}{Hidden}"
+        for text in (
+            "\\" + declaration,
+            r"\verb|" + declaration + "|",
+            r"\lstinline|" + declaration + "|",
+            "\\begin{Verbatim}\n" + declaration + "\n\\end{Verbatim}",
+            r"\string" + declaration,
+            r"\noexpand" + declaration,
+            r"\meaning" + declaration,
+            r"\detokenize{" + declaration + "}",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(oracle.declared_theorem_names(text), frozenset())
+                self.assertEqual(oracle.declared_theorem_names(text + "\n\\newtheorem{Quartzreal}{Printed}"),
+                                 frozenset({"Quartzreal"}))
+
+    def test_quoted_paragraph_tokens_preserve_following_theorem_declarations(self):
+        declaration = "\\newtheorem{Quartzreal}{Printed}"
+        for quote in ("\\string", "\\noexpand", "\\meaning"):
+            for gap in ("\n\n", "\n \t\n", "% comment\n\n", "\n% comment\n\n", "\r\n\r\n"):
+                with self.subTest(quote=quote, gap=gap):
+                    self.assertEqual(oracle.declared_theorem_names(quote + gap + declaration),
+                                     frozenset({"Quartzreal"}))
+
+    def test_unexpanded_theorem_tokens_remain_declarations_at_top_level(self):
+        text = r"\unexpanded{\newtheorem{Quartzreal}{Printed}}"
+        self.assertEqual(oracle.declared_theorem_names(text), frozenset({"Quartzreal"}))
+        hidden = "\\edef\\quartz{" + text + "}"
+        self.assertEqual(oracle.declared_theorem_names(hidden), frozenset())
+
+    def test_unbraced_quoting_does_not_hide_later_theorem_declarations(self):
+        declaration = "\n\\newtheorem{Quartzreal}{Printed}"
+        for prefix in (r"\detokenize Quartzopaque", r"\unexpanded Quartzopaque",
+                       r"\detokenize{Quartzopaque", r"\unexpanded{Quartzopaque"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(oracle.declared_theorem_names(prefix + declaration),
+                                 frozenset({"Quartzreal"}))
+
     def test_known_nonprinting_positions_are_failures(self):
         for text, word in [
             ("\\begin{frame}\nVisible % Quartzcomment\n\\end{frame}\n", "Quartzcomment"),
             ("\\begin{frame}[Quartzoption]\nVisible\n\\end{frame}\n", "Quartzoption"),
+            ("\\begin{table}[Quartzoption]\nVisible\n\\end{table}\n", "Quartzoption"),
+            ("\\begin{tabular}[Quartzoption]{c}\nVisible\n\\end{tabular}\n", "Quartzoption"),
+            ("\\begin{zibble}[Quartzoption]\nVisible\n\\end{zibble}\n", "Quartzoption"),
             ("\\begin{frame}\nVisible\n\\end{frame}\n", "frame"),
             ("\\caption[Quartzshort]{Printed caption}\n", "Quartzshort"),
             ("\\includegraphics{Quartzimage.pdf}\n", "Quartzimage"),
@@ -93,15 +400,369 @@ class OracleTests(unittest.TestCase):
                 bad = self.probe(text, "Quartzhidden", text.index("Quartzhidden"), anchor=4)
                 self.assertIn("nonprinting", bad.get("error", ""), bad)
                 self.assertFalse(bad.get("abstained"), bad)
+                punctuated = self.probe(text, "Quartzhidden.", text.index("Quartzhidden"), anchor=4)
+                self.assertIn("nonprinting", punctuated.get("error", ""), punctuated)
+                self.assertFalse(punctuated.get("abstained"), punctuated)
                 if "unknownwrapper" not in invocation:
                     good = self.probe(text, "Quartzbody", text.index("Quartzbody"), anchor=4)
                     self.assertTrue(good.get("precision_checked"), good)
+        coexisting = "\\begin{frame}\nThe word section precedes \\cref{sec:alpha} here.\n\\end{frame}\n"
+        ref_hit = self.probe(coexisting, "section", coexisting.index("sec:alpha"), anchor=3)
+        self.assertTrue(ref_hit.get("abstained"), ref_hit)
+        self.assertEqual(ref_hit.get("reason"), "precision_not_literal_math_or_expansion", ref_hit)
+        self.assertNotIn("error", ref_hit)
 
     def test_graphics_cannot_bypass_pdf_word_mismatch(self):
         text = "\\includegraphics{Quartzimage.pdf}\n"
         result = self.probe(text, "Quartzprobe", text.index("Quartzimage"), anchor=1, pdf_word="Other")
         self.assertFalse(result["ok"], result)
         self.assertNotEqual(result.get("match"), "graphics_argument")
+
+    def test_pdf_form_geometry_cannot_hide_a_graphics_filename_failure(self):
+        figure = {"A": "fig.pdf"}
+        invocation = "\\includegraphics{fig.pdf}\n"
+        for label, content, forms, text, argument, word, center in [
+            ("matching placement", b"q 1 0 0 1 40 590 cm /A Do Q", figure, invocation, "fig.pdf", "z", (50, 200)),
+            ("outside active clip", b"q 46 535 5 5 re W n 1 0 0 1 46 535 cm /A Do Q", figure, invocation, "fig.pdf", "z", (96, 215)),
+            ("independent overlay", b"q 1 0 0 1 77 574 cm /A Do Q BT /F1 20 Tf 107 614 Td (Independent) Tj ET", figure,
+             "\\includegraphics{fig.pdf} Independent\n", "fig.pdf", "Independent", (127, 176)),
+            ("comment is not painted", b"% /A Do\n", figure, invocation, "fig.pdf", "z", (50, 750)),
+            ("unnamed topmost form", b"q 1 0 0 1 40 590 cm /A Do Q q 1 0 0 1 40 590 cm /B Do Q",
+             {"A": "fig.pdf", "B": None}, invocation, "fig.pdf", "z", (50, 200)),
+            ("rotated bounds outside the form", b"q 0.7071 0.7071 -0.7071 0.7071 300 300 cm /A Do Q", figure, invocation,
+             "fig.pdf", "z", (235, 495)),
+            ("svg in another directory", b"q 1 0 0 1 40 590 cm /A Do Q", {"A": "./elsewhere/plot_svg-raw.pdf"},
+             "\\includesvg{dir3425/plot.svg}\n", "dir3425/plot.svg", "z", (50, 200)),
+        ]:
+            with self.subTest(label=label):
+                self.write_graphics_pdf(content, forms)
+                box = (center[0] - 2, center[1] - 2, center[0] + 2, center[1] + 2)
+                result = self.probe(text, word, text.index(argument), anchor=1, pdf_word=None, box=box)
+                self.assertIn("nonprinting", result.get("error", ""), result)
+                self.assertFalse(result.get("abstained"), result)
+                self.assertFalse(result.get("mapping_ok"), result)
+                self.assertEqual(result["graphics_filename_hint"]["argument"], argument, result)
+        printed = "\\includegraphics{fig.pdf} Independent\n"
+        result = self.probe(printed, "Independent", printed.index("Independent"), anchor=1)
+        self.assertTrue(result.get("precision_checked"), result)
+        self.assertNotIn("graphics_filename_hint", result)
+
+    def test_graphics_filename_hint_marks_only_an_active_filename_first_byte(self):
+        invocation = "\\begin{figure}\n\\includegraphics[width=2cm]{figs/plot.pdf}\n\\end{figure}\n"
+        commented = "Body\n% \\includegraphics{figs/plot.pdf}\nMore\n"
+        for label, text, target in [
+            ("inside the filename", invocation, "plot.pdf"),
+            ("option key", invocation, "width"),
+            ("comment", commented, "figs/plot"),
+        ]:
+            with self.subTest(label=label):
+                result = self.probe(text, "z", text.index(target), anchor=2, pdf_word=None)
+                self.assertIn("nonprinting", result.get("error", ""), result)
+                self.assertFalse(result.get("abstained"), result)
+                self.assertNotIn("graphics_filename_hint", result)
+        stored = "\\newcommand{\\stored}{\\includegraphics{figs/plot.pdf}}\nBody\n\\stored\n"
+        result = self.probe(stored, "z", stored.index("figs/plot"), anchor=3, pdf_word=None)
+        self.assertEqual(result.get("reason"), "unverified_execution_ownership", result)
+        self.assertNotIn("graphics_filename_hint", result)
+
+    def test_delimited_display_scope_follows_its_closing_line_anchor(self):
+        for opening, closing in (("\\[", "\\]"), ("$$", "$$")):
+            with self.subTest(opening=opening):
+                text = "Before\n" + opening + "\nQuartzfirst\n" + "a\n" * 5 + closing + "\n"
+                anchor = text.count("\n")
+                result = self.probe(text, "Quartzfirst", text.index("Quartzfirst"), anchor=anchor)
+                self.assertNotIn("error", result)
+                self.assertTrue(result.get("precision_checked"), result)
+                self.assertEqual(oracle.display_delimiter_bounds(text, anchor), (1, anchor - 1))
+        outside = "Quartzoutside\n" + "\n" * 6 + "\\[\nQ\n\\]\n"
+        result = self.probe(outside, "Quartzoutside", 0, anchor=outside.count("\n"))
+        self.assertIn("scope", result.get("error", ""), result)
+        self.assertIsNone(oracle.display_delimiter_bounds("\\[\na\n\\]\nAfter\n", 4))
+        self.assertIsNone(oracle.display_delimiter_bounds("% \\[\nAfter\n% \\]\n", 2))
+        self.assertIsNone(oracle.display_delimiter_bounds("a\\\\[2pt]\nb\\\\[2pt]\n", 2))
+
+    def test_quoted_display_delimiters_do_not_invent_scope(self):
+        split = (
+            "\\begin{verbatim}\n\\[\n\\end{verbatim}\nQuartzprose\n" + "a\n" * 5
+            + "\\begin{verbatim}\n\\]\n\\end{verbatim}\n"
+        )
+        result = self.probe(split, "Quartzprose", split.index("Quartzprose"), anchor=11)
+        self.assertIn("scope", result.get("error", ""), result)
+        self.assertFalse(result.get("abstained"), result)
+        for text in (split, "\\verb|\\[|\na\n\\verb|\\]|\n", "\\string\\[\na\n\\string\\]\n"):
+            with self.subTest(text=text):
+                self.assertEqual(oracle._display_delimiter_ranges(text), ())
+
+    def test_native_box_at_exact_line_resolves_scope_without_precision(self):
+        text = "Quartzfar\n" + "\n" * 8 + "Quartzanchor\n"
+        contained = {"Page": 1, "h": 40, "v": 210, "W": 20, "H": 20}
+        with patch.object(oracle, "raw_forward_records", return_value=[contained]) as native:
+            result = self.probe(text, "Quartzfar", 0, anchor=10)
+        native.assert_called_once_with(self.pdf, self.source, 1)
+        self.assertEqual(result.get("reason"), "native_forward_location_contains_point", result)
+        self.assertEqual(result["column_reason"], oracle.UNIQUE_LITERAL)
+        self.assertEqual(result["native_forward_box"], contained)
+        self.assertFalse(result["ok"], result)
+        self.assertFalse(result.get("precision_checked"), result)
+        self.assertFalse(result.get("mapping_ok"), result)
+        self.assertNotIn("error", result)
+        wrong_word = "Quartzright Quartzleft\n" + "\n" * 8 + "Quartzanchor\n"
+        with patch.object(oracle, "raw_forward_records", return_value=[contained]):
+            wrong = self.probe(wrong_word, "Quartzleft", 0, anchor=10)
+        self.assertIn("does not select", wrong.get("error", ""), wrong)
+        self.assertFalse(wrong.get("abstained"), wrong)
+        self.assertEqual(wrong["native_forward_box"], contained)
+        for label, record in [
+            ("disjoint", {**contained, "h": 300}),
+            ("another page", {**contained, "Page": 2}),
+            ("page-scale container", {"Page": 1, "h": 0, "v": 700, "W": 600, "H": 600}),
+        ]:
+            with self.subTest(label=label), patch.object(oracle, "raw_forward_records", return_value=[record]):
+                failed = self.probe(text, "Quartzfar", 0, anchor=10)
+                self.assertIn("scope", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+
+    def test_impossible_host_line_is_not_float_provenance(self):
+        included = self.root / "section.tex"
+        rows = ["Intro"] + [f"Row{index}" for index in range(2, 30)]
+        rows[4:7] = ["\\caption{Quartzcaption", "second", "third}"]
+        included.write_text("\n".join(rows) + "\n")
+        mapping = self.mapping(2, {1: self.source, 2: included})
+        host = "\\begin{document}\n\\include{section}\n\\end{document}\n"
+        contained = {"Page": 1, "h": 40, "v": 210, "W": 20, "H": 20}
+        for label, cols in [
+            ("line fits a caption", {"file": str(included), "line": 5, "byte_column": 9, "column": 10, "column_char": 10}),
+            ("line fits ordinary prose", {"file": str(included), "line": 8, "byte_column": 0, "column": 1, "column_char": 1}),
+        ]:
+            with self.subTest(label=label), patch.object(oracle, "raw_forward_records", return_value=[contained]):
+                result = self.probe(host, "Quartzcaption", 0, anchor=7, mapping=mapping, columns=cols,
+                                    raw_records=[(7, str(self.source))])
+                self.assertIn("outside its source file", result.get("error", ""), result)
+                self.assertFalse(result.get("abstained"), result)
+
+    def test_active_include_alias_needs_native_box_and_the_selected_word(self):
+        included = self.root / "section.tex"
+        rows = ["Intro"] + [f"Row{index}" for index in range(2, 30)]
+        rows[4:7] = ["\\caption{Quartzcaption", "second", "third}"]
+        included.write_text("\n".join(rows) + "\n")
+        mapping = self.mapping(2, {1: self.source, 2: included})
+        host = "\\begin{document}\n\\include{section}\n\\end{document}\n"
+        columns = {"file": str(included), "line": 5, "byte_column": 9, "column": 10, "column_char": 10}
+        include_line = [(2, str(self.source))]
+        contained = {"Page": 1, "h": 40, "v": 210, "W": 20, "H": 20}
+        with patch.object(oracle, "raw_forward_records", return_value=[contained]):
+            native = self.probe(host, "Quartzcaption", 0, anchor=2, mapping=mapping, columns=columns, raw_records=include_line)
+            wrong = self.probe(host, "Quartzcaption", 0, anchor=2, mapping=mapping, raw_records=include_line,
+                               columns={**columns, "line": 8, "byte_column": 0, "column": 1, "column_char": 1})
+        self.assertEqual(native.get("reason"), "active_include_native_box", native)
+        self.assertEqual(native["alias_evidence"]["include_host"], {"file": str(self.source), "line": 2})
+        self.assertEqual(native["column_reason"], oracle.UNIQUE_LITERAL)
+        self.assertFalse(native["ok"], native)
+        self.assertFalse(native.get("precision_checked"), native)
+        self.assertNotIn("error", native)
+        self.assertIn("does not select", wrong.get("error", ""), wrong)
+        self.assertFalse(wrong.get("abstained"), wrong)
+        with patch.object(oracle, "raw_forward_records", return_value=[{**contained, "h": 300}]):
+            disjoint = self.probe(host, "Quartzcaption", 0, anchor=2, mapping=mapping, columns=columns, raw_records=include_line)
+        self.assertIn("source file", disjoint.get("error", ""), disjoint)
+        self.assertFalse(disjoint.get("abstained"), disjoint)
+        for label, source in [
+            ("commented include", host.replace("\\include", "% \\include")),
+            ("quoted include", host.replace("\\include{section}", "\\verb|\\include{section}|")),
+            ("line break before a word", host.replace("\\include{section}", "\\\\include{section}")),
+        ]:
+            with self.subTest(label=label), patch.object(oracle, "raw_forward_records", return_value=[contained]):
+                failed = self.probe(source, "Quartzcaption", 0, anchor=2, mapping=mapping, columns=columns, raw_records=include_line)
+                self.assertIn("source file", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+
+    def bibliography_probe(self, text, target, columns=None):
+        generated = self.pdf.with_suffix(".bbl")
+        generated.write_text("\\begin{thebibliography}{9}\n\\bibitem{a} Printed.\n\\end{thebibliography}\n")
+        mapping = self.mapping(2, {1: self.source, 2: generated})
+        mapping.update(origins={1: (2, 2)}, page_inputs={1: {2}}, page_lines={1: {(2, 2)}})
+        return self.probe(text, "Printed", text.index(target), precise=False, mapping=mapping,
+                          raw_records=[(2, str(generated))], columns=columns)
+
+    def test_coarse_generated_bibliography_host_alias_stays_explicit(self):
+        text = "Body\n\\bibliography{refs}\n\n\\end{document}\n"
+        result = self.bibliography_probe(text, "\\end{document}")
+        self.assertEqual(result.get("reason"), "coarse_bibliography_host_alias", result)
+        self.assertTrue(result.get("abstained"), result)
+        self.assertFalse(result.get("mapping_ok"), result)
+        self.assertFalse(result["ok"], result)
+        self.assertNotIn("error", result)
+        printed = "Body\n\\printbibliography\n\n\\end{document}\n"
+        self.assertEqual(self.bibliography_probe(printed, "\\end{document}").get("reason"), "coarse_bibliography_host_alias")
+        for label, source, target in [
+            ("commented command", "Body\n% \\bibliography{refs}\n\n\\end{document}\n", "\\end{document}"),
+            ("no command", "Body\nMore\n\n\\end{document}\n", "\\end{document}"),
+            ("distant line", "Target\n" + "\n" * 8 + "\\bibliography{refs}\n", "Target"),
+        ]:
+            with self.subTest(label=label):
+                failed = self.bibliography_probe(source, target)
+                self.assertIn("anchor", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+        for label, source in [
+            ("verb", "Body\n\\verb|\\bibliography{refs}|\n\n\\end{document}\n"),
+            ("verbatim", "\\begin{verbatim}\n\\bibliography{refs}\n\\end{verbatim}\n\\end{document}\n"),
+            ("quoted", "Body\n\\string\\bibliography{refs}\n\n\\end{document}\n"),
+        ]:
+            with self.subTest(label=label):
+                failed = self.bibliography_probe(source, "\\end{document}")
+                self.assertIn("anchor", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+        host = "\\bibliography{refs}\n"
+        for label, line in [("line zero", 0), ("past the last line", 2)]:
+            with self.subTest(label=label):
+                failed = self.bibliography_probe(host, "\\bibliography", columns={"line": line})
+                self.assertIn("anchor", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+
+    def test_optional_proof_arity_does_not_make_its_heading_printing(self):
+        text = "\\begin{proof}[Quartzheading]\nQuartzbody.\n\\end{proof}\n"
+        style = self.root / "provider.sty"
+        # This declaration accepts the option and discards it, so its arity proves nothing.
+        style.write_text("\\newenvironment{proof}[1][\\proofname]{\\par}{}\n")
+        mapping = self.mapping(3, inputs={1: self.source, 2: style})
+        result = self.probe(text, "Quartzheading", text.index("Quartzheading"), anchor=3, mapping=mapping)
+        self.assertIn("nonprinting", result.get("error", ""), result)
+        self.assertFalse(result.get("abstained"), result)
+        self.assertFalse(result.get("precision_checked"), result)
+
+    def test_printed_window_explains_composite_words_but_not_wrong_columns(self):
+        for label, body, word, target, pdf_word in [
+            ("hyphen first", "The mossy-tuft case.", "mossy-tuft", "mossy", "mossy"),
+            ("hyphen second", "The mossy-tuft case.", "mossy-tuft", "tuft", "tuft"),
+            ("en dash", "A brine--fig latch.", "brine–fig", "fig", "fig"),
+            ("apostrophe", "By Zorbel's work.", "Zorbel’s", "Zorbel", "Zorbel"),
+            ("math scripts", "Then $Q_m$. Next", "𝑄𝑚.", "Q_m", "𝑄𝑚"),
+            ("math glued word", "Let $s$remains here", "𝑠remains", "remains", "remains"),
+        ]:
+            with self.subTest(label=label):
+                text = "\\begin{frame}\n" + body + "\n\\end{frame}\n"
+                result = self.probe(text, word, text.index(target), anchor=3, pdf_word=pdf_word)
+                self.assertEqual(result.get("reason"), "printed_glyph_window_unverified_ownership", result)
+                self.assertFalse(result["ok"], result)
+                self.assertFalse(result.get("precision_checked"), result)
+                self.assertNotIn("error", result)
+        repeated = "\\begin{frame}\nThen $Q_m$ and $Q_m$.\n\\end{frame}\n"
+        result = self.probe(repeated, "𝑄𝑚", repeated.rindex("Q_m"), anchor=3)
+        self.assertEqual(result.get("reason"), "ambiguous_repeated_occurrence", result)
+        for label, body, word, target in [
+            ("other plain word", "The mossy-tuft case.", "mossy-tuft", "case"),
+            ("inside the token", "The mossy-tuft case.", "mossy-tuft", "ossy"),
+            ("separated spelling", "The mossy tuft case. Later mossy-tuft.", "other-word", "case"),
+            ("prefix of a longer token", "The calculus case.", "calc", "calculus"),
+            ("suffix of a longer token", "The calculus case.", "ulus", "ulus"),
+            ("words joined across a space", "The alpha beta case.", "alphabeta", "alpha"),
+            ("words joined across a line", "The alpha\nbeta case.", "alphabeta", "alpha"),
+            ("words joined across a tie", "The alpha~beta case.", "alphabeta", "alpha"),
+        ]:
+            with self.subTest(label=label):
+                text = "\\begin{frame}\n" + body + "\n\\end{frame}\n"
+                result = self.probe(text, word, text.index(target), anchor=3, pdf_word=None)
+                self.assertIn("does not select", result.get("error", ""), result)
+                self.assertFalse(result.get("abstained"), result)
+        control = "The \\qq m case"
+        self.assertIsNone(oracle.printed_window_occurrences(control, control.index("m case"), "qm"))
+
+    def test_printed_window_never_infers_a_boundary_from_its_cutoff(self):
+        comment = "y%" + "c" * 300 + "\nx rest"
+        tail = "b" * 300 + "-c end"
+        for label, text, position, word in [
+            ("token continues past the right edge", "a" * 240 + "b", 0, "a" * 240),
+            ("token continues past the left edge", tail, tail.index("-c") + 1, "b" * 239 + "-c"),
+            ("comment crosses the right edge", "x%" + "c" * 300 + "\ny", 0, "x"),
+            ("control sequence crosses the right edge", "a" * 239 + "\\(b", 0, "a" * 239),
+            ("window opens inside a comment that joins the next line", comment, comment.index("x rest"), "x"),
+        ]:
+            with self.subTest(label=label):
+                self.assertIsNone(oracle.printed_window_occurrences(text, position, word))
+        spaced = "y " + "c" * 300 + "\nx rest"
+        for label, text, position, word in [
+            ("visible space inside the window", "a" * 239 + " b", 0, "a" * 239),
+            ("source really ends at the window edge", "a" * 240, 0, "a" * 240),
+            ("comment joins inside the window", "x%c\ny rest", 0, "xy"),
+            ("comment runs to the end of the source", "x%c", 0, "x"),
+            ("visible newline after a clipped line", spaced, spaced.index("x rest"), "x"),
+        ]:
+            with self.subTest(label=label):
+                self.assertEqual(oracle.printed_window_occurrences(text, position, word), 1)
+        cut_word = "a" * 100 + "-" + "b" * 139
+        self.assertIsNone(oracle.selected_column_verdict(cut_word + "c", 0, cut_word, None, "", (0, 0)))
+        whole_word = "a" * 100 + "-" + "b" * 138
+        self.assertEqual(
+            oracle.selected_column_verdict(whole_word + " end", 0, whole_word, None, "", (0, 0)),
+            "printed_glyph_window_unverified_ownership",
+        )
+
+    def test_extractor_component_needs_composite_word_and_matching_token(self):
+        text = "\\begin{frame}\n\\footnotetext[1]{[Quartzname, Quartzauthor]}\n\\end{frame}\n"
+        offset = text.index("Quartzname")
+        selected = self.probe(text, "1[Quartzname", offset, anchor=3, pdf_word="Quartzname")
+        self.assertEqual(selected.get("reason"), "extractor_component_selected_unverified_ownership", selected)
+        self.assertFalse(selected["ok"], selected)
+        self.assertFalse(selected.get("precision_checked"), selected)
+        self.assertNotIn("error", selected)
+        for label, word, at, pdf_word in [
+            ("wrong column", "1[Quartzname", text.index("Quartzauthor"), "Quartzname"),
+            ("PDFium word outside the composite", "1[Quartzname", offset, "Quartzauthor"),
+            ("no PDFium word", "1[Quartzname", offset, None),
+        ]:
+            with self.subTest(label=label):
+                failed = self.probe(text, word, at, anchor=3, pdf_word=pdf_word)
+                self.assertIn("does not select", failed.get("error", ""), failed)
+                self.assertFalse(failed.get("abstained"), failed)
+        inside = "\\begin{frame}\nfoobarbaz\n\\end{frame}\n"
+        failed = self.probe(inside, "1[barbaz", inside.index("barbaz"), anchor=3, pdf_word="barbaz")
+        self.assertIn("does not select", failed.get("error", ""), failed)
+        self.assertFalse(failed.get("abstained"), failed)
+
+    def test_batch_validation_rejects_absent_swapped_and_malformed_echoes(self):
+        point = {"page": 2, "x": 12.5, "y": 40.25}
+        for label, stdout, count in [
+            ("not an object", "[]\n", 1),
+            ("empty object", "{}\n", 1),
+            ("non-boolean ok", '{"ok": 1}\n', 1),
+            ("not JSON", "garbage\n", 1),
+            ("too few rows", '{"ok": true}\n', 2),
+        ]:
+            with self.subTest(label=label), self.assertRaises(RuntimeError):
+                oracle.parse_batch_rows(stdout, count)
+        echo = json.dumps(point)
+        for label, batch in [
+            ("success without a point", {"ok": True, "location": None}),
+            ("success missing a coordinate", {"ok": True, "page": 2, "x": 12.5}),
+            ("error without input", {"ok": False, "error": "failed"}),
+            ("swapped page", {"ok": True, "page": 3, "x": 12.5, "y": 40.25}),
+            ("swapped coordinates", {"ok": True, "page": 2, "x": 40.25, "y": 12.5}),
+            ("adjacent float", {"ok": True, "page": 2, "x": 12.500001, "y": 40.25}),
+            ("string page", {"ok": True, "page": "2", "x": 12.5, "y": 40.25}),
+            ("other error input", {"ok": False, "input": echo.replace("12.5", "13.5")}),
+            ("malformed error input", {"ok": False, "input": "not json"}),
+        ]:
+            with self.subTest(label=label):
+                self.assertIsNotNone(oracle.batch_identity_error(batch, point, require_echo=True))
+        self.assertIsNone(oracle.batch_identity_error({"ok": True, **point}, point, require_echo=True))
+        self.assertIsNone(oracle.batch_identity_error({"ok": False, "input": echo}, point, require_echo=True))
+
+    def test_forward_response_validation_rejects_other_pdfs_and_invalid_boxes(self):
+        good = {"pdf": str(self.pdf), "page": 1, "h": 1.0, "v": 2.0, "width": 3.0, "height": 4.0}
+        self.assertTrue(oracle.forward_response_valid(good, self.pdf, 1))
+        for label, change in [
+            ("other PDF", {"pdf": "/other.pdf"}),
+            ("page out of range", {"page": 2}),
+            ("boolean page", {"page": True}),
+            ("non-finite box", {"h": float("inf")}),
+            ("empty box", {"width": 0.0, "height": 0.0}),
+        ]:
+            with self.subTest(label=label):
+                self.assertFalse(oracle.forward_response_valid({**good, **change}, self.pdf, 1))
+        missing = dict(good)
+        del missing["page"]
+        with self.assertRaises(KeyError):
+            oracle.forward_response_valid(missing, self.pdf, 1)
 
     def test_note_arguments_and_unknown_wrappers_are_unverified(self):
         for invocation in ["\\note{Quartzopaque}", "\\unknownwrapper{Quartzopaque}"]:
@@ -205,6 +866,16 @@ class OracleTests(unittest.TestCase):
         expanded = self.probe(text, "42", text.index("\\ref"), anchor=3)
         self.assertTrue(expanded.get("abstained"), expanded)
         self.assertNotIn("error", expanded)
+        brace_expanded = self.probe(text, "42", text.index("Quartzkey"), anchor=3)
+        self.assertEqual(brace_expanded.get("reason"), "precision_not_literal_math_or_expansion", brace_expanded)
+        self.assertTrue(brace_expanded.get("abstained"), brace_expanded)
+        self.assertNotIn("error", brace_expanded)
+        fig_text = "\\begin{frame}\nPrefigure \\cref{fig:square} postfigure.\n\\end{frame}\n"
+        fig_prefix = self.probe(fig_text, "fig.", fig_text.index("fig:square"), anchor=3, pdf_word="fig")
+        self.assertEqual(fig_prefix.get("reason"), "precision_not_literal_math_or_expansion", fig_prefix)
+        self.assertTrue(fig_prefix.get("abstained"), fig_prefix)
+        self.assertFalse(fig_prefix.get("ok"), fig_prefix)
+        self.assertNotIn("error", fig_prefix)
         key = self.probe(text, "Quartzkey", text.index("Quartzkey"), anchor=3)
         self.assertIn("nonprinting", key.get("error", ""), key)
 

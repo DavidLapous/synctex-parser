@@ -8,6 +8,22 @@ is checked even for coarse results; fragile frames use the clicked sheet's
 original source-map box, never the final reused .vrb contents. Precision checks
 unique eligible literal spellings, not arbitrary TeX execution ownership.
 Unknown expansions and repeated occurrences are explicitly unverified.
+A precise location is a native-compatible column hint, not a printed execution
+proof. A hit on a graphics filename's first byte may be a legitimate hint, but no
+available evidence proves which printed object owns the clicked glyph, so it stays
+a raw failure annotated graphics_filename_hint; that is neither an ownership
+result nor proof of a product bug. These evidence-backed reasons abstain and never
+count as precision. The first two only replace a file or scope failure, and only
+after the selected column survives the same wrong-word check as any other result:
+native_forward_location_contains_point (a sub-page native box of the exact line
+holds the point; ownership is unproven), active_include_native_box (the raw anchor
+is an active include of the resolved file and such a box holds the point; float
+provenance is unproven), coarse_bibliography_host_alias (a valid line within four
+lines of an active bibliography command; conditionals are not evaluated),
+printed_glyph_window_unverified_ownership (the column lies in one complete source
+token spelling the word; macro meaning is unproven) and
+extractor_component_selected_unverified_ownership (the column starts a literal
+token equal to the PDFium component of a composite word; occurrence is unproven).
 Failures exit 1; an enabled best-guess inverse run with no verified precision
 exits 2 (inconclusive). Disabled inverse probing and text-free pages are exempt.
 
@@ -25,18 +41,22 @@ import bisect
 import concurrent.futures
 import functools
 import gzip
+import hashlib
 import json
 import math
 import random
 import re
 import string
 import subprocess
+import shutil
 import struct
 import sys
 import unicodedata
 from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
+
+from replay_capture import CODE_SHA256 as CAPTURE_CODE_SHA256, ReplayCapture
 
 WordPoint = tuple[str, tuple[float, float, float, float], float]
 PDFTERM_BINARY = Path(
@@ -46,6 +66,23 @@ PDFTERM_BINARY = Path(
     )
 )
 BUILD_DIRECTORY: Path | None = None
+REPLAY_CAPTURE: ReplayCapture | None = None
+ORACLE_CODE_SHA256 = {
+    str(Path(__file__).resolve()): hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    str(Path(sys.modules[ReplayCapture.__module__].__file__).resolve()): CAPTURE_CODE_SHA256,
+}
+
+
+def validate_oracle_code() -> None:
+    for path, digest in ORACLE_CODE_SHA256.items():
+        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
+            raise RuntimeError(f"loaded oracle code changed on disk: {path}")
+
+
+def run_command(args, **kwargs):
+    if REPLAY_CAPTURE is not None:
+        return REPLAY_CAPTURE.run(args, **kwargs)
+    return subprocess.run(args, **kwargs)
 
 
 def usable_forward_record(record: dict[str, int | float]) -> bool:
@@ -64,7 +101,7 @@ def usable_forward_record(record: dict[str, int | float]) -> bool:
 
 
 def raw_forward_records(pdf: Path, source: Path, line: int, column: int = 1) -> list[dict]:
-    result = subprocess.run(
+    result = run_command(
         ["synctex", "view", "-i", f"{line}:{column}:{source}", "-o", str(pdf)],
         capture_output=True,
         text=True,
@@ -73,8 +110,12 @@ def raw_forward_records(pdf: Path, source: Path, line: int, column: int = 1) -> 
     )
     if result.returncode:
         raise RuntimeError(f"synctex view: {result.stderr.strip()[:200]}")
+    return parse_forward_records(result.stdout)
+
+
+def parse_forward_records(stdout: str) -> list[dict]:
     records, record = [], {}
-    for row in [*result.stdout.splitlines(), ""]:
+    for row in [*stdout.splitlines(), ""]:
         key, sep, value = row.strip().partition(":")
         if sep and key in {"Page", "h", "v", "W", "H"}:
             if key == "Page" and "Page" in record:
@@ -97,7 +138,7 @@ def raw_pages(pdf: Path, source: Path, line: int, column: int = 1) -> set[int]:
 
 
 def raw_inverse(pdf: Path, x: float, y: float, page: int) -> list[tuple[int, str]]:
-    result = subprocess.run(
+    result = run_command(
         ["synctex", "edit", "-o", f"{page}:{x}:{y}:{pdf}"],
         capture_output=True,
         text=True,
@@ -146,7 +187,7 @@ def source_line_text(text: str) -> str:
 
 
 def sample_source_positions(
-    source: str, rng: random.Random, count: int
+    source: str, rng: random.Random, count: int | None
 ) -> list[tuple[int, int]]:
     candidates = []
     for line, row in enumerate(source_lines(source), 1):
@@ -158,8 +199,11 @@ def sample_source_positions(
             for match in re.finditer(r"[A-Za-z]{6,}", row)
             if match.start() == 0 or row[match.start() - 1] != "\\"
         ]
-        candidates.append((line, rng.choice(words) if words else 1))
-    return sorted(rng.sample(candidates, min(count, len(candidates))))
+        if count is None:
+            candidates.extend((line, column) for column in sorted({1, *words}))
+        else:
+            candidates.append((line, rng.choice(words) if words else 1))
+    return sorted(candidates if count is None else rng.sample(candidates, min(count, len(candidates))))
 
 
 def normalized_words(value: str) -> list[str]:
@@ -197,7 +241,7 @@ def context_score(tokens: list[str], hint: dict) -> int | None:
 
 
 def pdf_visible_words(pdf: Path) -> list[list[str]]:
-    result = subprocess.run(
+    result = run_command(
         ["pdftotext", "-layout", str(pdf), "-"],
         capture_output=True,
         text=True,
@@ -259,6 +303,26 @@ def source_context_hint(text: str, line: int, column: int) -> dict | None:
     return None
 
 
+def forward_response_valid(got: dict, pdf: Path, page_count: int) -> bool:
+    """Check one view response's echoed PDF, page range and finite non-empty box."""
+    page = got["page"]
+    h, v, width, height = got["h"], got["v"], got["width"], got["height"]
+    return (
+        got["pdf"] == str(pdf)
+        and type(page) is int
+        and 1 <= page <= page_count
+        and all(
+            isinstance(val, (int, float))
+            and not isinstance(val, bool)
+            and math.isfinite(val)
+            for val in (h, v, width, height, h + width, v - height)
+        )
+        and width >= 0
+        and height >= 0
+        and (width > 0 or height > 0)
+    )
+
+
 def forward(
     pdf: Path,
     source: Path,
@@ -290,6 +354,7 @@ def forward(
                 "direction": "forward",
                 "line": line,
                 "ok": False,
+                "transport_error": True,
                 "error": str(error),
             }
             continue
@@ -315,7 +380,7 @@ def forward(
                             else:
                                 break
         try:
-            result = subprocess.run(
+            result = run_command(
                 [
                     str(pdfterm_bin()),
                     str(pdf),
@@ -338,6 +403,7 @@ def forward(
                 "line": line,
                 "column": column,
                 "ok": False,
+                "transport_error": True,
                 "error": str(error),
             }
             continue
@@ -357,27 +423,13 @@ def forward(
         try:
             got = json.loads(result.stdout)
             page = got["page"]
-            h, v, width, height = got["h"], got["v"], got["width"], got["height"]
-            valid = (
-                got["pdf"] == str(pdf)
-                and type(page) is int
-                and 1 <= page <= page_count
-                and (not expected or page in expected)
-                and all(
-                    isinstance(val, (int, float))
-                    and not isinstance(val, bool)
-                    and math.isfinite(val)
-                    for val in (h, v, width, height, h + width, v - height)
-                )
-                and width >= 0
-                and height >= 0
-                and (width > 0 or height > 0)
-            )
+            valid = forward_response_valid(got, pdf, page_count) and (not expected or page in expected)
         except (ValueError, KeyError, TypeError) as error:
             yield {
                 "direction": "forward",
                 "line": line,
                 "ok": False,
+                "transport_error": True,
                 "error": str(error),
             }
             continue
@@ -618,7 +670,7 @@ NONPRINTING_KEYS = REFERENCE_COMMANDS | {
 
 
 @functools.lru_cache(maxsize=32)
-def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
+def nonprinting_ranges(text: str, theorem_names: frozenset[str] = frozenset()) -> list[tuple[int, int]]:
     definitions = {
         "newcommand", "renewcommand", "providecommand", "DeclareRobustCommand",
         "DeclareMathOperator", "pgfmathsetmacro", "pgfmathtruncatemacro",
@@ -732,7 +784,8 @@ def nonprinting_ranges(text: str) -> list[tuple[int, int]]:
                         at = over
                     if env in {"tabularx", "tabular*"} and (w_end := tex_group_end(text, at)) is not None:
                         at = w_end
-                    if (opt_end := tex_group_end(text, at, "[")) is not None:
+                    # Only declared theorem environments have conventional printed optional headings.
+                    if env not in theorem_names and (opt_end := tex_group_end(text, at, "[")) is not None:
                         at = opt_end
                     if env in {"tabularx", "tabular*", "tabular", "array"}:
                         at = tex_group_end(text, at) or at
@@ -892,6 +945,61 @@ def _environment_ranges(text: str, environment: str) -> tuple[tuple[int, int], .
                     ranges.append((index, index + 1))
         line_offset += len(raw_row)
     return tuple(ranges)
+
+
+def active_tokens(text: str) -> Iterator[re.Match]:
+    """Yield control and math-shift tokens outside comments, definitions, verbatim and quoting."""
+    hidden = _nonprinting_index(text)
+    skip_until = 0
+    for token in re.finditer(r"\\([A-Za-z@]+|.)|\$\$?", text, re.DOTALL):
+        if token.start() < skip_until or _range_contains(hidden, token.start()):
+            continue
+        if token[1] is None:
+            yield token
+            continue
+        at = token.end()
+        if (opaque := opaque_command_end(text, token[1], at)) is not None:
+            skip_until = opaque[0]
+            continue
+        if token[1] in {"string", "noexpand", "meaning"}:
+            space_end = tex_space_end(text, at)
+            # A blank physical line supplies the quoted \par, not the following command.
+            if (paragraph := re.search(r"\n[ \t\r]*\n", text[at:space_end])) is not None:
+                skip_until = at + paragraph.end()
+                continue
+            at = space_end
+            if (quoted := re.match(r"\\[A-Za-z@]+|\\.|.", text[at:], re.DOTALL)) is not None:
+                skip_until = at + quoted.end()
+            continue
+        if token[1] == "detokenize" and (end := tex_group_end(text, at)) is not None:
+            skip_until = end
+            continue
+        yield token
+
+
+@functools.lru_cache(maxsize=32)
+def _display_delimiter_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    ranges, opening = [], None
+    closers = {"$": "$", "$$": "$$", "\\(": "\\)", "\\[": "\\]"}
+    for token in active_tokens(text):
+        if opening is None:
+            if token[0] in closers:
+                opening = token
+        elif token[0] == closers[opening[0]]:
+            if opening[0] in {"\\[", "$$"}:
+                ranges.append((text.count("\n", 0, opening.start()), text.count("\n", 0, token.start())))
+            opening = None
+    return tuple(ranges)
+
+
+def display_delimiter_bounds(text: str, line_number: int) -> tuple[int, int] | None:
+    """Delimited displays anchor on their closing line, as display environments do."""
+    anchor = line_number - 1
+    ranges = _display_delimiter_ranges(text)
+    index = bisect.bisect_right(ranges, (anchor, math.inf)) - 1
+    if index >= 0 and anchor <= ranges[index][1]:
+        return ranges[index]
+    return None
 
 
 def environment_bounds(text: str, line_number: int, environment: str) -> tuple[int, int] | None:
@@ -1119,11 +1227,262 @@ def math_expansion_at(text: str, position: int) -> bool:
     return _range_contains(display, text.count("\n", 0, position) + 1)
 
 
+def reference_argument_anchor_at(text: str, position: int, word: str) -> bool:
+    """Recognize the first non-space/comment label byte inside direct reference braces."""
+    needle = normalized_words(word)
+    if not needle:
+        return False
+    for command in re.finditer(r"\\(ref|eqref|pageref|autoref|cref|Cref)(?![A-Za-z@])", text):
+        at = command.end()
+        if at < len(text) and text[at] in "*+":
+            at += 1
+        while (end := tex_group_end(text, at, "[") or overlay_end(text, at)) is not None:
+            at = end
+        body = tex_space_end(text, at)
+        end = tex_group_end(text, body)
+        if end is None or not (body < position < end - 1):
+            continue
+        label_start = tex_space_end(text, body + 1)
+        if position != label_start or label_start >= end - 1:
+            return False
+        raw_body = re.sub(r"%[^\n]*", "", text[label_start : end - 1])
+        if any(ch in raw_body for ch in "\\{}#") or any(not item.strip() for item in raw_body.split(",")):
+            return False
+        key_items = {item.strip().lower() for item in raw_body.split(",") if item.strip()}
+        key_words = {
+            norm[0]
+            for item in key_items
+            if len(norm := normalized_words(item)) == 1
+        }
+        raw_token = word.strip().lower()
+        norm_token = needle[0]
+        return norm_token.isdigit() or (raw_token not in key_items and norm_token not in key_words)
+    return False
+
+
+GRAPHICS_COMMAND_RE = re.compile(r"\\(includegraphics|includesvg)(?![A-Za-z@])[*+]?")
+NATIVE_BOX_MAX_PAGE_HEIGHT_FRACTION = 0.25
+BIBLIOGRAPHY_COMMANDS = {"bibliography", "printbibliography", "nobibliography", "putbib", "bibbysection"}
+BIBLIOGRAPHY_HOST_LINE_DISTANCE = 4
+PRINTED_REMOVED_RE = re.compile(r"\\\(|\\\)|\\\[|\\\]|\$+|[_^{}]|%[^\n]*\n")
+PRINTED_SEPARATOR_RE = re.compile(r"\s+|~|\\[,;:!> ]")
+PRINTED_CONTROL_RE = re.compile(r"\\(?:[A-Za-z@]+|.)", re.DOTALL)
+UNIQUE_LITERAL = "unique_lexical_literal"
+PRINTED_GLYPH_FOLD = str.maketrans({
+    "∗": "*", "−": "-", "–": "-", "—": "-", "‐": "-",
+    "’": None, "‘": None, "“": None, "”": None, "'": None, "`": None,
+})
+
+
+def graphics_filename_argument_at(text: str, position: int, theorem_names: frozenset[str] = frozenset()) -> tuple[str, str] | None:
+    """Return (command, literal filename) when position is an active filename's first byte."""
+    for lo, hi in nonprinting_ranges(text, theorem_names):
+        if not lo <= position < hi:
+            continue
+        command = GRAPHICS_COMMAND_RE.match(text, lo, hi)
+        if command is None:
+            continue
+        at = command.end()
+        while (end := tex_group_end(text, at, "[") or overlay_end(text, at)) is not None:
+            at = end
+        body = tex_space_end(text, at)
+        end = tex_group_end(text, body)
+        if end is None or position != tex_space_end(text, body + 1):
+            return None
+        name = re.sub(r"%[^\n]*", "", text[position:end - 1]).strip()
+        return (command[1], name) if name and "\\" not in name else None
+    return None
+
+
+def native_box_at_point(pdf: Path, path: Path, line: int, point: dict) -> dict | None:
+    """Return a same-page native box of this exact line that holds the point, excluding containers."""
+    for record in raw_forward_records(pdf, path, line):
+        if (
+            record["Page"] == point["page"]
+            and record["H"] <= NATIVE_BOX_MAX_PAGE_HEIGHT_FRACTION * point["page_height"]
+            and record["h"] <= point["x"] <= record["h"] + record["W"]
+            and record["v"] - record["H"] <= point["y"] <= record["v"]
+        ):
+            return record
+    return None
+
+
+def active_include_lines(text: str, host: Path, target: Path, build_dir: Path | None = None) -> list[int]:
+    """Return host lines whose active braced input or include names the target file."""
+    lines = []
+    for command in active_tokens(text):
+        if command[1] not in {"input", "include"}:
+            continue
+        body = tex_space_end(text, command.end())
+        end = tex_group_end(text, body)
+        if end is None:
+            continue
+        name = text[body + 1:end - 1].strip()
+        for base in filter(None, (host.parent, build_dir)):
+            if target in {(base / name).resolve(), (base / f"{name}.tex").resolve()}:
+                lines.append(text.count("\n", 0, command.start()) + 1)
+                break
+    return lines
+
+
 @functools.lru_cache(maxsize=32)
-def lexical_words(text: str) -> tuple[dict[str, list[tuple[int, int]]], list[tuple[int, int]], set[str], list[tuple[int, int]]]:
+def _bibliography_command_lines(text: str) -> tuple[int, ...]:
+    return tuple(
+        text.count("\n", 0, command.start()) + 1
+        for command in active_tokens(text)
+        if command[1] in BIBLIOGRAPHY_COMMANDS
+    )
+
+
+def bibliography_host_near(text: str, line: int) -> bool:
+    """Is this valid host line near an active bibliography command?"""
+    return 1 <= line <= len(source_lines(text)) and any(
+        abs(command_line - line) <= BIBLIOGRAPHY_HOST_LINE_DISTANCE
+        for command_line in _bibliography_command_lines(text)
+    )
+
+
+def fold_printed(value: str) -> str:
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", value).translate(PRINTED_GLYPH_FOLD))
+    return "".join(char for char in folded if not char.isspace()).casefold()
+
+
+def printed_window_occurrences(text: str, position: int, word: str, radius: int = 240) -> int | None:
+    """Count nearby complete literal spellings of word when one has a glyph at position.
+
+    Only math delimiters, scripts, grouping and line-joining comments are removed.
+    Visible spacing separates words. Each other control sequence is one unmatchable
+    token, so neither its name nor its expansion can spell a printed word. A spelling
+    touching a window edge inside the source has an unproven boundary and never counts.
+    """
+    needle = re.sub(r"^\W+|\W+$", "", re.sub(r"-+", "-", fold_printed(word)))
+    if not needle or (position > 0 and text[position - 1].isalnum()):
+        return None
+    chars, offsets = [], []
+    lo, stop = max(0, position - radius), min(len(text), position + radius)
+    if lo > 0:
+        # A window opening inside a comment must not read that comment's text as glyphs.
+        before = text[text.rfind("\n", 0, lo) + 1:lo]
+        if source_line_text(before) != before:
+            lo = text.find("\n", lo, position) + 1 or lo
+    at = lo
+    while at < stop:
+        if (removed := PRINTED_REMOVED_RE.match(text, at, stop)) is not None:
+            at = removed.end()
+            continue
+        if (separator := PRINTED_SEPARATOR_RE.match(text, at, stop)) is not None:
+            chars.append(" ")
+            offsets.append(at)
+            at = separator.end()
+            continue
+        if (control := PRINTED_CONTROL_RE.match(text, at, stop)) is not None:
+            chars.append("\0")
+            offsets.append(at)
+            at = control.end()
+            continue
+        if text[at] in "%\\":
+            # This comment or control sequence extends past the window, so no glyph follows here.
+            break
+        for char in fold_printed(text[at]):
+            if char != "-" or not chars or chars[-1] != "-":
+                chars.append(char)
+                offsets.append(at)
+        at += 1
+    stream = "".join(chars)
+    found, total, at = False, 0, 0
+    while (at := stream.find(needle, at)) >= 0:
+        end = at + len(needle)
+        starts_complete = not stream[at - 1].isalnum() if at > 0 else lo == 0
+        ends_complete = not stream[end].isalnum() if end < len(stream) else stop == len(text)
+        if starts_complete and ends_complete:
+            total += 1
+            found = found or position in offsets[at:end]
+        at += 1
+    return total if found else None
+
+
+def extractor_component_selected(literals: dict[str, list[tuple[int, int]]], position: int, needle: list[str], pdf_word: str | None) -> bool:
+    """A composite PyMuPDF word may hit one PDFium component whose literal token starts at the column."""
+    chosen = normalized_words(pdf_word or "")
+    return (
+        len(chosen) == 1 and chosen[0] in needle
+        and any(lo == position for lo, _ in literals.get(chosen[0], []))
+    )
+
+
+def anchor_scope_bounds(text: str, line: int) -> tuple[int, int] | None:
+    """The zero-based source range that a compiler anchor on this line may cover."""
+    return (
+        caption_bounds(text, line)
+        or collected_env_bounds(text, line)
+        or display_delimiter_bounds(text, line)
+        or environment_bounds(text, line, "tikzpicture")
+    )
+
+
+def selected_column_verdict(
+    text: str, position: int, word: str, pdf_word: str | None, warning: str,
+    scope: tuple[int, int], theorem_names: frozenset[str] = frozenset(),
+) -> str | None:
+    """Return an abstention reason or UNIQUE_LITERAL, or None for a wrong word or column."""
+    literals, uncertain, opaque_words, _ = lexical_words(text, theorem_names)
+    needle = normalized_words(word)
+    occurrences = literals.get(needle[0], []) if len(needle) == 1 else []
+    opaque_word = len(needle) == 1 and needle[0] in opaque_words
+    unknown_scope = any(scope[0] <= lo < scope[1] for lo, _ in uncertain)
+    if unknown_scope or any(lo <= position < hi for lo, hi in uncertain) or opaque_word:
+        return "unverified_execution_ownership"
+    if reference_argument_anchor_at(text, position, word):
+        # Abstain on valid reference-argument anchors even when the rendered word also appears literally.
+        return "precision_not_literal_math_or_expansion"
+    if len(occurrences) > 1:
+        return "ambiguous_repeated_occurrence"
+    if len(occurrences) == 1 and occurrences[0][0] == position:
+        if warning:
+            return "resolver_warning"
+        if not pdf_word:
+            return "pdfium_selected_no_word"
+        return UNIQUE_LITERAL if normalized_words(pdf_word) == needle else "pdfium_word_mismatch"
+    if not occurrences and (
+        math_expansion_at(text, position)
+        or (
+            (command := re.compile(r"\\([A-Za-z@]+)").match(text, position))
+            and command[1] in MATH_COMMANDS | REFERENCE_COMMANDS
+        )
+    ):
+        # Actual math/reference expansion is evidence; a wrong plain word is not.
+        return "precision_not_literal_math_or_expansion"
+    if not occurrences and (windows := printed_window_occurrences(text, position, word)):
+        return "ambiguous_repeated_occurrence" if windows > 1 else "printed_glyph_window_unverified_ownership"
+    if len(needle) > 1 and extractor_component_selected(literals, position, needle, pdf_word):
+        return "extractor_component_selected_unverified_ownership"
+    return None
+
+
+@functools.lru_cache(maxsize=32)
+def declared_theorem_names(text: str) -> frozenset[str]:
+    if "\\newtheorem" not in text:
+        return frozenset()
+    names = set()
+    for command in active_tokens(text):
+        if command[1] != "newtheorem":
+            continue
+        at = command.end()
+        if at < len(text) and text[at] == "*":
+            at += 1
+        at = tex_space_end(text, at)
+        if (end := tex_group_end(text, at)) is not None:
+            name = text[at + 1:end - 1].strip()
+            if re.fullmatch(r"[A-Za-z@][A-Za-z0-9@*:-]*", name):
+                names.add(name)
+    return frozenset(names)
+
+
+@functools.lru_cache(maxsize=32)
+def lexical_words(text: str, theorem_names: frozenset[str] = frozenset()) -> tuple[dict[str, list[tuple[int, int]]], list[tuple[int, int]], set[str], list[tuple[int, int]]]:
     """Index literal spellings; unknown macro arguments remain unverified."""
-    hidden = nonprinting_ranges(text)
-    hidden_index = _nonprinting_index(text)
+    hidden = nonprinting_ranges(text, theorem_names)
+    hidden_index = _merged_ranges(hidden)
     uncertain = []
     opaque = [
         (lo, hi) for lo, hi in hidden
@@ -1174,6 +1533,38 @@ def lexical_words(text: str) -> tuple[dict[str, list[tuple[int, int]]], list[tup
     return dict(words), uncertain + opaque, opaque_words, known_nonprinting
 
 
+def parse_batch_rows(stdout: str, count: int) -> list[dict]:
+    rows = []
+    for line in stdout.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"invalid batch JSON: {error}: {line[:200]}") from error
+        if not isinstance(rows[-1], dict) or type(rows[-1].get("ok")) is not bool:
+            raise RuntimeError("batch response must be an object with a boolean ok field")
+    if len(rows) != count:
+        raise RuntimeError(f"batch returned {len(rows)} results for {count} points")
+    return rows
+
+
+def batch_identity_error(batch: dict, point: dict, require_echo: bool = False) -> str | None:
+    """Reject a response echoing another point; require_echo also rejects one echoing none."""
+    if require_echo and not ({"page", "x", "y"} <= set(batch) if batch["ok"] else "input" in batch):
+        return "batch response does not echo the submitted point"
+    if any(key in batch and not same_point_value(key, batch[key], point[key]) for key in ("page", "x", "y")):
+        return "batch response point identity differs from the submitted point"
+    if "input" in batch:
+        try:
+            echoed = json.loads(batch["input"])
+        except (TypeError, ValueError):
+            echoed = None
+        if not isinstance(echoed, dict) or set(echoed) != {"page", "x", "y"} or any(
+            not same_point_value(key, echoed[key], point[key]) for key in ("page", "x", "y")
+        ):
+            return "batch error input differs from the submitted point"
+    return None
+
+
 def inverse(
     pdf: Path,
     source: Path,
@@ -1190,7 +1581,7 @@ def inverse(
     if not points:
         return
     extra = ["--synctex-best-guess"] if best_guess else []
-    result = subprocess.run(
+    result = run_command(
         [str(pdfterm_bin()), str(pdf), "--synctex-edit-batch", *extra],
         input="".join(json.dumps({key: point[key] for key in ("page", "x", "y")}) + "\n" for point in points),
         capture_output=True,
@@ -1200,16 +1591,7 @@ def inverse(
     )
     if result.returncode:
         raise RuntimeError(f"pdfterm --synctex-edit-batch exited {result.returncode}: {result.stderr.strip()[:500]}")
-    rows = []
-    for line in result.stdout.splitlines():
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"invalid batch JSON: {error}: {line[:200]}") from error
-        if not isinstance(rows[-1], dict) or type(rows[-1].get("ok")) is not bool:
-            raise RuntimeError("batch response must be an object with a boolean ok field")
-    if len(rows) != len(points):
-        raise RuntimeError(f"batch returned {len(rows)} results for {len(points)} points")
+    rows = parse_batch_rows(result.stdout, len(points))
     source_map = read_source_map(pdf)
     known_inputs = set(source_map["inputs"].values())
     sources = {}
@@ -1230,6 +1612,19 @@ def inverse(
                 metadata_spans(text),
             )
         return sources[path]
+
+    theorem_names = recorded_theorem_names(source_map)
+
+    def active_include_native_box(point: dict, candidates: list, resolved_file: Path, resolved_line: int) -> dict | None:
+        """A raw anchor on an active include of the resolved file, and that line's native box at the point."""
+        for cand in candidates:
+            host, anchor, generated = cand[1], cand[2], cand[5]
+            if generated or host == resolved_file or is_compiler_sidecar_or_graphics(host):
+                continue
+            if anchor in active_include_lines(source_info(host)[0], host, resolved_file, source_map.get("build_dir")):
+                record = native_box_at_point(pdf, resolved_file, resolved_line, point)
+                return {"include_host": {"file": str(host), "line": anchor}, "native_forward_box": record} if record else None
+        return None
 
     @functools.lru_cache(maxsize=32)
     def candidate_anchor(page: int, raw: tuple[int, str]):
@@ -1272,12 +1667,7 @@ def inverse(
                         expected_file, expected_anchor = original, origin[1]
                         bounds, remapped = original_bounds, True
         else:
-            raw_text = source_info(expected_file)[0]
-            bounds = (
-                caption_bounds(raw_text, raw[0])
-                or collected_env_bounds(raw_text, raw[0])
-                or environment_bounds(raw_text, raw[0], "tikzpicture")
-            )
+            bounds = anchor_scope_bounds(source_info(expected_file)[0], raw[0])
         return raw, expected_file, expected_anchor, bounds, remapped, generated
 
     @functools.lru_cache(maxsize=32)
@@ -1327,23 +1717,14 @@ def inverse(
             "warning": batch.get("warning"),
             "ok": False,
         }
-        if any(key in batch and not same_point_value(key, batch[key], point[key]) for key in ("page", "x", "y")):
-            entry["error"] = "batch response point identity differs from the submitted point"
+        if (identity_error := batch_identity_error(batch, point)) is not None:
+            entry["transport_error"] = True
+            entry["error"] = identity_error
             yield entry
             continue
-        if "input" in batch:
-            try:
-                echoed = json.loads(batch["input"])
-            except (TypeError, ValueError):
-                echoed = None
-            if not isinstance(echoed, dict) or set(echoed) != {"page", "x", "y"} or any(
-                not same_point_value(key, echoed[key], point[key]) for key in ("page", "x", "y")
-            ):
-                entry["error"] = "batch error input differs from the submitted point"
-                yield entry
-                continue
         # Warnings/coarse results do not exempt file, line or remap identity.
         if raw_error is not None:
+            entry["transport_error"] = True
             entry["error"] = f"raw SyncTeX edit failed: {raw_error}"
             yield entry
             continue
@@ -1411,7 +1792,15 @@ def inverse(
                 and resolved_line == raw[0]
             )
             if not any(resolved_file == cand[1] and resolved_line == cand[2] for cand in candidates) and not unremapped_pdf_tex_ok:
-                entry["error"] = "coarse inverse result changed the source file or page-proven anchor"
+                if (
+                    generated and raw_path.suffix == ".bbl" and resolved_file in known_inputs
+                    and not is_compiler_sidecar_or_graphics(resolved_file)
+                    and bibliography_host_near(source_info(resolved_file)[0], resolved_line)
+                ):
+                    # Host alias only: no sheet origin proves which bibliography line was clicked.
+                    entry.update(abstained=True, reason="coarse_bibliography_host_alias")
+                else:
+                    entry["error"] = "coarse inverse result changed the source file or page-proven anchor"
                 yield entry
                 continue
             entry["mapping_ok"] = True
@@ -1446,9 +1835,12 @@ def inverse(
             yield entry
             continue
         absolute_column = starts[resolved_line - 1] + len(prefix)
-        literals, uncertain, opaque_words, known_nonprinting = lexical_words(resolved_text)
-        if any(start <= absolute_column < end for start, end in known_nonprinting):
+        known_nonprinting = lexical_words(resolved_text, theorem_names)[3]
+        ref_arg_anchor = reference_argument_anchor_at(resolved_text, absolute_column, word)
+        if any(start <= absolute_column < end for start, end in known_nonprinting) and not ref_arg_anchor:
             entry["error"] = "precise inverse result selected a known nonprinting argument or definition"
+            if (graphic := graphics_filename_argument_at(resolved_text, absolute_column, theorem_names)) is not None:
+                entry["graphics_filename_hint"] = {"command": graphic[0], "argument": graphic[1]}
             yield entry
             continue
         pdf_word = batch.get("pdf_word")
@@ -1466,61 +1858,52 @@ def inverse(
                 )
             )
         )
+        # Native or include evidence can only replace a mapping failure, after the column check below.
+        mapping_evidence = None
         if resolved_file not in {cand[1] for cand in candidates}:
-            entry["error"] = "inverse result changed the page-proven source file"
-            yield entry
-            continue
-        in_scope = any(
+            if (alias := active_include_native_box(point, candidates, resolved_file, resolved_line)) is None:
+                entry["error"] = "inverse result changed the page-proven source file"
+                yield entry
+                continue
+            mapping_evidence = "active_include_native_box"
+            entry["alias_evidence"] = alias
+        elif not metadata and not any(
             resolved_file == cand[1] and (
                 cand[3][0] + 1 <= resolved_line <= cand[3][1] + 1
                 if cand[3] else abs(resolved_line - cand[2]) <= 4
             )
             for cand in candidates
-        )
-        if not metadata and not in_scope:
-            entry["error"] = "inverse result escaped the page-proven source scope"
-            yield entry
-            continue
-        entry["mapping_ok"] = True
+        ):
+            if (native_box := native_box_at_point(pdf, resolved_file, resolved_line, point)) is None:
+                entry["error"] = "inverse result escaped the page-proven source scope"
+                yield entry
+                continue
+            mapping_evidence = "native_forward_location_contains_point"
+            entry["native_forward_box"] = native_box
+        else:
+            entry["mapping_ok"] = True
         scopes = {(cand[1], cand[3] or (cand[2], cand[2])) for cand in candidates}
-        if len(scopes) > 1:
+        if mapping_evidence is None and len(scopes) > 1:
             entry.update(abstained=True, reason="ambiguous_compiler_ownership")
         else:
-            needle = normalized_words(word)
-            occurrences = literals.get(needle[0], []) if len(needle) == 1 else []
-            opaque_word = len(needle) == 1 and needle[0] in opaque_words
-            scope_first, scope_last = bounds or (max(0, expected_anchor - 5), min(len(resolved_lines) - 1, expected_anchor + 3))
-            scope_lo = starts[scope_first]
-            scope_hi = starts[scope_last] + len(resolved_lines[scope_last])
-            unknown_scope = any(scope_lo <= lo < scope_hi for lo, _ in uncertain)
-            if unknown_scope or any(lo <= absolute_column < hi for lo, hi in uncertain) or opaque_word:
-                entry.update(abstained=True, reason="unverified_execution_ownership")
-            elif len(occurrences) > 1:
-                entry.update(abstained=True, reason="ambiguous_repeated_occurrence")
-            elif len(occurrences) == 1 and occurrences[0][0] == absolute_column:
-                if warning:
-                    entry.update(abstained=True, reason="resolver_warning")
-                elif not pdf_word:
-                    entry.update(abstained=True, reason="pdfium_selected_no_word")
-                elif normalized_words(pdf_word) != needle:
-                    entry.update(abstained=True, reason="pdfium_word_mismatch")
-                else:
-                    entry.update(
-                        ok=True, precision_checked=True,
-                        match="document_metadata" if metadata else "literal_frame_word" if bounds else "literal_source",
-                        ownership="unique_lexical_literal_not_execution_trace",
-                    )
-            elif not occurrences and (
-                math_expansion_at(resolved_text, absolute_column)
-                or (
-                    (command := re.match(r"\\([A-Za-z@]+)", resolved_row[len(prefix):]))
-                    and command[1] in MATH_COMMANDS | REFERENCE_COMMANDS
-                )
-            ):
-                # Actual math/reference expansion is evidence; a wrong plain word is not.
-                entry.update(abstained=True, reason="precision_not_literal_math_or_expansion")
+            if mapping_evidence is None:
+                scope_first, scope_last = bounds or (max(0, expected_anchor - 5), min(len(resolved_lines) - 1, expected_anchor + 3))
             else:
+                scope_first, scope_last = max(0, resolved_line - 5), min(len(resolved_lines) - 1, resolved_line + 3)
+            scope = (starts[scope_first], starts[scope_last] + len(resolved_lines[scope_last]))
+            verdict = selected_column_verdict(resolved_text, absolute_column, word, pdf_word, warning, scope, theorem_names)
+            if verdict is None:
                 entry["error"] = "precise inverse column does not select the PDF word"
+            elif mapping_evidence is not None:
+                entry.update(abstained=True, reason=mapping_evidence, column_reason=verdict)
+            elif verdict == UNIQUE_LITERAL:
+                entry.update(
+                    ok=True, precision_checked=True,
+                    match="document_metadata" if metadata else "literal_frame_word" if bounds else "literal_source",
+                    ownership="unique_lexical_literal_not_execution_trace",
+                )
+            else:
+                entry.update(abstained=True, reason=verdict)
         yield entry
 
 
@@ -1623,7 +2006,7 @@ def painted_word_points(
 
 
 def pdf_page_count(pdf: Path) -> int:
-    result = subprocess.run(
+    result = run_command(
         ["pdfinfo", str(pdf)], capture_output=True, text=True, errors="replace", timeout=30, check=False
     )
     if result.returncode:
@@ -1655,8 +2038,61 @@ def validate_sources(pdf: Path, companion: Path, source_map: dict, source: Path,
             raise RuntimeError(f"PDF/SyncTeX pair predates compiler source {path}; rebuild or pass --allow-stale")
 
 
+def replay_identity(args, pdf: Path, companion: Path, source_map: dict, source: Path) -> dict:
+    paths = {pdf, companion, source, pdfterm_bin(), *source_map["inputs"].values(), pdf.with_suffix(".fls")}
+    for tool in ("synctex", "pdfinfo", "pdftotext"):
+        executable = shutil.which(tool)
+        if executable is None:
+            raise RuntimeError(f"missing replay prerequisite: {tool}")
+        paths.add(Path(executable).resolve())
+    files = {}
+    for path in sorted(paths):
+        if not path.exists():
+            files[str(path)] = {"missing": True}
+            continue
+        before = path.stat()
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = path.stat()
+        if any(getattr(before, key) != getattr(after, key) for key in (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns",
+        )):
+            raise RuntimeError(f"replay input changed while hashing: {path}")
+        files[str(path)] = {
+            "sha256": digest, "size": after.st_size, "mtime_ns": after.st_mtime_ns,
+            "ctime_ns": after.st_ctime_ns,
+            "device": after.st_dev, "inode": after.st_ino,
+            "mode": after.st_mode,
+        }
+    pymupdf_version = None
+    if args.pages != 0 or args.page:
+        try:
+            import pymupdf
+        except ImportError as error:
+            raise RuntimeError("inverse word probes require PyMuPDF in the Python environment") from error
+        pymupdf_version = list(pymupdf.version)
+    return {
+        "files": files, "source": str(source), "build_dir": str(BUILD_DIRECTORY),
+        "pymupdf_version": pymupdf_version,
+        "seed": args.seed, "lines": args.lines, "pages": args.pages, "words": args.words,
+        "page": args.page, "best_guess": args.best_guess, "allow_stale": args.allow_stale,
+        "full": args.full, "preflight": args.preflight,
+    }
+
+
+def recorded_theorem_names(source_map: dict) -> frozenset[str]:
+    # Fail on unreadable inputs before starting any expensive consumer replay.
+    # Declaration syntax is ASCII; surrogateescape preserves other package bytes.
+    return frozenset(
+        name
+        for path in set(source_map["inputs"].values())
+        if not is_compiler_sidecar_or_graphics(path)
+        for name in declared_theorem_names(path.read_bytes().decode("ascii", "surrogateescape"))
+    )
+
+
 def main() -> None:
-    global PDFTERM_BINARY, BUILD_DIRECTORY
+    global PDFTERM_BINARY, BUILD_DIRECTORY, REPLAY_CAPTURE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path)
     parser.add_argument("--binary", type=Path, default=PDFTERM_BINARY, help="pdfterm executable to probe")
@@ -1674,11 +2110,33 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260922)
     parser.add_argument("--allow-stale", action="store_true", help="accept an older PDF/SyncTeX pair")
     parser.add_argument("--best-guess", action="store_true", help="pass --synctex-best-guess to pdfterm")
+    stage = parser.add_mutually_exclusive_group()
+    stage.add_argument("--preflight", action="store_true", help="quick real-input check: 8 source lines, 1 inverse page, 8 words")
+    stage.add_argument("--full", action="store_true", help="all eligible source positions and PDF words; requires capture/replay and reviewed binary SHA")
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--capture", type=Path, help="new private directory for durable raw command responses")
+    transport.add_argument("--replay", type=Path, help="reclassify a complete matching capture without external producer processes")
+    parser.add_argument("--reviewed-binary-sha256", help="explicit attestation of the reviewed consumer binary, required for --full")
     args = parser.parse_args()
     PDFTERM_BINARY = args.binary.resolve()
     BUILD_DIRECTORY = args.build_dir.resolve() if args.build_dir else None
+    REPLAY_CAPTURE = None
+    if args.full:
+        if not (args.capture or args.replay) or not args.reviewed_binary_sha256:
+            parser.error("--full requires --capture or --replay and --reviewed-binary-sha256")
+        if args.pages is not None or args.page is not None or args.words or args.lines != 100:
+            parser.error("--full cannot combine with sampling caps")
+        args.lines = None
+        with pdfterm_bin().open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if digest != args.reviewed_binary_sha256:
+            parser.error("reviewed binary SHA does not match the current executable")
+    elif args.preflight:
+        if args.page is not None:
+            parser.error("--preflight cannot combine with --page")
+        args.lines, args.pages, args.words = 8, 1, 8
     if (
-        min(args.lines, args.words) < 0
+        args.words < 0 or (args.lines is not None and args.lines < 0)
         or (args.pages is not None and args.pages < 0)
         or (args.page is not None and (args.pages is not None or min(args.page) < 1 or len(set(args.page)) != len(args.page)))
     ):
@@ -1698,9 +2156,21 @@ def main() -> None:
     try:
         source_map = read_source_map(pdf)
         source_file = (args.source or source_map["inputs"][1]).resolve()
+        identity = replay_identity(args, pdf, companion, source_map, source_file) if args.capture or args.replay else None
+        if args.full and identity["files"][str(pdfterm_bin())]["sha256"] != args.reviewed_binary_sha256:
+            raise RuntimeError("reviewed binary changed before the input freeze")
         validate_sources(pdf, companion, source_map, source_file, args.allow_stale)
         with source_file.open(newline="") as stream:
             source = stream.read()
+        recorded_theorem_names(source_map)
+        validate_oracle_code()
+        if identity is not None and (
+            read_source_map(pdf) != source_map
+            or replay_identity(args, pdf, companion, source_map, source_file) != identity
+        ):
+            raise RuntimeError("replay inputs changed during initialization")
+        if identity is not None:
+            REPLAY_CAPTURE = ReplayCapture(args.capture or args.replay, identity, replay=bool(args.replay))
     except (OSError, RuntimeError, UnicodeError) as error:
         raise SystemExit(str(error)) from error
 
@@ -1715,6 +2185,17 @@ def main() -> None:
     visible_words = pdf_visible_words(pdf) if forward_positions else []
     if visible_words and len(visible_words) != page_count:
         raise SystemExit("pdftotext page count differs from pdfinfo")
+    preflight = None
+    if args.full:
+        quick_points = {page: words[:8] for page, words in list(word_points.items())[:1]}
+        quick = list(forward(pdf, source_file, source, forward_positions[:2], page_count, visible_words, args.best_guess, source_map))
+        if any(row.get("transport_error") for row in quick):
+            raise RuntimeError("forward preflight transport failed; full replay was not started")
+        quick.extend(inverse(pdf, source_file, quick_points, args.best_guess))
+        if any(row.get("transport_error") for row in quick):
+            raise RuntimeError("inverse preflight transport failed; full replay was not started")
+        preflight = {"probes": len(quick), "failures": sum(not row["ok"] and not row.get("abstained") for row in quick)}
+        # Diagnostic failures remain failures; preflight certifies execution, not ownership.
 
     results = list(forward(pdf, source_file, source, forward_positions, page_count, visible_words, args.best_guess, source_map))
     batch_error = None
@@ -1751,16 +2232,34 @@ def main() -> None:
     ]
     failures += len(missing_controls)
     inconclusive = bool(args.best_guess and inverse_coverage["selected"] and not inverse_coverage["checked"] and not failures)
+    transport_failed = bool(batch_error) or any(row.get("transport_error") for row in results)
+    capture_complete = False
+    if REPLAY_CAPTURE is not None:
+        validate_oracle_code()
+        if (
+            read_source_map(pdf) != source_map
+            or replay_identity(args, pdf, companion, source_map, source_file) != identity
+        ):
+            raise RuntimeError("frozen replay inputs or oracle changed during the run; capture remains incomplete")
+        if not transport_failed:
+            REPLAY_CAPTURE.finish()
+            capture_complete = True
     print(json.dumps({
         "pdf": str(pdf),
         "source": str(source_file),
+        "stage": "full" if args.full else "preflight" if args.preflight else "focused",
+        "preflight": preflight,
+        "oracle_sha256": ORACLE_CODE_SHA256[str(Path(__file__).resolve())],
+        "oracle_code_sha256": ORACLE_CODE_SHA256,
+        "capture": str(args.capture or args.replay) if args.capture or args.replay else None,
+        "capture_complete": capture_complete,
         "revision_verified": False,
         "freshness_check": "disabled" if args.allow_stale else "all_recorded_sources_mtime_only",
         "precision_status": "verified_controls" if inverse_coverage["checked"] else "unverified" if inverse_coverage["selected"] else "not_requested_or_no_eligible_text",
         "missing_precision_controls": missing_controls,
         "probes": len(results),
         "fails": failures,
-        "stopped_early": bool(batch_error),
+        "stopped_early": transport_failed,
         "batch_error": batch_error,
         "inverse_coverage": inverse_coverage,
         "visible_checked": sum(bool(probe.get("visible_checked")) for probe in results),
