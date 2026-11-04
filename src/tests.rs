@@ -122,6 +122,644 @@ fn scaled_graphics_native_selection_keeps_overlay_prose() {
 }
 
 #[test]
+fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
+    // A clipped `\includegraphics` leaf holds only a form reference with no `<`
+    // definition, and each natural box overlaps its neighboring image.
+    let host = |line: u32, x: u32, forms: &[u32]| {
+        let leaf: String = forms.iter().map(|tag| format!("f{tag}:{x},100\n")).collect();
+        format!(
+            concat!(
+                "(1,{line}:{x},100:30,30,0\n",
+                "(1,{line}:{x},100:30,30,0\n",
+                "(1,{line}:{x},100:0,30,0\n",
+                "(1,{line}:{x},100:0,60,0\n",
+                "(1,{line}:{x},100:200,60,0\n",
+                "{leaf}",
+                ")\n",
+                "k1,{line}:{x},100:-200\n",
+                ")\n)\n)\n)\n",
+            ),
+            line = line,
+            x = x,
+            leaf = leaf,
+        )
+    };
+    let document = |forms: &[&[u32]; 2]| {
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
+                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                "{{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n",
+                "{left}{right})\n",
+                "(1,5:10,150:300,10,0\ng1,5:10,150\nx1,5:200,150\n)\n",
+                "]\n}}1\nPostamble:\nCount:40\n",
+            ),
+            left = host(3, 50, forms[0]),
+            right = host(4, 100, forms[1]),
+        )
+    };
+    let unclipped = document(&[&[], &[]]);
+    let clipped = document(&[&[7], &[8]]);
+    let repeated = document(&[&[7, 9], &[8]]);
+    for (name, synctex) in [
+        ("unclipped", &unclipped),
+        ("clipped", &clipped),
+        ("repeated", &repeated),
+    ] {
+        for fix_cross_file_tags in [false, true] {
+            for (x, y, line) in [(60.0, 85.0, 3), (115.0, 85.0, 4), (40.0, 145.0, 5)] {
+                let candidates = inverse_candidates_from_reader_with_options(
+                    synctex.as_bytes(),
+                    InversePoint {
+                        page: 1,
+                        x,
+                        y_from_top: y,
+                        page_height_pt: 792.0,
+                    },
+                    fix_cross_file_tags,
+                )
+                .unwrap();
+                assert_eq!(candidates.len(), 1, "{name} ({x},{y}): {candidates:?}");
+                assert_eq!(candidates[0].line, line, "{name} ({x},{y})");
+            }
+        }
+    }
+
+    // Forward geometry ignores the undefined placeholder too.
+    let forward = |synctex: &str, line: u32| {
+        forward_candidates_from_reader(
+            synctex.as_bytes(),
+            Path::new("/tmp/doc.pdf"),
+            Path::new("/tmp/doc.tex"),
+            None,
+            line,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|candidate| (candidate.page, candidate.source_line, candidate.rect))
+        .collect::<Vec<_>>()
+    };
+    for line in [3, 4] {
+        let expected = forward(&unclipped, line);
+        assert!(!expected.is_empty());
+        assert_eq!(forward(&clipped, line), expected);
+    }
+
+    // A defined form still owns its recorded content.
+    let defined = format!(
+        concat!(
+            "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
+            "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+            "<7\n(1,9:0,60:200,60,0\nx1,9:200,60\n)\n>\n",
+            "{{1\n[1,6:0,0:400,792,0\n{host}]\n}}1\nPostamble:\nCount:40\n",
+        ),
+        host = host(3, 50, &[7]),
+    );
+    let candidates = inverse_candidates_from_reader(
+        defined.as_bytes(),
+        InversePoint {
+            page: 1,
+            x: 60.0,
+            y_from_top: 85.0,
+            page_height_pt: 792.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].line, 9);
+
+    // The clipped image dispatches to its own filename, ignoring embedded vector text.
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    let source = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\includegraphics[clip,width=30pt]{figs/left.pdf}\n",
+        "\\includegraphics[clip,width=30pt]{figs/right.pdf}\n",
+        "Trailing prose.\n",
+        "\\end{document}\n",
+    );
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, source).unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        clipped.replace("/tmp/doc.tex", &tex.to_string_lossy()),
+    )
+    .unwrap();
+    for (x, line, filename) in [(60.0, 3, "figs/left.pdf"), (115.0, 4, "figs/right.pdf")] {
+        let hit = resolve_inverse(
+            &pdf,
+            InversePoint {
+                page: 1,
+                x,
+                y_from_top: 85.0,
+                page_height_pt: 792.0,
+            },
+            Some(("Blorf", 0)),
+            2,
+            &Operation::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hit.location.line, line);
+        assert_eq!(
+            hit.location.byte_column,
+            source
+                .lines()
+                .nth(line as usize - 1)
+                .unwrap()
+                .find(filename)
+                .unwrap()
+        );
+        assert!(hit.location.precise);
+    }
+}
+
+#[test]
+fn only_undefined_form_references_leave_their_host_identity_intact() {
+    let document = |before: &str, leaf: &str, after: &str| {
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
+                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                "{before}{{1\n[1,1:0,0:400,792,0\n(1,7:100,100:200,60,0\n{leaf})\n]\n}}1\n",
+                "{after}Postamble:\nCount:10\n",
+            ),
+            before = before,
+            leaf = leaf,
+            after = after,
+        )
+    };
+    let forward = |synctex: &str, line: u32, fix_readahead: bool| {
+        forward_candidates_from_reader_with_options(
+            synctex.as_bytes(),
+            Path::new("/tmp/doc.pdf"),
+            Path::new("/tmp/doc.tex"),
+            None,
+            line,
+            fix_readahead,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|candidate| (candidate.page, candidate.source_line, candidate.rect))
+        .collect::<Vec<_>>()
+    };
+    let definition = "<1\n(1,5:0,60:200,60,0\nx1,5:200,60\n)\n>\n";
+    for fix_readahead in [false, true] {
+        // Native gives a defined reference's host a zero leading boundary, so nothing is
+        // recorded at the host's own line, wherever the definition sits in the sidecar.
+        for (before, leaf, after) in [
+            (definition, "f1:100,100\n", ""),
+            ("", "f1:100,100\n", definition),
+            (definition, "f9:100,100\nf1:100,100\n", ""),
+        ] {
+            let synctex = document(before, leaf, after);
+            assert!(forward(&synctex, 7, fix_readahead).is_empty(), "{leaf}");
+            assert!(!forward(&synctex, 5, fix_readahead).is_empty(), "{leaf}");
+        }
+
+        // An undefined reference leaves the same geometry as a sidecar that never had it.
+        for (with_reference, without) in [
+            ("f9:100,100\n", ""),
+            ("f9:100,100\nx1,7:150,100\n", "x1,7:150,100\n"),
+        ] {
+            let expected = forward(&document("", without, ""), 7, fix_readahead);
+            assert!(!expected.is_empty(), "{with_reference}");
+            assert_eq!(
+                forward(&document("", with_reference, ""), 7, fix_readahead),
+                expected,
+                "{with_reference}"
+            );
+        }
+    }
+}
+
+#[test]
+fn undefined_form_references_parse_as_if_never_recorded() {
+    let document = |content: &str, after: &str| {
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
+                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                "{{1\n[1,1:0,0:400,792,0\n{content}]\n}}1\n{after}Postamble:\nCount:20\n",
+            ),
+            content = content,
+            after = after,
+        )
+    };
+    let forward = |synctex: &str, line: u32, fix_readahead: bool| {
+        forward_candidates_from_reader_with_options(
+            synctex.as_bytes(),
+            Path::new("/tmp/doc.pdf"),
+            Path::new("/tmp/doc.tex"),
+            None,
+            line,
+            fix_readahead,
+        )
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .map(|candidate| (candidate.page, candidate.source_line, candidate.rect))
+                .collect::<Vec<_>>()
+        })
+        .map_err(|error| error.to_string())
+    };
+    let inverse = |synctex: &str, x: f32, y_from_top: f32, fix_cross_file_tags: bool| {
+        inverse_candidates_from_reader_with_options(
+            synctex.as_bytes(),
+            InversePoint {
+                page: 1,
+                x,
+                y_from_top,
+                page_height_pt: 792.0,
+            },
+            fix_cross_file_tags,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let hbox = |body: &str| format!("(1,7:100,100:200,60,0\n{body})\n");
+    let ancestor = concat!(
+        "(1,50:10,100:300,60,0\n(1,7:100,100:30,10,0\nf9:100,100\nx1,7:130,100\n)\n",
+        "k1,100:140,100:10\ng1,100:150,100\n)\n",
+    );
+    let definition = "<1\n(1,5:0,60:200,60,0\nx1,5:200,60\n)\n>\n";
+    let reference = "f9:100,100\n";
+    for (with_reference, after) in [
+        // The trailing kern and glue take their identity from what precedes them at close.
+        (hbox("f9:100,100\nk1,7:150,100:10\ng1,7:160,100\n"), ""),
+        // A kern and glue separated only by the reference still pair up.
+        (hbox("k1,7:150,100:10\nf9:100,100\ng1,7:160,100\n"), ""),
+        // A glyph run directly after the leading boundary takes the next record's identity.
+        (hbox("f9:100,100\nx1,7:150,100\nk1,8:160,100:10\n"), ""),
+        // A vbox holding only the reference is empty, so it registers itself.
+        ("[1,7:100,100:30,10,0\nf9:100,100\n]\n".to_owned(), ""),
+        // The ancestor's mean uses the trailing records' identity before their recoloring.
+        (ancestor.to_owned(), ""),
+        // A defined reference, wherever its definition sits, stays alongside the undefined one.
+        (
+            hbox("f9:100,100\nf1:100,100\nk1,7:150,100:10\ng1,7:160,100\n"),
+            definition,
+        ),
+    ] {
+        let with = document(&with_reference, after);
+        let without = document(&with_reference.replace(reference, ""), after);
+        for mode in [false, true] {
+            for line in [1, 5, 7, 8, 50, 100] {
+                assert_eq!(
+                    forward(&with, line, mode),
+                    forward(&without, line, mode),
+                    "{with_reference} mode={mode} line={line}"
+                );
+            }
+            for (x, y) in [(100.0, 85.0), (120.0, 95.0), (150.0, 85.0), (250.0, 85.0)] {
+                assert_eq!(
+                    inverse(&with, x, y, mode),
+                    inverse(&without, x, y, mode),
+                    "{with_reference} mode={mode} ({x},{y})"
+                );
+            }
+        }
+    }
+
+    // The measured failures, stated directly rather than only relative to the deleted form.
+    let trailing = document(&hbox("f9:100,100\nk1,7:150,100:10\ng1,7:160,100\n"), "");
+    for mode in [false, true] {
+        assert!(!forward(&trailing, 7, mode).unwrap().is_empty(), "mode={mode}");
+    }
+    assert_eq!(forward(&document(ancestor, ""), 7, true).unwrap().len(), 2);
+
+    // Only the identity is dropped: a following `=` still means the reference's recorded position.
+    assert_eq!(
+        forward(&document(&hbox("f9:100,77\nx1,7:150,=\n"), ""), 7, false),
+        forward(&document(&hbox("x1,7:150,77\n"), ""), 7, false),
+    );
+}
+
+#[test]
+fn same_line_text_over_graphics_keeps_its_word() {
+    // Natural inner boxes overlap the next image, as in a scaled `\includegraphics`.
+    let graphic = |line: u32, x: u32, leaf: String| {
+        format!(
+            concat!(
+                "(1,{line}:{x},100:30,30,0\n(1,{line}:{x},100:30,30,0\n",
+                "(1,{line}:{x},100:0,30,0\n(1,{line}:{x},100:0,60,0\n",
+                "(1,{line}:{x},100:200,60,0\n{leaf})\n",
+                "k1,{line}:{x},100:-200\n)\n)\n)\n)\n",
+            ),
+            line = line,
+            x = x,
+            leaf = leaf,
+        )
+    };
+    let plain = |line: u32, x: u32| graphic(line, x, format!("k1,{line}:{},100:0\n", x + 200));
+    let clipped = |line: u32, x: u32| graphic(line, x, format!("f{line}:{x},100\n"));
+    let overlay = |line: u32, x: u32| {
+        format!(
+            "(1,{line}:{x},90:30,10,0\ng1,{line}:{x},90\nx1,{line}:{},90\n)\n",
+            x + 30
+        )
+    };
+    let separate = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\includegraphics[width=30pt]{figs/left.pdf}\n",
+        "\\includegraphics[width=30pt]{figs/right.pdf}\\llap{Overlay text}\n",
+        "\\end{document}\n",
+    );
+    let same_line = concat!(
+        "\\documentclass{article}\n",
+        "\\begin{document}\n",
+        "\\includegraphics[width=30pt]{figs/a.pdf}\\includegraphics[width=30pt]{figs/b.pdf}\\llap{Overlay text}\n",
+        "\\end{document}\n",
+    );
+    let word = Some("Overlay text");
+    let vector = Some("Blorf");
+    for (source, body, clicks) in [
+        (
+            separate,
+            [plain(3, 50), plain(4, 100), overlay(4, 100)].concat(),
+            [
+                (115.0, 85.0, word, 4, "Overlay text"),
+                (115.0, 75.0, vector, 4, "figs/right.pdf"),
+                (60.0, 85.0, vector, 3, "figs/left.pdf"),
+            ],
+        ),
+        (
+            separate,
+            [clipped(3, 50), clipped(4, 100), overlay(4, 100)].concat(),
+            [
+                (115.0, 85.0, word, 4, "Overlay text"),
+                (115.0, 75.0, vector, 4, "figs/right.pdf"),
+                (60.0, 85.0, vector, 3, "figs/left.pdf"),
+            ],
+        ),
+        (
+            same_line,
+            [plain(3, 50), plain(3, 100), overlay(3, 100)].concat(),
+            [
+                (115.0, 85.0, word, 3, "Overlay text"),
+                (115.0, 75.0, None, 3, "figs/b.pdf"),
+                (60.0, 85.0, None, 3, "figs/a.pdf"),
+            ],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let pdf = root.join("doc.pdf");
+        let tex = root.join("doc.tex");
+        fs::write(&pdf, b"pdf-v1").unwrap();
+        fs::write(&tex, source).unwrap();
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                concat!(
+                    "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
+                    "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                    "{{1\n[1,2:0,0:400,792,0\n(1,2:10,100:300,60,0\n{body})\n]\n}}1\n",
+                    "Postamble:\nCount:40\n",
+                ),
+                tex = tex.display(),
+                body = body,
+            ),
+        )
+        .unwrap();
+        for (x, y, context, line, needle) in clicks {
+            let hit = resolve_inverse(
+                &pdf,
+                InversePoint {
+                    page: 1,
+                    x,
+                    y_from_top: y,
+                    page_height_pt: 792.0,
+                },
+                context.map(|context| (context, 0)),
+                2,
+                &Operation::default(),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(hit.location.line, line, "({x},{y}) {needle}");
+            assert_eq!(
+                hit.location.byte_column,
+                source
+                    .lines()
+                    .nth(line as usize - 1)
+                    .unwrap()
+                    .find(needle)
+                    .unwrap(),
+                "({x},{y}) {needle}"
+            );
+            assert!(hit.location.precise, "({x},{y}) {needle}");
+        }
+    }
+}
+
+#[test]
+fn printing_overrides_of_reference_wrappers_do_not_own_their_text() {
+    let source_with = |preamble: &str, body: &str| {
+        format!("\\documentclass{{article}}\n{preamble}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+    };
+    let label_byte = |source: &str| source.lines().nth(3).unwrap().find("sec:a").unwrap();
+    for (preamble, body, context) in [
+        (
+            "\\renewcommand{\\emph}[1]{Zed #1}",
+            "See \\emph{\\cref{sec:a}} then.",
+            "See Zed section 1 then.",
+        ),
+        (
+            "\\renewcommand{\\clearpage}{\\textsc{Zed}}",
+            "See \\cref{sec:a}\\clearpage then.",
+            "See section 1 Zed then.",
+        ),
+    ] {
+        let source = source_with(preamble, body);
+        let label = label_byte(&source);
+        for word in ["Zed", "section", "1"] {
+            let offset = context.find(word).unwrap();
+            assert_ne!(
+                source_word_location(&source, 4, context, offset, 2),
+                Some((4, label)),
+                "{body} {word}"
+            );
+            let guess = source_word_guess_with_sources(
+                &source,
+                4,
+                context,
+                offset,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            );
+            assert!(
+                !matches!(guess, Ok(Some(location)) if location.line == 4 && location.byte == label),
+                "{body} {word}"
+            );
+        }
+    }
+
+    // Neither the unmodified wrapper nor an unrelated override costs the label its precision.
+    for preamble in ["", "\\renewcommand{\\textbf}[1]{Zed #1}"] {
+        let source = source_with(preamble, "See \\emph{\\cref{sec:a}} then.");
+        let label = label_byte(&source);
+        let context = "See section 1 then.";
+        for word in ["section", "1"] {
+            let offset = context.find(word).unwrap();
+            assert_eq!(
+                source_word_location(&source, 4, context, offset, 2),
+                Some((4, label)),
+                "{preamble} {word}"
+            );
+        }
+    }
+}
+
+#[test]
+fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
+    let multiline = "\\begin{frame} <1->[<+->]\n[label=syntheticish-theorem,\n  t]{Theorem statement}";
+    let commented = "\\begin{frame}% keep header\n[label=syntheticish-theorem]{Theorem statement}";
+    for (header, anchor, line, context, needle, owned) in [
+        (
+            "\\begin{frame}[label=syntheticish-theorem]\n\\begin{theorem}\nBounded claim holds here.\n\\end{theorem}",
+            3,
+            3,
+            "Theorem 1. Bounded claim holds here.",
+            "[label=syntheticish-theorem]",
+            false,
+        ),
+        (
+            multiline,
+            4,
+            4,
+            "syntheticish theorem",
+            "[label=syntheticish-theorem,",
+            false,
+        ),
+        (multiline, 5, 5, "Theorem statement", "Theorem statement", true),
+        // A comment newline continues the header, so the option after it is still metadata.
+        (
+            commented,
+            4,
+            4,
+            "syntheticish theorem",
+            "[label=syntheticish-theorem]",
+            false,
+        ),
+        (commented, 4, 4, "Theorem statement", "Theorem statement", true),
+        // A blank line ends the header: this bracket is printed body text, not an option.
+        (
+            "\\begin{frame}\n\n[Bracketword ordinary body.]",
+            6,
+            5,
+            "Bracketword ordinary body.",
+            "Bracketword ordinary body.",
+            true,
+        ),
+        (
+            "\\begin{frame}[label=é-théorème]{Théorème énoncé}",
+            3,
+            3,
+            "Théorème énoncé",
+            "Théorème énoncé",
+            true,
+        ),
+        (
+            "\\begin{frame}[label=topic-theorem]{Primary Topic}{Theorem subtitle}",
+            3,
+            3,
+            "Theorem subtitle",
+            "Theorem subtitle",
+            true,
+        ),
+        // Only frame options are configuration: other environments can print theirs.
+        (
+            "\\begin{frame}\n\\begin{theorem}[Printed Name]\nBounded claim holds here.\n\\end{theorem}",
+            4,
+            4,
+            "Printed Name",
+            "Printed Name",
+            true,
+        ),
+    ] {
+        let source = format!(
+            "\\documentclass{{beamer}}\n\\begin{{document}}\n{header}\n\\end{{frame}}\n\\end{{document}}\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let pdf = root.join("doc.pdf");
+        let tex = root.join("doc.tex");
+        fs::write(&pdf, b"pdf-v1").unwrap();
+        fs::write(&tex, &source).unwrap();
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                concat!(
+                    "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
+                    "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                    "{{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,100:300,10,0\n",
+                    "g1,{anchor}:10,100\nx1,{anchor}:310,100\n)\n]\n}}1\n",
+                    "Postamble:\nCount:10\n",
+                ),
+                tex = tex.display(),
+                anchor = anchor,
+            ),
+        )
+        .unwrap();
+        let hit = resolve_inverse(
+            &pdf,
+            InversePoint {
+                page: 1,
+                x: 50.0,
+                y_from_top: 95.0,
+                page_height_pt: 792.0,
+            },
+            Some((context, 0)),
+            2,
+            &Operation::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let start = source
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap()
+            .find(needle)
+            .unwrap();
+        let span = start..start + needle.len();
+        if owned {
+            assert_eq!(hit.location.line, line, "{header}");
+            assert_eq!(hit.location.byte_column, start, "{header}");
+            assert!(hit.location.precise, "{header}");
+        } else {
+            assert!(
+                !(hit.location.line == line
+                    && hit.location.precise
+                    && span.contains(&hit.location.byte_column)),
+                "{header}: {:?}",
+                hit.location
+            );
+            let guess = source_word_guess_with_sources(
+                &source,
+                anchor,
+                context,
+                0,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            );
+            assert!(
+                !matches!(guess, Ok(Some(location)) if location.line == line && span.contains(&location.byte)),
+                "{header}"
+            );
+        }
+    }
+}
+
+#[test]
 fn compatible_columns_do_not_require_macro_execution_classification() {
     let directory = tempfile::tempdir().unwrap();
     let pdf = directory.path().join("gnimble.pdf");
@@ -260,7 +898,7 @@ fn inverse_title_refinement_stays_native_supported() {
 fn caption_review_embedded_comment_end_does_not_expose_hidden_caption() {
     let source = "\\begin{comment}\nignored \\end{comment}\n\
                   \\caption{hidden\ncaption}\n\\end{comment}";
-    assert_eq!(caption_closing_line(source, 3, 10), None);
+    assert_eq!(collected_text_closing_line(source, 3, 10), None);
 }
 
 #[test]
@@ -277,12 +915,12 @@ fn caption_review_comment_keys_cannot_become_inverse_word_targets() {
 fn caption_review_unbraced_short_brackets_do_not_own_adjacent_prose() {
     let source = "\\caption[short[inner]]{first\nsecond}";
     let column = source.find("first").unwrap() as u32 + 1;
-    assert_eq!(caption_closing_line(source, 1, column), None);
-    assert_eq!(math::caption_lines(source, 2), None);
+    assert_eq!(collected_text_closing_line(source, 1, column), None);
+    assert_eq!(math::collected_text_lines(source, 2), None);
     let source = "\\caption[{short[inner]}]{first\nsecond}";
     let column = source.find("first").unwrap() as u32 + 1;
-    assert_eq!(caption_closing_line(source, 1, column), Some(2));
-    assert_eq!(math::caption_lines(source, 2), Some(0..2));
+    assert_eq!(collected_text_closing_line(source, 1, column), Some(2));
+    assert_eq!(math::collected_text_lines(source, 2), Some(0..2));
 }
 
 #[test]
@@ -309,6 +947,224 @@ fn optional_arguments_shield_braces_comments_and_control_symbols() {
 }
 
 #[test]
+fn inverse_line_leading_word_retains_native_readahead_anchor() {
+    let source = "Hauling a kettle slowly past a lopsided\n\
+                  turnip barrow with inline $V$ beside damp gravel nudges an\n\
+                  brambling porridges teakettle:";
+    assert_eq!(
+        tex::source_word_location(source, 2, "brambling", 0, 12),
+        Some((3, 0)),
+    );
+    assert_eq!(source_word_compiler_line(source, 3, 1), 2);
+    assert_eq!(source_word_compiler_line(source, 2, 1), 1);
+    assert_eq!(source_word_compiler_line(source, 3, 11), 3);
+    assert_eq!(
+        tex::line_start_word_compiler_line("Prior prose\n  Café next", 2, 3),
+        Some(1)
+    );
+    assert_eq!(
+        tex::line_start_word_compiler_line("Pewter $R_\\star$ nudges an\nbrambling teapot", 2, 1),
+        Some(1)
+    );
+    for (source, line, column) in [
+        ("brambling porridges", 1, 1),
+        ("Prior prose\n\nbrambling porridges", 3, 1),
+        ("% comment\nbrambling porridges", 2, 1),
+        ("Prior prose\\par\nbrambling porridges", 2, 1),
+        ("\\section{Copper}\n1 Wazzit.", 2, 1),
+        ("\\section{Copper\nspindles}\n1 Wazzit.", 3, 1),
+        ("\\section{Copper\nspindles}\\relax\n1 Wazzit.", 3, 1),
+        ("\\section{Copper\n\\{spindles}\n1 Wazzit.", 3, 1),
+        ("\\section\n{Copper}\n1 Wazzit.", 3, 1),
+        ("\\section\nCopper\n1 Wazzit.", 3, 1),
+        ("\\section\n% comment\nCopper\n1 Wazzit.", 4, 1),
+        ("\\section\n[Short]\nC\n1 Wazzit.", 4, 1),
+        (
+            "\\newcommand{\\Unused}{\\verb}\n\\section\nC\n1 Wazzit.",
+            4,
+            1,
+        ),
+        ("Prior \\xref{spindle}\nbrambling porridges", 2, 1),
+        ("\\tableofcontents\nContents Wazzit.", 2, 1),
+        ("Prior {prose\nbrambling porridges", 2, 1),
+        ("\\paragraph{Copper}\nWazzit body.", 2, 1),
+        ("\\item\n1 Wazzit.", 2, 1),
+        ("\\end{figure}\nWazzit body.", 2, 1),
+        ("Prior prose\nbrambling porridges", 2, 0),
+        ("Prior prose\nbrambling porridges", 2, 11),
+        ("Prior prose\n\\command brambling", 2, 10),
+    ] {
+        assert_eq!(
+            tex::line_start_word_compiler_line(source, line, column),
+            None
+        );
+    }
+}
+
+#[test]
+fn multiline_formatting_uses_collected_scope_without_losing_outer_boundaries() {
+    for wrapper in [
+        "textbf",
+        "textit",
+        "emph",
+        "textnormal",
+        "texttt",
+        "textsf",
+        "mathbf",
+        "mathrm",
+        "mathsf",
+        "mathbb",
+    ] {
+        let source = format!("\\{wrapper}{{Café Snazzles\nWazzit}}");
+        let byte = source.find("Snazzles").unwrap();
+        let column = source[..byte].chars().count() as u32 + 1;
+        assert_eq!(source_word_compiler_line(&source, 1, column), 2);
+        assert_eq!(
+            tex::source_word_location(&source, 2, "Snazzles", 0, 0),
+            Some((1, byte)),
+        );
+    }
+    for (source, word, expected) in [
+        (
+            "\\textbf{Outer \\textit{Snazzles\nWazzit}\nTail}",
+            "Snazzles",
+            3,
+        ),
+        (
+            "\\begin{align}\n\\text{Snazzles\nWazzit}\n\\end{align}",
+            "Snazzles",
+            4,
+        ),
+        ("\\textbf{$A\nB$\nSnazzles}", "A", 3),
+        (
+            "\\subparagraph*{\\textbf{Snazzles\nWazzit}}\nBody.",
+            "Snazzles",
+            3,
+        ),
+    ] {
+        let at = source.find(word).unwrap();
+        let prefix = &source[..at];
+        let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let start = prefix.rfind('\n').map_or(0, |at| at + 1);
+        let column = source[start..at].chars().count() as u32 + 1;
+        assert_eq!(
+            source_word_compiler_line(source, line, column),
+            expected,
+            "{source}"
+        );
+    }
+    let source = "\\begin{frame}\nSnazzles only.\n\\textbf{Copper\nNickel}\\end{frame}";
+    assert_eq!(
+        tex::source_word_location(source, 4, "Snazzles", 0, 0),
+        Some((2, 0)),
+    );
+    let adjoining = "\\textbf{Snazzles frobnitz\nquux}\\begin{tabularx}{\\linewidth}{X}\nCopper\\\\\n\\end{tabularx}";
+    assert_eq!(
+        tex::source_word_location(adjoining, 2, "frobnitz", 0, 0),
+        Some((1, adjoining.find("frobnitz").unwrap())),
+    );
+    assert_eq!(
+        tex::source_word_location("\\textbf{Snazzles\nSnazzles}", 1, "Snazzles", 0, 4),
+        Some((1, 8)),
+    );
+    let quoted = "\\csname string\\endcsname Zephyr";
+    assert_eq!(
+        tex::source_word_location(quoted, 1, "Zephyr", 0, 0),
+        Some((1, quoted.find("Zephyr").unwrap())),
+    );
+    for source in [
+        "\\string\\textbf{Snazzles\nWazzit}",
+        "\\noexpand\\textbf{Snazzles\nWazzit}",
+        "\\csname string\\endcsname\\textbf{Snazzles\nWazzit}",
+        "\\csname noexpand\\endcsname\\textbf{Snazzles\nWazzit}",
+        "\\mathord{Snazzles\nWazzit}",
+        "\\mathrel{Snazzles\nWazzit}",
+        "\\mathop{Snazzles\nWazzit}",
+        "\\verb|\\textbf{Snazzles\nWazzit}|",
+        "\\newcommand{\\hidden}{\\textbf{Snazzles\nWazzit}}",
+        "% \\textbf{Snazzles\nWazzit}",
+        "\\textbf{Snazzles",
+    ] {
+        let byte = source.find("Snazzles").unwrap();
+        assert_eq!(
+            math::collected_text_argument_at(source, byte),
+            None,
+            "{source}"
+        );
+        assert_eq!(math::collected_text_lines(source, 1), None, "{source}");
+    }
+    assert_eq!(math::collected_text_lines("\\textbf{Snazzles}", 1), None);
+}
+
+#[test]
+fn environment_identifiers_are_not_literal_output_but_titles_remain_visible() {
+    let source = "\\begin{zibble}[Frumple snazzling]\nBlorple wazzit.\n\\end{zibble}";
+    for (word, expected) in [
+        ("zibble", None),
+        ("Frumple", Some((1, source.find("Frumple").unwrap()))),
+        ("snazzling", Some((1, source.find("snazzling").unwrap()))),
+        ("wazzit", Some((2, 8))),
+    ] {
+        assert_eq!(
+            tex::source_word_location_with_sources(
+                source,
+                1,
+                word,
+                0,
+                4,
+                &[],
+                &Operation::default(),
+            ),
+            Ok(expected),
+            "{word}",
+        );
+    }
+}
+
+#[test]
+fn run_in_heading_aliases_skip_labels_but_not_literal_commands() {
+    for prefix in [
+        "",
+        "\\label{key}",
+        "\\label{key}\n\\index{entry}",
+        "% comment",
+    ] {
+        let source = format!("\\subparagraph*{{Café Snazzles}}{prefix}\nBody text.");
+        let column = source[..source.find("Snazzles").unwrap()].chars().count() as u32 + 1;
+        assert_eq!(
+            tex::run_in_heading_compiler_line(&source, 1, column),
+            Some(source.lines().count() as u32),
+            "{source}",
+        );
+    }
+    assert_eq!(
+        tex::run_in_heading_compiler_line(
+            "\\paragraph X\nFirst body.\n\n\\paragraph{Snazzles}\nSecond body.",
+            4,
+            12,
+        ),
+        Some(5),
+    );
+    for source in [
+        "\\verb|\\subparagraph*{Snazzles}|\nBody text.",
+        "\\string\\subparagraph*{Snazzles}\nBody text.",
+        "\\begin{verbatim}\n\\subparagraph*{Snazzles}\nBody text.\n\\end{verbatim}",
+        "% \\subparagraph*{Snazzles}\nBody text.",
+        "\\subparagraph*{Snazzles}\n\\end{document}",
+    ] {
+        let at = source.find("Snazzles").unwrap();
+        let line = source[..at].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let row_start = source[..at].rfind('\n').map_or(0, |at| at + 1);
+        let column = source[row_start..at].chars().count() as u32 + 1;
+        assert_eq!(
+            tex::run_in_heading_compiler_line(source, line, column),
+            None,
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn comment_closure_requires_a_complete_subsequent_input_line() {
     for fake in [
         "ignored \\end{comment}",
@@ -319,20 +1175,20 @@ fn comment_closure_requires_a_complete_subsequent_input_line() {
             let source = format!(
                 "\\begin{{comment}}{newline}{fake}{newline}\\caption{{hidden{newline}caption}}{newline}\\end{{comment}}{newline}\\caption{{visible{newline}caption}}"
             );
-            assert_eq!(caption_closing_line(&source, 3, 10), None);
-            assert_eq!(caption_closing_line(&source, 6, 10), Some(7));
+            assert_eq!(collected_text_closing_line(&source, 3, 10), None);
+            assert_eq!(collected_text_closing_line(&source, 6, 10), Some(7));
             let unclosed = format!(
                 "\\begin{{comment}}{newline}{fake}{newline}\\caption{{hidden{newline}caption}}"
             );
-            assert_eq!(caption_closing_line(&unclosed, 3, 10), None);
+            assert_eq!(collected_text_closing_line(&unclosed, 3, 10), None);
         }
     }
     for newline in ["\n", "\r\n"] {
         let source = format!(
             "\\begin{{comment}}\\end{{comment}}{newline}\\caption{{hidden{newline}caption}}{newline}\\end{{comment}}   {newline}\\caption{{visible{newline}caption}}"
         );
-        assert_eq!(caption_closing_line(&source, 2, 10), None);
-        assert_eq!(caption_closing_line(&source, 5, 10), Some(6));
+        assert_eq!(collected_text_closing_line(&source, 2, 10), None);
+        assert_eq!(collected_text_closing_line(&source, 5, 10), Some(6));
     }
 }
 
@@ -347,10 +1203,10 @@ fn forward_caption_anchor_uses_only_complete_long_argument() {
         let source = format!(
             "before\n{caption}% argument follows\n{{école first\nsecond \\emph{{literal}}\n}}\nafter"
         );
-        assert_eq!(caption_closing_line(&source, 3, 2), Some(5));
-        assert_eq!(caption_closing_line(&source, 4, 1), Some(5));
+        assert_eq!(collected_text_closing_line(&source, 3, 2), Some(5));
+        assert_eq!(collected_text_closing_line(&source, 4, 1), Some(5));
         for (line, column) in [(1, 1), (2, 1), (3, 13), (5, 1), (6, 1), (0, 1), (3, 0)] {
-            assert_eq!(caption_closing_line(&source, line, column), None);
+            assert_eq!(collected_text_closing_line(&source, line, column), None);
         }
     }
     for source in [
@@ -360,7 +1216,7 @@ fn forward_caption_anchor_uses_only_complete_long_argument() {
     ] {
         let last = source.lines().count() as u32;
         let column = source.lines().last().unwrap().chars().count() as u32;
-        assert_eq!(caption_closing_line(source, last, column), None);
+        assert_eq!(collected_text_closing_line(source, last, column), None);
     }
 }
 
@@ -391,13 +1247,17 @@ fn forward_caption_anchor_excludes_nonprinting_and_opaque_source() {
         let line = source[..at].bytes().filter(|ch| *ch == b'\n').count() as u32 + 1;
         let start = source[..at].rfind('\n').map_or(0, |end| end + 1);
         let column = source[start..at].chars().count() as u32 + 1;
-        assert_eq!(caption_closing_line(source, line, column), None, "{word}");
+        assert_eq!(
+            collected_text_closing_line(source, line, column),
+            None,
+            "{word}"
+        );
     }
-    assert_eq!(caption_closing_line(source, 7, 17), Some(8));
+    assert_eq!(collected_text_closing_line(source, 7, 17), Some(8));
     let source = "\\begin{frame}\n\\caption{first\nsecond}\n\\end{frame}";
-    assert_eq!(caption_closing_line(source, 2, 10), Some(3));
+    assert_eq!(collected_text_closing_line(source, 2, 10), Some(3));
     assert_eq!(
-        frame_closing_line(source, 2).or_else(|| caption_closing_line(source, 2, 10)),
+        frame_closing_line(source, 2).or_else(|| collected_text_closing_line(source, 2, 10)),
         Some(4),
     );
 }
@@ -692,6 +1552,931 @@ fn inverse_prose_excludes_nonprinting_keys_and_multiline_definitions() {
     );
     let source = "\\newcommand{\\Hidden}{$Zephyr$}\n\\Hidden\\label{Zephyr}\n";
     assert_eq!(source_word_location(source, 2, "Zephyr", 0, 4), None);
+}
+
+#[test]
+fn inverse_reference_commands_select_first_label_byte_inside_braces() {
+    let source = "\\section{Alpha}\\label{sec:alpha}\n\
+                  We check \\cref{sec:alpha} and \\Cref{thm:beta} before \\eqref{eq:gamma} \
+                  on page \\pageref{sec:alpha} via \\autoref{thm:beta} and \\ref{sec:alpha} \
+                  near \\cref{fig:square}.\n";
+    let context = "We check section 1 and Theorem 1 before (1) on page 1 via Theorem 1 and 1 near fig. 1.";
+    let row = source.lines().nth(1).unwrap();
+    let expected = [
+        ("section", "\\cref{", "sec:alpha"),
+        ("1 and Theorem", "\\cref{", "sec:alpha"),
+        ("Theorem 1 before", "\\Cref{", "thm:beta"),
+        ("1 before", "\\Cref{", "thm:beta"),
+        ("(1)", "\\eqref{", "eq:gamma"),
+        ("1 via", "\\pageref{", "sec:alpha"),
+        ("Theorem 1 and", "\\autoref{", "thm:beta"),
+        ("1 and 1 near", "\\autoref{", "thm:beta"),
+        ("1 near", "\\ref{", "sec:alpha"),
+        ("fig. 1.", "\\cref{", "fig:square"),
+        ("1.", "\\cref{", "fig:square"),
+    ];
+    for (needle, prefix, label) in expected {
+        let offset = context.find(needle).unwrap();
+        let target_byte = row.find(&format!("{prefix}{label}")).unwrap() + prefix.len();
+        assert_eq!(
+            source_word_location(source, 2, context, offset, 2),
+            Some((2, target_byte)),
+            "strict failed for {needle}"
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                source,
+                2,
+                context,
+                offset,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 2,
+                byte: target_byte,
+            })),
+            "guess failed for {needle}"
+        );
+    }
+
+    // Multiline, leading spaces/comments, multi-label lists, and non-ASCII UTF-8 prefix columns.
+    let multiline = "Café check \\cref{%\n  sec:first,sec:second\n} done.\n";
+    let multi_ctx = "Café check sections 1 and 2 done.";
+    let first_byte = multiline.lines().nth(1).unwrap().find("sec:first").unwrap();
+    for token in ["sections", "1", "and", "2"] {
+        let offset = multi_ctx.find(token).unwrap();
+        assert_eq!(
+            source_word_location(multiline, 3, multi_ctx, offset, 3),
+            Some((2, first_byte)),
+            "multiline token {token}"
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                multiline,
+                3,
+                multi_ctx,
+                offset,
+                3,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 2,
+                byte: first_byte,
+            })),
+            "multiline guess token {token}"
+        );
+    }
+    let col_char = multiline.lines().nth(1).unwrap()[..first_byte].chars().count() as u32 + 1;
+    assert_eq!(
+        tex::reference_argument_closing_line(multiline, 2, col_char),
+        Some(3)
+    );
+
+    let custom_format = "\\crefformat{section}{#2#1#3 zone}\nBefore \\cref{sec:alpha} after.\n";
+    let custom_ctx = "Before 1 zone after.";
+    let custom_byte = custom_format.lines().nth(1).unwrap().find("sec:alpha").unwrap();
+    for token in ["1", "zone"] {
+        let offset = custom_ctx.find(token).unwrap();
+        assert_eq!(
+            source_word_location(custom_format, 2, custom_ctx, offset, 1),
+            Some((2, custom_byte)),
+            "custom format token {token}"
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                custom_format,
+                2,
+                custom_ctx,
+                offset,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 2,
+                byte: custom_byte,
+            })),
+            "custom format guess token {token}"
+        );
+    }
+
+    // Non-reference generated constructs (\cite, \item, \caption, theorem headers) must not steal reference labels.
+    let cite_src = "Note \\cite{bib:one} before \\cref{sec:alpha} done.\n";
+    let cite_ctx = "Note [7] before section 1 done.";
+    let cite_ref_byte = cite_src.find("sec:alpha").unwrap();
+    assert_ne!(
+        source_word_location(cite_src, 1, cite_ctx, cite_ctx.find('7').unwrap(), 1),
+        Some((1, cite_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(cite_src, 1, cite_ctx, cite_ctx.find("section").unwrap(), 1),
+        Some((1, cite_ref_byte))
+    );
+
+    let item_src = "\\item Item before \\cref{sec:alpha} done.\n";
+    let item_ctx = "1. Item before section 1 done.";
+    let item_ref_byte = item_src.find("sec:alpha").unwrap();
+    assert_ne!(
+        source_word_location(item_src, 1, item_ctx, 0, 1),
+        Some((1, item_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(item_src, 1, item_ctx, item_ctx.rfind('1').unwrap(), 1),
+        Some((1, item_ref_byte))
+    );
+
+    let cap_src = "\\caption{Caption before \\cref{sec:alpha} done.}\n";
+    let cap_ctx = "Figure 1: Caption before section 1 done.";
+    let cap_ref_byte = cap_src.find("sec:alpha").unwrap();
+    assert_ne!(
+        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("Figure").unwrap(), 1),
+        Some((1, cap_ref_byte))
+    );
+    assert_ne!(
+        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("1:").unwrap(), 1),
+        Some((1, cap_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("section").unwrap(), 1),
+        Some((1, cap_ref_byte))
+    );
+
+    let thm_src = "\\newtheorem{thm}{Theorem}\n\\begin{thm}Claim before \\cref{sec:alpha} done.\\end{thm}\n";
+    let thm_ctx = "Theorem 1. Claim before section 1 done.";
+    let thm_ref_byte = thm_src.lines().nth(1).unwrap().find("sec:alpha").unwrap();
+    assert_ne!(
+        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("Theorem").unwrap(), 1),
+        Some((2, thm_ref_byte))
+    );
+    assert_ne!(
+        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("1.").unwrap(), 1),
+        Some((2, thm_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("section").unwrap(), 1),
+        Some((2, thm_ref_byte))
+    );
+
+    // Same-line literal word ("section") and generated reference ("section 1") each resolve to their own owner.
+    let lit_src = "The word section precedes \\cref{sec:alpha} here.\n";
+    let lit_ctx = "The word section precedes section 1 here.";
+    let lit_word_byte = lit_src.find("section").unwrap();
+    let lit_ref_byte = lit_src.find("sec:alpha").unwrap();
+    assert_eq!(
+        source_word_location(lit_src, 1, lit_ctx, lit_ctx.find("section").unwrap(), 1),
+        Some((1, lit_word_byte))
+    );
+    assert_eq!(
+        source_word_location(lit_src, 1, lit_ctx, lit_ctx.rfind("section").unwrap(), 1),
+        Some((1, lit_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(lit_src, 1, lit_ctx, lit_ctx.find('1').unwrap(), 1),
+        Some((1, lit_ref_byte))
+    );
+
+    // Paragraph-end reference when PDF context continues into the next paragraph and search_radius == 1.
+    let para_src = "Paragraph ends at \\cref{sec:alpha}.\n\nNext paragraph starts here.\n";
+    let para_ctx = "Paragraph ends at section 1. Next paragraph starts here.";
+    let para_ref_byte = para_src.lines().next().unwrap().find("sec:alpha").unwrap();
+    assert_eq!(
+        source_word_location(para_src, 1, para_ctx, para_ctx.find("section").unwrap(), 1),
+        Some((1, para_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(para_src, 1, para_ctx, para_ctx.find('1').unwrap(), 1),
+        Some((1, para_ref_byte))
+    );
+
+    // Comment-only line between source lines does not create a false paragraph boundary, and off-line reference is not invisible.
+    let twoline_src = "Lead \\cref{sec:first} middle\n% comment line\nand \\cref{sec:second} tail.\n";
+    let twoline_ctx = "Lead section 1 middle and section 2 tail.";
+    let second_ref_byte = twoline_src.lines().nth(2).unwrap().find("sec:second").unwrap();
+    assert_eq!(
+        source_word_location(twoline_src, 3, twoline_ctx, twoline_ctx.rfind("section").unwrap(), 1),
+        Some((3, second_ref_byte))
+    );
+    assert_eq!(
+        source_word_location(twoline_src, 3, twoline_ctx, twoline_ctx.find('2').unwrap(), 1),
+        Some((3, second_ref_byte))
+    );
+
+    // Reference-first theft controls, invalid key before valid reference, and same-word references on adjacent lines.
+    let ref_before_cite = "Note \\cref{sec:alpha} before \\cite{bib:one} done.\n";
+    let ref_before_cite_ctx = "Note section 1 before [7] done.";
+    let ref_before_cite_byte = ref_before_cite.find("sec:alpha").unwrap();
+    assert_eq!(
+        source_word_location(ref_before_cite, 1, ref_before_cite_ctx, ref_before_cite_ctx.find('7').unwrap(), 1),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            ref_before_cite,
+            1,
+            ref_before_cite_ctx,
+            ref_before_cite_ctx.find('7').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        source_word_location(ref_before_cite, 1, ref_before_cite_ctx, ref_before_cite_ctx.find("section").unwrap(), 1),
+        Some((1, ref_before_cite_byte))
+    );
+
+    let item_ref_first = "\\item \\cref{sec:alpha} item text done.\n";
+    let item_ref_first_ctx = "1. section 1 item text done.";
+    let item_ref_first_byte = item_ref_first.find("sec:alpha").unwrap();
+    assert_ne!(
+        source_word_location(item_ref_first, 1, item_ref_first_ctx, 0, 1),
+        Some((1, item_ref_first_byte))
+    );
+
+    let invalid_then_valid = "Lead \\cref{\\macrokey} middle \\cref{sec:second} tail.\n";
+    let invalid_then_valid_ctx = "Lead section 1 middle section 2 tail.";
+    let valid_second_byte = invalid_then_valid.find("sec:second").unwrap();
+    assert_eq!(
+        source_word_location(invalid_then_valid, 1, invalid_then_valid_ctx, invalid_then_valid_ctx.find("section").unwrap(), 1),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            invalid_then_valid,
+            1,
+            invalid_then_valid_ctx,
+            invalid_then_valid_ctx.find("section").unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        source_word_location(invalid_then_valid, 1, invalid_then_valid_ctx, invalid_then_valid_ctx.rfind("section").unwrap(), 1),
+        Some((1, valid_second_byte))
+    );
+
+    let adj_lines_src = "First \\cref{sec:one} end.\nSecond \\cref{sec:two} done.\n";
+    let adj_lines_ctx = "First section 1 end. Second section 2 done.";
+    let adj_one_byte = adj_lines_src.lines().next().unwrap().find("sec:one").unwrap();
+    let adj_two_byte = adj_lines_src.lines().nth(1).unwrap().find("sec:two").unwrap();
+    assert_eq!(
+        source_word_location(adj_lines_src, 1, adj_lines_ctx, adj_lines_ctx.find("section").unwrap(), 1),
+        Some((1, adj_one_byte))
+    );
+    assert_eq!(
+        source_word_location(adj_lines_src, 2, adj_lines_ctx, adj_lines_ctx.rfind("section").unwrap(), 1),
+        Some((2, adj_two_byte))
+    );
+
+    // Repeated-neighbor occurrence alignment: citations, filtered references, math, and two-reference segments
+    // with identical surrounding flanks must not be stolen by a reference.
+    let rep_cite_src = "By \\cref{sec:a} then \\\\ By \\cite{key} then.\n";
+    let rep_cite_ctx = "By section 1 then By [7] then.";
+    for offset in [rep_cite_ctx.find('7').unwrap()] {
+        assert_eq!(source_word_location(rep_cite_src, 1, rep_cite_ctx, offset, 1), None);
+        assert_eq!(
+            source_word_guess_with_sources(
+                rep_cite_src,
+                1,
+                rep_cite_ctx,
+                offset,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None)
+        );
+    }
+    assert_eq!(
+        source_word_location(rep_cite_src, 1, "By [7] then.", 4, 1),
+        None
+    );
+
+    let frame_cite_src = "\\begin{frame}\nBy \\cref{sec:a} then.\n\nBy \\cite{key} then.\n\\end{frame}\n";
+    let frame_cite_ctx = "By section 1 then. By [7] then.";
+    assert_eq!(
+        source_word_location(frame_cite_src, 5, frame_cite_ctx, frame_cite_ctx.find('7').unwrap(), 4),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            frame_cite_src,
+            5,
+            frame_cite_ctx,
+            frame_cite_ctx.find('7').unwrap(),
+            4,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+
+    let tabx_src = "\\begin{tabularx}{\\linewidth}{lll}\nYes & \\cref{sec:a} & ok \\\\\nYes & \\cite{key} & ok \\\\\n\\end{tabularx}\n";
+    let tabx_ctx = "Yes section 1 ok Yes [7] ok";
+    assert_eq!(
+        source_word_location(tabx_src, 4, tabx_ctx, tabx_ctx.find('7').unwrap(), 4),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            tabx_src,
+            4,
+            tabx_ctx,
+            tabx_ctx.find('7').unwrap(),
+            4,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+
+    let rep_filtered_src = "By \\cref{sec:a} then \\\\ By \\cref{\\keymacro} then.\n";
+    let rep_filtered_ctx = "By section 1 then By section 2 then.";
+    assert_eq!(
+        source_word_location(rep_filtered_src, 1, rep_filtered_ctx, rep_filtered_ctx.rfind("section").unwrap(), 1),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            rep_filtered_src,
+            1,
+            rep_filtered_ctx,
+            rep_filtered_ctx.rfind("section").unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+
+    let rep_math_src = "By \\cref{sec:a} then \\\\ By $\\alpha$ then.\n";
+    let rep_math_ctx = "By section 1 then By α then.";
+    let rep_math_byte = rep_math_src.find("\\alpha").unwrap();
+    assert_eq!(
+        source_word_location(rep_math_src, 1, rep_math_ctx, rep_math_ctx.find('α').unwrap(), 1),
+        Some((1, rep_math_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            rep_math_src,
+            1,
+            rep_math_ctx,
+            rep_math_ctx.find('α').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 1,
+            byte: rep_math_byte,
+        }))
+    );
+
+    let frame_and_src = "\\begin{frame}\nBy \\cref{sec:a} then\n\nBy \\cref{sec:b} and \\cref{sec:c} then\n\\end{frame}\n";
+    let frame_and_ctx = "By section 1 then By section 2 and section 3 then";
+    let frame_and_byte = frame_and_src.lines().nth(3).unwrap().find("and").unwrap();
+    assert_eq!(
+        source_word_location(frame_and_src, 5, frame_and_ctx, frame_and_ctx.find("and").unwrap(), 4),
+        Some((4, frame_and_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            frame_and_src,
+            5,
+            frame_and_ctx,
+            frame_and_ctx.find("and").unwrap(),
+            4,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 4,
+            byte: frame_and_byte,
+        }))
+    );
+
+    let para_start_rep_src = "Use the \\cref{sec:a} as the base. Use the \\cite{key} as the base.\n";
+    let para_start_rep_ctx = "Use the section 1 as the base. Use the [7] as the base.";
+    assert_eq!(
+        source_word_location(para_start_rep_src, 1, para_start_rep_ctx, para_start_rep_ctx.find('7').unwrap(), 1),
+        None
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            para_start_rep_src,
+            1,
+            para_start_rep_ctx,
+            para_start_rep_ctx.find('7').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    // Zero-word source slots paired with mixed generated+literal segments must not shift ordinals or steal literals.
+    let ord_shift_src = "By \\rule{1em}{1pt} then \\\\ By \\cref{sec:a} then \\\\ By \\cite{key} too then.\n";
+    let ord_shift_ctx = "By [7] too then.";
+    let ord_too_byte = ord_shift_src.find("too").unwrap();
+    assert_eq!(
+        source_word_location(ord_shift_src, 1, ord_shift_ctx, ord_shift_ctx.find('7').unwrap(), 1),
+        None
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            ord_shift_src,
+            1,
+            ord_shift_ctx,
+            ord_shift_ctx.find('7').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+    assert_eq!(
+        source_word_location(ord_shift_src, 1, ord_shift_ctx, ord_shift_ctx.find("too").unwrap(), 1),
+        Some((1, ord_too_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            ord_shift_src,
+            1,
+            ord_shift_ctx,
+            ord_shift_ctx.find("too").unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 1,
+            byte: ord_too_byte,
+        }))
+    );
+
+    let tabx_shift_src = "\\begin{tabularx}{\\linewidth}{lll}\nYes & $-$ & ok \\\\\nYes & \\cref{sec:a} & ok \\\\\nYes & \\cite{key} table & ok \\\\\n\\end{tabularx}\n";
+    let tabx_shift_ctx = "Yes − ok Yes section 1 ok Yes [7] table ok";
+    let tabx_table_byte = tabx_shift_src.lines().nth(3).unwrap().find("table").unwrap();
+    assert_eq!(
+        source_word_location(tabx_shift_src, 5, tabx_shift_ctx, tabx_shift_ctx.find('7').unwrap(), 5),
+        None
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            tabx_shift_src,
+            5,
+            tabx_shift_ctx,
+            tabx_shift_ctx.find('7').unwrap(),
+            5,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+    assert_eq!(
+        source_word_location(tabx_shift_src, 5, tabx_shift_ctx, tabx_shift_ctx.find("table").unwrap(), 5),
+        Some((4, tabx_table_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            tabx_shift_src,
+            5,
+            tabx_shift_ctx,
+            tabx_shift_ctx.find("table").unwrap(),
+            5,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 4,
+            byte: tabx_table_byte,
+        }))
+    );
+
+    // Main-stream and footnote-stream slots with identical surrounding flanks must compete.
+    let fn_cite_src = "See \\cite{key} for details.\\footnote{See \\cref{sec:a} for details.}\n";
+    let fn_cite_ctx = "See [7] for details.1";
+    assert_eq!(
+        source_word_location(fn_cite_src, 1, fn_cite_ctx, fn_cite_ctx.find('7').unwrap(), 1),
+        None
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            fn_cite_src,
+            1,
+            fn_cite_ctx,
+            fn_cite_ctx.find('7').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    let fn_math_src = "See $\\alpha$ for details.\\footnote{See \\cref{sec:a} for details.}\n";
+    let fn_math_ctx = "See α for details.1";
+    let fn_alpha_byte = fn_math_src.find("\\alpha").unwrap();
+    assert_eq!(
+        source_word_location(fn_math_src, 1, fn_math_ctx, fn_math_ctx.find('α').unwrap(), 1),
+        Some((1, fn_alpha_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            fn_math_src,
+            1,
+            fn_math_ctx,
+            fn_math_ctx.find('α').unwrap(),
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 1,
+            byte: fn_alpha_byte,
+        }))
+    );
+
+    // Non-printing spacing/index arguments consume their mandatory group without inserting words.
+    let hspace_src = "Before \\hspace{1em} \\cref{sec:a} after.\n";
+    let hspace_ctx = "Before section 1 after.";
+    let hspace_byte = hspace_src.find("sec:a").unwrap();
+    for needle in ["section", "1"] {
+        let offset = hspace_ctx.find(needle).unwrap();
+        assert_eq!(
+            source_word_location(hspace_src, 1, hspace_ctx, offset, 1),
+            Some((1, hspace_byte))
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                hspace_src,
+                1,
+                hspace_ctx,
+                offset,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 1,
+                byte: hspace_byte,
+            }))
+        );
+    }
+
+    // Same-line page breaks must not let context-edge spans claim page-furniture numbers.
+    for (footer_src, footer_ctx, num) in [
+        ("Alpha \\cref{sec:a}\\clearpage\n", "Alpha section 1 5", '5'),
+        ("Beta \\cref{sec:a}\\par\\clearpage\n", "Beta section 1 6", '6'),
+        ("\\cref{sec:a} done.\\clearpage\n", "7 section 1 done.", '7'),
+    ] {
+        let off = footer_ctx.find(num).unwrap();
+        assert_eq!(source_word_location(footer_src, 1, footer_ctx, off, 1), None);
+        assert!(matches!(
+            source_word_guess_with_sources(
+                footer_src,
+                1,
+                footer_ctx,
+                off,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None) | Err(())
+        ));
+    }
+    let nextline_pb_src = "Gamma \\cref{sec:a}\n\\clearpage\n";
+    let nextline_pb_ctx = "Gamma section 1";
+    let nextline_pb_byte = nextline_pb_src.find("sec:a").unwrap();
+    for needle in ["section", "1"] {
+        let off = nextline_pb_ctx.find(needle).unwrap();
+        assert_eq!(
+            source_word_location(nextline_pb_src, 1, nextline_pb_ctx, off, 1),
+            Some((1, nextline_pb_byte))
+        );
+    }
+
+    // Positive footnote reference with unjoined inner flank word refines in both modes,
+    // even when a neighboring line in the local window has a shorter-flank footnote or math clause.
+    let fn_pos_src = "Alpha.\\footnote{Note see \\cref{sec:a} for details.}\\clearpage\n\
+                      Beta.\\footnote{See \\cref{sec:a} for details.}\\clearpage\n";
+    let fn_pos_ctx = "Alpha. 1 1Note see section 1 for details.";
+    let fn_pos_byte = fn_pos_src.find("sec:a").unwrap();
+    for needle in ["section", "1"] {
+        let off = fn_pos_ctx.rfind(needle).unwrap();
+        assert_eq!(
+            source_word_location(fn_pos_src, 1, fn_pos_ctx, off, 1),
+            Some((1, fn_pos_byte))
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                fn_pos_src,
+                1,
+                fn_pos_ctx,
+                off,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 1,
+                byte: fn_pos_byte,
+            }))
+        );
+    }
+    let fn_body_math_src =
+        "Other see $88$ for details.\\footnote{Note see \\cref{sec:a} for details.}\n";
+    let fn_body_math_ctx = "Other see 88 for details.";
+    let fn_body_math_off = fn_body_math_ctx.find("88").unwrap();
+    let fn_body_math_byte = fn_body_math_src.find("88").unwrap();
+    let fn_body_ref_byte = fn_body_math_src.find("sec:a").unwrap();
+    assert_ne!(fn_body_math_byte, fn_body_ref_byte);
+    assert_eq!(
+        source_word_location(fn_body_math_src, 1, fn_body_math_ctx, fn_body_math_off, 2),
+        Some((1, fn_body_math_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            fn_body_math_src,
+            1,
+            fn_body_math_ctx,
+            fn_body_math_off,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 1,
+            byte: fn_body_math_byte,
+        }))
+    );
+
+    // Shorter-left main-body competitors (paragraph-start and \item-start citations/math) must count against footnote-head references.
+    for (short_cite_src, short_cite_line) in [
+        (
+            "Alpha.\n\nSee \\cite{key} for details.\\footnote{Note see \\cref{sec:a} for details.}\n",
+            3u32,
+        ),
+        (
+            "\\begin{itemize}\n\\item See \\cite{key} for details.\\footnote{Note see \\cref{sec:a} for details.}\n\\end{itemize}\n",
+            2u32,
+        ),
+    ] {
+        let short_cite_ctx = "See [7] for details.";
+        let short_cite_off = short_cite_ctx.find('7').unwrap();
+        assert_eq!(
+            source_word_location(
+                short_cite_src,
+                short_cite_line,
+                short_cite_ctx,
+                short_cite_off,
+                3
+            ),
+            None
+        );
+        assert!(matches!(
+            source_word_guess_with_sources(
+                short_cite_src,
+                short_cite_line,
+                short_cite_ctx,
+                short_cite_off,
+                3,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None) | Err(())
+        ));
+    }
+    let short_math_src =
+        "Alpha.\n\nSee $88$ for details.\\footnote{Note see \\cref{sec:a} for details.}\n";
+    let short_math_ctx = "See 88 for details.";
+    let short_math_off = short_math_ctx.find("88").unwrap();
+    let short_math_byte = short_math_src.lines().nth(2).unwrap().find("88").unwrap();
+    assert_eq!(
+        source_word_location(short_math_src, 3, short_math_ctx, short_math_off, 3),
+        Some((3, short_math_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            short_math_src,
+            3,
+            short_math_ctx,
+            short_math_off,
+            3,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 3,
+            byte: short_math_byte,
+        }))
+    );
+    let short_alpha_src =
+        "Alpha.\n\nSee $\\alpha$ for details.\\footnote{Note see \\cref{sec:a} for details.}\n";
+    let short_alpha_ctx = "See α for details.";
+    let short_alpha_off = short_alpha_ctx.find('α').unwrap();
+    let short_alpha_byte = short_alpha_src
+        .lines()
+        .nth(2)
+        .unwrap()
+        .find("\\alpha")
+        .unwrap();
+    assert_eq!(
+        source_word_location(short_alpha_src, 3, short_alpha_ctx, short_alpha_off, 3),
+        Some((3, short_alpha_byte))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            short_alpha_src,
+            3,
+            short_alpha_ctx,
+            short_alpha_off,
+            3,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 3,
+            byte: short_alpha_byte,
+        }))
+    );
+
+    // Same-line \clearpage in main_stream prevents an ending footnote reference from absorbing trailing page footer numbers,
+    // while bare-EOF and next-source-line pagebreaks keep generated footnote reference tokens accurate.
+    let fn_pb_src = "Alpha.\\footnote{One two three see \\cref{sec:a}.}\\clearpage\n";
+    let fn_pb_footer_ctx = "Alpha. 1 1One two three see section 1. 5";
+    let fn_pb_footer_off = fn_pb_footer_ctx.rfind('5').unwrap();
+    assert_eq!(
+        source_word_location(fn_pb_src, 1, fn_pb_footer_ctx, fn_pb_footer_off, 1),
+        None
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            fn_pb_src,
+            1,
+            fn_pb_footer_ctx,
+            fn_pb_footer_off,
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+    for fn_eof_src in [
+        "Alpha.\\footnote{One two three see \\cref{sec:a}.}\n",
+        "Alpha.\\footnote{One two three see \\cref{sec:a}.}\n\\clearpage\n",
+    ] {
+        let fn_eof_ctx = "Alpha. 1 1One two three see section 1.";
+        let fn_eof_byte = fn_eof_src.find("sec:a").unwrap();
+        for needle in ["section", "1."] {
+            let off = fn_eof_ctx.rfind(needle).unwrap();
+            assert_eq!(
+                source_word_location(fn_eof_src, 1, fn_eof_ctx, off, 2),
+                Some((1, fn_eof_byte))
+            );
+            assert_eq!(
+                source_word_guess_with_sources(
+                    fn_eof_src,
+                    1,
+                    fn_eof_ctx,
+                    off,
+                    2,
+                    &[],
+                    &Operation::new(Duration::from_secs(10)),
+                ),
+                Ok(Some(UnverifiedWordLocation {
+                    line: 1,
+                    byte: fn_eof_byte,
+                }))
+            );
+        }
+    }
+
+    let fn_glued_src = "Beta.\\footnote{See \\cref{sec:a} for details.}\\clearpage\n";
+    let fn_glued_ctx = "Beta. 2 2See section 1 for details.";
+    let beta_off = fn_glued_ctx.find("Beta").unwrap();
+    assert_eq!(
+        source_word_location(fn_glued_src, 1, fn_glued_ctx, beta_off, 1),
+        Some((1, 0))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            fn_glued_src,
+            1,
+            fn_glued_ctx,
+            beta_off,
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation { line: 1, byte: 0 }))
+    );
+    for needle in ["section", "1"] {
+        let off = fn_glued_ctx.rfind(needle).unwrap();
+        assert_eq!(
+            source_word_location(fn_glued_src, 1, fn_glued_ctx, off, 1),
+            None
+        );
+        assert!(matches!(
+            source_word_guess_with_sources(
+                fn_glued_src,
+                1,
+                fn_glued_ctx,
+                off,
+                1,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None) | Err(())
+        ));
+    }
+
+    // Printed optional arguments (\item[...], \begin{thm}[...]) and internal-boundary generated segments compete as slots.
+    for opt_comp_src in [
+        "By \\cref{sec:a} then.\n\\begin{itemize}\n\\item[By \\cite{key} then] Item.\n\\end{itemize}\n",
+        "By \\cref{sec:a} then.\n\\begin{thm}[By \\cite{key} then]\nBody.\n\\end{thm}\n",
+        "By \\cref{sec:a} then.\n\nBy \\cite{a} \\\\ \\cite{b} then.\n",
+        "By \\cref{sec:a} then.\n\nBy \\cite{key} \\\\ more then.\n",
+    ] {
+        let opt_ctx = "By [7] then";
+        let off = opt_ctx.find('7').unwrap();
+        assert_eq!(source_word_location(opt_comp_src, 1, opt_ctx, off, 4), None);
+        assert!(matches!(
+            source_word_guess_with_sources(
+                opt_comp_src,
+                1,
+                opt_ctx,
+                off,
+                4,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None) | Err(())
+        ));
+    }
+
+    // Global crefformat scanner consumes only its fixed 2 mandatory groups, not following braced prose.
+    let crefformat_prose_src = "\\crefformat{section}{#2#1#3 zone}\n{\\itshape Printed} word.\n";
+    let crefformat_prose_ctx = "Printed word.";
+    let printed_byte = crefformat_prose_src.lines().nth(1).unwrap().find("Printed").unwrap();
+    assert_eq!(
+        source_word_location(crefformat_prose_src, 2, crefformat_prose_ctx, 0, 1),
+        Some((2, printed_byte))
+    );
+
+    // Malformed, empty, comment-only, macro-inside-key, overridden, and ambiguous cases abstain.
+    for bad in [
+        "See \\cref{} done.\n",
+        "See \\cref{ % only comment\n} done.\n",
+        "See \\cref{\\macrokey} done.\n",
+        "See \\cref{sec:a,,sec:b} done.\n",
+        "\\newcommand{\\cref}[1]{section 1}\nSee \\cref{sec:alpha} done.\n",
+        "See \\cref{sec:alpha} \\cref{sec:beta} done.\n",
+    ] {
+        let line = bad.lines().count() as u32;
+        assert_eq!(
+            source_word_location(bad, line, "See section 1 done.", 4, 2),
+            None,
+            "expected strict abstention for {bad:?}"
+        );
+    }
+    let ambiguous_frame = "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\n\\end{frame}\n";
+    assert_eq!(
+        source_word_location(ambiguous_frame, 4, "See section 1 done.", 4, 4),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            ambiguous_frame,
+            4,
+            "See section 1 done.",
+            4,
+            4,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Err(())
+    );
+    let tied_frame_with_literal =
+        "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\nLiteral token here.\n\\end{frame}\n";
+    let tied_frame_ctx = "See section 1 done. Literal token here.";
+    assert_eq!(
+        source_word_guess_with_sources(
+            tied_frame_with_literal,
+            5,
+            tied_frame_ctx,
+            tied_frame_ctx.find("Literal").unwrap(),
+            4,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation { line: 4, byte: 0 }))
+    );
 }
 
 #[test]
@@ -5808,6 +7593,413 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         prose_hit.location.byte_column,
         "We study $\\PreambleSym$ and \\RootWrapper{".len()
     );
+
+    // Zero-argument fixed literal prose macros refine to their invocation backslash in both local and imported modes.
+    let defs_src = "\\newcommand{\\QX}{QX}\n\\newcommand{\\BadParam}[1]{#1}\n\\newcommand{\\BadCtr}{\\arabic{page}}\n";
+    let body_src = concat!(
+        "\\section{ Target }\n",
+        "𐐀 Café amber of teal lanterns drifts \\QX{} by that harbor.\n",
+        "\n",
+        "Marmalade filler row.\n",
+        "Six \\texttt{\\QX{}+ZYW} kettle wanders sideways.\n",
+    );
+    let line2 = body_src.lines().nth(1).unwrap();
+    let plain_qx_byte = line2.find("\\QX").unwrap();
+    let plain_qx_utf16 = line2[..plain_qx_byte].encode_utf16().count() + 1;
+    let plain_qx_char = line2[..plain_qx_byte].chars().count() + 1;
+    assert!(plain_qx_byte > plain_qx_utf16 && plain_qx_utf16 > plain_qx_char);
+    let line5 = body_src.lines().nth(4).unwrap();
+    let wrapped_qx_byte = line5.find("\\QX").unwrap();
+
+    let plain_ctx = "𐐀 Café amber of teal lanterns drifts QX by that harbor.";
+    let plain_off = plain_ctx.find("QX").unwrap();
+    let wrapped_ctx = "Six QX+ZYW kettle wanders sideways.";
+    let wrapped_off = wrapped_ctx.find("QX").unwrap();
+
+    for extra in [&[defs_src][..], &[][..]] {
+        let full_body = if extra.is_empty() {
+            format!("{defs_src}{body_src}")
+        } else {
+            body_src.to_string()
+        };
+        let line_shift = if extra.is_empty() { 3 } else { 0 };
+        assert_eq!(
+            source_word_location_with_sources(
+                &full_body,
+                2 + line_shift,
+                plain_ctx,
+                plain_off,
+                1,
+                extra,
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some((2 + line_shift, plain_qx_byte)))
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                &full_body,
+                2 + line_shift,
+                plain_ctx,
+                plain_off,
+                1,
+                extra,
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 2 + line_shift,
+                byte: plain_qx_byte,
+            }))
+        );
+        assert_eq!(
+            source_word_location_with_sources(
+                &full_body,
+                5 + line_shift,
+                wrapped_ctx,
+                wrapped_off,
+                1,
+                extra,
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some((5 + line_shift, wrapped_qx_byte)))
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                &full_body,
+                5 + line_shift,
+                wrapped_ctx,
+                wrapped_off,
+                1,
+                extra,
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 5 + line_shift,
+                byte: wrapped_qx_byte,
+            }))
+        );
+    }
+
+    // End-to-end resolve_inverse on imported body file keeps destination in sub_tex (never preamble_tex) with exact UTF-8/UTF-16/scalar columns.
+    fs::write(&preamble_tex, defs_src).unwrap();
+    fs::write(&sub_tex, body_src).unwrap();
+    for best_guess in [false, true] {
+        let qx_hit = resolve_inverse(
+            &pdf,
+            InversePoint {
+                page: 1,
+                x: 20.0,
+                y_from_top: 100.0,
+                page_height_pt: 792.0,
+            },
+            Some((plain_ctx, plain_off)),
+            2,
+            &Operation::default(),
+            None,
+            best_guess,
+        )
+        .unwrap();
+        assert_eq!(qx_hit.location.file, sub_tex);
+        assert_eq!(qx_hit.location.line, 2);
+        assert_eq!(qx_hit.location.byte_column, plain_qx_byte);
+        assert_eq!(qx_hit.location.column, plain_qx_utf16);
+        assert_eq!(qx_hit.location.column_char, plain_qx_char);
+        assert!(qx_hit.location.precise);
+    }
+
+    // Identical redefinition is explicitly permitted by macros_from_sources.
+    let identical_redef_src = "\\renewcommand{\\QX}{QX}\nSee \\QX{} here.\n";
+    assert_eq!(
+        source_word_location_with_sources(
+            identical_redef_src,
+            2,
+            "See QX here.",
+            4,
+            2,
+            &[defs_src],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some((2, 4)))
+    );
+
+    // Equal-context macro/literal, macro/macro, conflicting, conditional, counter/param, hidden, and opaque cases stay conservative.
+    for (bad_src, bad_extra, expect_err_in_guess) in [
+        ("See \\QX{} here.\nSee QX here.\n", &[defs_src][..], true),
+        ("See \\QX{} here.\nSee \\QX{} here.\n", &[defs_src][..], true),
+        (
+            "\\renewcommand{\\QX}{\\textbf{QX}}\nSee \\QX{} here.\n",
+            &[defs_src][..],
+            false,
+        ),
+        (
+            "\\iftrue\\newcommand{\\QX}{QX}\\fi\nSee \\QX{} here.\n",
+            &[][..],
+            false,
+        ),
+        ("See \\BadCtr{} here.\n", &[defs_src][..], false),
+        ("See \\phantom{\\QX{}} here.\n", &[defs_src][..], false),
+        ("See \\phantom{QX} here.\n", &[defs_src][..], false),
+        ("See \\note{\\QX{}} here.\n", &[defs_src][..], true),
+    ] {
+        let line = bad_src.lines().count() as u32;
+        let strict_res = source_word_location_with_sources(
+            bad_src,
+            line,
+            "See QX here.",
+            4,
+            2,
+            bad_extra,
+            &Operation::new(Duration::from_secs(10)),
+        );
+        assert!(
+            matches!(strict_res, Ok(None) | Err(())),
+            "strict should abstain on {bad_src:?}: {strict_res:?}"
+        );
+        let guess_res = source_word_guess_with_sources(
+            bad_src,
+            line,
+            "See QX here.",
+            4,
+            2,
+            bad_extra,
+            &Operation::new(Duration::from_secs(10)),
+        );
+        if expect_err_in_guess {
+            assert_eq!(guess_res, Err(()), "guess should error on {bad_src:?}");
+        } else {
+            assert!(
+                matches!(guess_res, Ok(None) | Err(())),
+                "guess should not refine on {bad_src:?}: {guess_res:?}"
+            );
+        }
+    }
+    // Generated theorem/caption headings must not steal a body zero-arg macro via distant context_bonus alone (score > 0 required),
+    // while clicking the body macro occurrence with near-neighbor corroboration resolves to the macro invocation.
+    for (heading_src, heading_ctx, macro_token) in [
+        (
+            "\\newcommand{\\Thm}{Theorem}\n\\begin{thm} By \\Thm{} we have the result.\\end{thm}\n",
+            "Theorem 1. By Theorem we have the result.",
+            "\\Thm{}",
+        ),
+        (
+            "\\newcommand{\\Fig}{Figure}\n\\caption{By \\Fig{} we have the result.}\n",
+            "Figure 1: By Figure we have the result.",
+            "\\Fig{}",
+        ),
+    ] {
+        let body_macro_byte = heading_src.lines().nth(1).unwrap().find(macro_token).unwrap();
+        let body_pdf_off = heading_ctx.rfind("By ").unwrap() + "By ".len();
+        assert_eq!(
+            source_word_location_with_sources(
+                heading_src,
+                2,
+                heading_ctx,
+                0,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                heading_src,
+                2,
+                heading_ctx,
+                0,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Err(())
+        );
+        assert_eq!(
+            source_word_location_with_sources(
+                heading_src,
+                2,
+                heading_ctx,
+                body_pdf_off,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some((2, body_macro_byte)))
+        );
+        assert_eq!(
+            source_word_guess_with_sources(
+                heading_src,
+                2,
+                heading_ctx,
+                body_pdf_off,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(Some(UnverifiedWordLocation {
+                line: 2,
+                byte: body_macro_byte,
+            }))
+        );
+    }
+
+    // Known nonprinting spacing/index arguments (\hspace, \hspace*, \vspace, \vspace*, \index) do not expose inner macros to citations,
+    // while an explicit user redefinition (\renewcommand{\index}[1]{#1}) remains printable.
+    for nonprinting_gap_src in [
+        "\\newcommand{\\gap}{2}\nSee \\hspace{\\gap pt} \\cite{k} here.\n",
+        "\\newcommand{\\gap}{2}\nSee \\hspace*{\\gap pt} \\cite{k} here.\n",
+        "\\newcommand{\\gap}{2}\nSee \\vspace{\\gap pt} \\cite{k} here.\n",
+        "\\newcommand{\\gap}{2}\nSee \\vspace*{\\gap pt} \\cite{k} here.\n",
+        "\\newcommand{\\gap}{2}\nSee \\index{\\gap} \\cite{k} here.\n",
+        "\\newcommand{\\gap}{2}\nSee \\hspace\\gap \\cite{k} here.\n",
+    ] {
+        let gap_ctx = "See [2] here.";
+        let gap_off = gap_ctx.find('2').unwrap();
+        assert_eq!(
+            source_word_location_with_sources(
+                nonprinting_gap_src,
+                2,
+                gap_ctx,
+                gap_off,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None)
+        );
+        assert!(matches!(
+            source_word_guess_with_sources(
+                nonprinting_gap_src,
+                2,
+                gap_ctx,
+                gap_off,
+                2,
+                &[],
+                &Operation::new(Duration::from_secs(10)),
+            ),
+            Ok(None) | Err(())
+        ));
+    }
+    let printable_override_src =
+        "\\newcommand{\\gap}{2}\n\\renewcommand{\\index}[1]{#1}\nSee \\index{\\gap} here.\n";
+    let printable_override_byte = printable_override_src
+        .lines()
+        .nth(2)
+        .unwrap()
+        .find("\\gap")
+        .unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            printable_override_src,
+            3,
+            "See 2 here.",
+            4,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some((3, printable_override_byte)))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            printable_override_src,
+            3,
+            "See 2 here.",
+            4,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: 3,
+            byte: printable_override_byte,
+        }))
+    );
+
+    // Nested zero-arg macro expansion works within the 64 KiB cap and abstains cleanly when breadth exceeds 64 KiB.
+    let nested_ok_src = "\\newcommand{\\Leaf}{Target}\n\\newcommand{\\Mid}{\\Leaf{} \\Leaf{}}\n\\newcommand{\\Top}{\\Mid{} \\Mid{}}\nSee \\Top{} here.\n";
+    let nested_ok_ctx = "See Target Target Target Target here.";
+    assert_eq!(
+        source_word_location_with_sources(
+            nested_ok_src,
+            4,
+            nested_ok_ctx,
+            4,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some((4, 4)))
+    );
+    let blowup_src = "\\newcommand{\\Lzero}{Targetword Targetword Targetword Targetword}\n\
+                      \\newcommand{\\Lone}{\\Lzero{} \\Lzero{} \\Lzero{} \\Lzero{}}\n\
+                      \\newcommand{\\Ltwo}{\\Lone{} \\Lone{} \\Lone{} \\Lone{}}\n\
+                      \\newcommand{\\Lthree}{\\Ltwo{} \\Ltwo{} \\Ltwo{} \\Ltwo{}}\n\
+                      \\newcommand{\\Lfour}{\\Lthree{} \\Lthree{} \\Lthree{} \\Lthree{}}\n\
+                      \\newcommand{\\Lfive}{\\Lfour{} \\Lfour{} \\Lfour{} \\Lfour{}}\n\
+                      \\newcommand{\\Lsix}{\\Lfive{} \\Lfive{} \\Lfive{} \\Lfive{}}\n\
+                      See \\Lsix{} here.\n";
+    assert_eq!(
+        source_word_location_with_sources(
+            blowup_src,
+            8,
+            "See Targetword here.",
+            4,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            blowup_src,
+            8,
+            "See Targetword here.",
+            4,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    assert!(matches!(
+        source_word_location_with_sources(
+            "See \\QX{} here.\n",
+            1,
+            "QX",
+            0,
+            1,
+            &[defs_src],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+    assert!(matches!(
+        source_word_guess_with_sources(
+            "See \\QX{} here.\n",
+            1,
+            "QX",
+            0,
+            1,
+            &[defs_src],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None) | Err(())
+    ));
+    let expired = Operation::new(Duration::ZERO);
+    expired.cancel();
+    assert_eq!(
+        source_word_guess_with_sources(
+            "See \\QX{} here.\n",
+            1,
+            "See QX here.",
+            4,
+            1,
+            &[defs_src],
+            &expired,
+        ),
+        Err(())
+    );
 }
 
 #[test]
@@ -8103,4 +10295,425 @@ fn ambiguous_inverse_keeps_first_compiler_anchor() {
             assert!(result.warning.is_some());
         }
     }
+}
+
+#[test]
+fn clearpage_bounds_footnote_reference_competitors_to_same_page_segment() {
+    let source = concat!(
+        "Endfn.\\footnote{One two three see \\cref{sec:first}.}\\clearpage\n",
+        "\n",
+        "Page five text.\\footnote{Note see \\cref{sec:first} for details.}\\par\\clearpage\n",
+        "\n",
+        "See \\cite{kpar} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n",
+        "\\begin{itemize}\n",
+        "\\item See \\cite{kitm} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n",
+        "\\end{itemize}\n",
+    );
+    let fn2_line = 3u32;
+    let fn2_sec_byte = source
+        .lines()
+        .nth(fn2_line as usize - 1)
+        .unwrap()
+        .find("sec:first")
+        .unwrap();
+    let fn2_ctx = "1Note see section 1 for details.";
+    let fn2_off = fn2_ctx.find("section").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            source,
+            fn2_line,
+            fn2_ctx,
+            fn2_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(Some((fn2_line, fn2_sec_byte)))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            source,
+            fn2_line,
+            fn2_ctx,
+            fn2_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(Some(UnverifiedWordLocation {
+            line: fn2_line,
+            byte: fn2_sec_byte,
+        }))
+    );
+
+    let cite_ctx = "See [73] for details.1 Following material.";
+    let cite_off = cite_ctx.find("73").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            source,
+            5,
+            cite_ctx,
+            cite_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            source,
+            5,
+            cite_ctx,
+            cite_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
+}
+
+#[test]
+fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
+    let footline_last = concat!(
+        "\\documentclass{beamer}\n",
+        "\\setbeamertemplate{footline}[frame number]\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "Top lead.\n",
+        "\\begin{itemize}\n",
+        "\\item See \\ref{sec:frame}\n",
+        "\\end{itemize}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    let foot_ctx = "Top lead. See 71 1 / 1";
+    let foot_off = foot_ctx.rfind("1 / 1").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            footline_last,
+            10,
+            foot_ctx,
+            foot_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            footline_last,
+            10,
+            foot_ctx,
+            foot_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    let footline_first = concat!(
+        "\\documentclass{beamer}\n",
+        "\\setbeamertemplate{footline}[frame number]\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "\\ref{sec:frame} done.\n",
+        "Bottom tail.\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    let foot_first_ctx = "71 done. Bottom tail. 1 / 1";
+    let foot_first_off = foot_first_ctx.rfind("1 / 1").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            footline_first,
+            8,
+            foot_first_ctx,
+            foot_first_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            footline_first,
+            8,
+            foot_first_ctx,
+            foot_first_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    let headline_first = concat!(
+        "\\documentclass{beamer}\n",
+        "\\setbeamertemplate{headline}{Headerword}\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "\\ref{sec:frame} done.\n",
+        "Bottom tail.\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    let head_ctx = "Headerword 71 done. Bottom tail.";
+    let head_off = head_ctx.find("Headerword").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            headline_first,
+            8,
+            head_ctx,
+            head_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            headline_first,
+            8,
+            head_ctx,
+            head_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    let headline_last = concat!(
+        "\\documentclass{beamer}\n",
+        "\\setbeamertemplate{headline}{Headerword}\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "Top lead.\n",
+        "\\begin{itemize}\n",
+        "\\item See \\ref{sec:frame}\n",
+        "\\end{itemize}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    let head_last_ctx = "Headerword Top lead. See 71";
+    let head_last_off = head_last_ctx.find("Headerword").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            headline_last,
+            10,
+            head_last_ctx,
+            head_last_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            headline_last,
+            10,
+            head_last_ctx,
+            head_last_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
+
+    let pause_footline = concat!(
+        "\\documentclass{beamer}\n",
+        "\\setbeamertemplate{navigation symbols}{}\n",
+        "\\setbeamertemplate{footline}[frame number]\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "\\begin{itemize}\n",
+        "\\item See \\ref{sec:frame}\\pause then.\n",
+        "\\end{itemize}\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    for pause_ctx in ["See 71 1 / 1", "See 71then. 1 / 1"] {
+        for pause_off in [pause_ctx.find("1 / 1").unwrap(), pause_ctx.rfind('1').unwrap()] {
+            assert_eq!(
+                source_word_location_with_sources(
+                    pause_footline,
+                    10,
+                    pause_ctx,
+                    pause_off,
+                    1,
+                    &[],
+                    &Operation::default(),
+                ),
+                Ok(None),
+                "pause_ctx={pause_ctx:?} pause_off={pause_off}"
+            );
+            assert!(
+                matches!(
+                    source_word_guess_with_sources(
+                        pause_footline,
+                        10,
+                        pause_ctx,
+                        pause_off,
+                        1,
+                        &[],
+                        &Operation::default(),
+                    ),
+                    Ok(None) | Err(())
+                ),
+                "pause_ctx={pause_ctx:?} pause_off={pause_off}"
+            );
+        }
+    }
+
+    let flanked_frame = concat!(
+        "\\documentclass{beamer}\n",
+        "\\begin{document}\n",
+        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
+        "\\begin{frame}\n",
+        "Unique \\ref{sec:frame} here.\n",
+        "\\end{frame}\n",
+        "\\end{document}\n",
+    );
+    let pos_ctx = "Headerword Unique 71 here. 1 / 1";
+    let pos_off = pos_ctx.find("71").unwrap();
+    let expected_byte = flanked_frame
+        .lines()
+        .nth(4)
+        .unwrap()
+        .find("sec:frame")
+        .unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            flanked_frame,
+            6,
+            pos_ctx,
+            pos_off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(Some((5, expected_byte)))
+    );
+}
+
+#[test]
+fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
+    for sep in [
+        "\\pagebreak[0]",
+        "\\newpage",
+        "\\verb|\\clearpage|",
+        "\\item[\\clearpage]",
+    ] {
+        let same_line = format!(
+            "\\begin{{itemize}}\\item See \\ref{{sec:a}} for details. {sep} \\item See \\cite{{k}} for details.\\end{{itemize}}\n"
+        );
+        let ctx = "See 74 for details.";
+        let off = ctx.find("74").unwrap();
+        assert_eq!(
+            source_word_location_with_sources(
+                &same_line,
+                1,
+                ctx,
+                off,
+                1,
+                &[],
+                &Operation::default(),
+            ),
+            Ok(None),
+            "sep={sep}"
+        );
+        assert!(
+            matches!(
+                source_word_guess_with_sources(
+                    &same_line,
+                    1,
+                    ctx,
+                    off,
+                    1,
+                    &[],
+                    &Operation::default(),
+                ),
+                Ok(None) | Err(())
+            ),
+            "sep={sep}"
+        );
+
+        let in_frame = format!(
+            "\\begin{{frame}}\n\\begin{{itemize}}\n\\item See \\ref{{sec:a}} for details.\n{sep}\n\\item See \\cite{{k}} for details.\n\\end{{itemize}}\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location_with_sources(
+                &in_frame,
+                7,
+                ctx,
+                off,
+                1,
+                &[],
+                &Operation::default(),
+            ),
+            Ok(None),
+            "frame sep={sep}"
+        );
+        assert!(
+            matches!(
+                source_word_guess_with_sources(
+                    &in_frame,
+                    7,
+                    ctx,
+                    off,
+                    1,
+                    &[],
+                    &Operation::default(),
+                ),
+                Ok(None) | Err(())
+            ),
+            "frame sep={sep}"
+        );
+    }
+
+    let overridden_clearpage = concat!(
+        "\\renewcommand{\\clearpage}{}\n",
+        "\\begin{document}\n",
+        "\\begin{itemize}\\item See \\ref{sec:a} for details. \\clearpage \\item See \\cite{k} for details.\\end{itemize}\n",
+        "\\end{document}\n",
+    );
+    let ctx = "See 74 for details.";
+    let off = ctx.find("74").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            overridden_clearpage,
+            3,
+            ctx,
+            off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None)
+    );
+    assert!(matches!(
+        source_word_guess_with_sources(
+            overridden_clearpage,
+            3,
+            ctx,
+            off,
+            1,
+            &[],
+            &Operation::default(),
+        ),
+        Ok(None) | Err(())
+    ));
 }

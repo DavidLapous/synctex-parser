@@ -142,7 +142,7 @@ pub fn tabularx_closing_line(source: &str, line: u32) -> Option<u32> {
         .map(|(_, end)| end as u32 + 1)
 }
 
-pub(crate) fn caption_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+pub(crate) fn collected_text_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
     let row = validate_forward_source_position(source, line, column).ok()?;
     // End-of-line is a cursor boundary, not a character in the argument.
     let byte = row.char_indices().nth(column.checked_sub(1)? as usize)?.0;
@@ -151,7 +151,21 @@ pub(crate) fn caption_closing_line(source: &str, line: u32, column: u32) -> Opti
         .take(line.checked_sub(1)? as usize)
         .map(str::len)
         .sum::<usize>();
-    let body = math::caption_argument_at(source, start + byte)?;
+    let body = math::collected_text_argument_at(source, start + byte)?;
+    u32::try_from(source[..body.end].bytes().filter(|ch| *ch == b'\n').count())
+        .ok()?
+        .checked_add(1)
+}
+
+pub(crate) fn reference_argument_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    let row = validate_forward_source_position(source, line, column).ok()?;
+    let byte = row.char_indices().nth(column.checked_sub(1)? as usize)?.0;
+    let start = source
+        .split_inclusive('\n')
+        .take(line.checked_sub(1)? as usize)
+        .map(str::len)
+        .sum::<usize>();
+    let body = reference_argument_body_at(source, start + byte)?;
     u32::try_from(source[..body.end].bytes().filter(|ch| *ch == b'\n').count())
         .ok()?
         .checked_add(1)
@@ -1204,6 +1218,156 @@ pub(crate) fn source_word_guess_with_sources(
     .map(|location| location.map(|(line, byte)| UnverifiedWordLocation { line, byte }))
 }
 
+/// Run-in headings are shipped when TeX starts their following body paragraph.
+pub(crate) fn run_in_heading_compiler_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    let row = source
+        .split_inclusive('\n')
+        .nth(line.checked_sub(1)? as usize)?;
+    let row_start: usize = source
+        .split_inclusive('\n')
+        .take(line as usize - 1)
+        .map(str::len)
+        .sum();
+    let byte = row_start + row.char_indices().nth(column.checked_sub(1)? as usize)?.0;
+    let mut skip_until = 0;
+    let mut hidden = nonprinting_source_spans(source).peekable();
+    for (at, _) in source[..byte].match_indices('\\') {
+        if at < skip_until {
+            continue;
+        }
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= at) {
+            hidden.next();
+        }
+        if let Some((start, range, _)) = hidden.peek()
+            && *start <= at
+        {
+            skip_until = range.end;
+            continue;
+        }
+        let row_start = source[..at].rfind('\n').map_or(0, |at| at + 1);
+        let prefix = &source[row_start..at];
+        if source_line_text(prefix).len() != prefix.len() {
+            continue;
+        }
+        let (name, mut end) = math::command(source, at);
+        skip_until = math::quoted_token_end(source, name, end)
+            .or_else(|| math::opaque_command_end(source, name, end).map(|(end, _)| end))
+            .unwrap_or(end);
+        if skip_until > byte {
+            return None;
+        }
+        if !matches!(name, "paragraph" | "subparagraph") {
+            continue;
+        }
+        end += usize::from(source.as_bytes().get(end) == Some(&b'*'));
+        end = optional_argument_end(source, end).unwrap_or(end);
+        let Some((title, end)) = math::group(source, skip_source_space(source, end)) else {
+            continue;
+        };
+        if !title.contains(&byte) {
+            skip_until = end;
+            continue;
+        }
+        let mut body = skip_source_space(source, end);
+        while source.as_bytes().get(body) == Some(&b'\\') {
+            let (name, end) = math::command(source, body);
+            if !matches!(name, "label" | "index") {
+                break;
+            }
+            let (_, end) = math::group(source, skip_source_space(source, end))?;
+            body = skip_source_space(source, end);
+        }
+        if body == source.len()
+            || (source.as_bytes()[body] == b'\\'
+                && matches!(
+                    math::command(source, body).0,
+                    "end"
+                        | "part"
+                        | "chapter"
+                        | "section"
+                        | "subsection"
+                        | "subsubsection"
+                        | "paragraph"
+                        | "subparagraph"
+                ))
+        {
+            return None;
+        }
+        return Some(source[..body].bytes().filter(|&b| b == b'\n').count() as u32 + 1);
+    }
+    None
+}
+
+pub(crate) fn line_start_word_compiler_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    let previous_line = line.checked_sub(1)?;
+    let mut rows = source.lines();
+    let previous_row = rows.nth(previous_line.checked_sub(1)? as usize)?;
+    let previous = source_line_text(previous_row);
+    let row = rows.next()?;
+    let word = row.trim_start_matches([' ', '\t']);
+    if column as usize != row.len() - word.len() + 1
+        || !word.chars().next()?.is_alphanumeric()
+        || previous.trim().is_empty()
+        // shortcut: grouped or non-math command boundaries need scope proof for read-ahead.
+        || previous.contains(['{', '}'])
+        || previous
+            .match_indices('\\')
+            .any(|(at, _)| !math::in_region(previous, at))
+    {
+        return None;
+    }
+    let previous_start = previous_row.as_ptr() as usize - source.as_ptr() as usize;
+    let previous_end = previous_start + previous_row.len();
+    let mut skip_until = 0;
+    let mut hidden = nonprinting_source_spans(source).peekable();
+    for (at, _) in source[..previous_end].match_indices('\\') {
+        if at < skip_until {
+            continue;
+        }
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= at) {
+            hidden.next();
+        }
+        if let Some((start, range, _)) = hidden.peek()
+            && *start <= at
+        {
+            skip_until = range.end;
+            continue;
+        }
+        let row_start = source[..at].rfind('\n').map_or(0, |at| at + 1);
+        let prefix = &source[row_start..at];
+        if source_line_text(prefix).len() != prefix.len() {
+            continue;
+        }
+        let (name, mut end) = math::command(source, at);
+        skip_until = math::quoted_token_end(source, name, end)
+            .or_else(|| math::opaque_command_end(source, name, end).map(|(end, _)| end))
+            .unwrap_or(end);
+        if !matches!(
+            name,
+            "part"
+                | "chapter"
+                | "section"
+                | "subsection"
+                | "subsubsection"
+                | "paragraph"
+                | "subparagraph"
+        ) {
+            continue;
+        }
+        end = skip_source_space(source, end);
+        end += usize::from(source.as_bytes().get(end) == Some(&b'*'));
+        end = optional_argument_end(source, end).unwrap_or(end);
+        let (_, end) = math::argument(source, end, source.len(), false)?;
+        skip_until = end;
+        // A generated heading label must not borrow a body literal across its title.
+        if end > previous_start {
+            return None;
+        }
+    }
+    // TeX can tag a continued line's first literal word before advancing its input line.
+    Some(previous_line)
+}
+
 // Opaque word ownership also prohibits document-metadata fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn source_word_location_with_sources(
@@ -1257,7 +1421,7 @@ fn source_word_location_with_sources_mode(
         return Ok(Some(loc));
     }
     let anchor = line.checked_sub(1).map(|l| l as usize);
-    let scope = math::caption_lines(source, line)
+    let scope = math::collected_text_lines(source, line)
         .or_else(|| {
             environment_bounds_with_hidden(source, anchor?, "frame", &hidden)
                 .map(|(start, end)| start..end + 1)
@@ -1683,6 +1847,17 @@ fn known_note_independent_command(name: &str, mode: WordLocationMode) -> bool {
             | "footnote"
             | "label"
             | "ref"
+            | "eqref"
+            | "pageref"
+            | "autoref"
+            | "cref"
+            | "Cref"
+            | "crefname"
+            | "Crefname"
+            | "crefformat"
+            | "Crefformat"
+            | "newtheorem"
+            | "theoremstyle"
             | "cite"
     ) || mode == WordLocationMode::Guess
         && (known_formatting_switch(name)
@@ -1704,6 +1879,16 @@ fn known_note_independent_command(name: &str, mode: WordLocationMode) -> bool {
                     | "subparagraph"
                     | "subref"
                     | "noindent"
+                    | "rule"
+                    | "vspace"
+                    | "hspace"
+                    | "index"
+                    | "hypertarget"
+                    | "clearpage"
+                    | "newpage"
+                    | "pagebreak"
+                    | "pagestyle"
+                    | "thispagestyle"
             ))
         || !name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
 }
@@ -1950,6 +2135,10 @@ fn discarded_macro_args_with_macros(
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     // Without a known unused parameter, this pass cannot produce a discarded range.
     if !notes
+        && !source.contains("phantom")
+        && !source.contains("hspace")
+        && !source.contains("vspace")
+        && !source.contains("index")
         && !macros
             .values()
             .flatten()
@@ -1973,6 +2162,26 @@ fn discarded_macro_args_with_macros(
             continue;
         }
         if kind == InvocationKind::EnvironmentEnd {
+            continue;
+        }
+        if !notes
+            && kind == InvocationKind::Command
+            && matches!(
+                cmd,
+                "phantom" | "hphantom" | "vphantom" | "hspace" | "vspace" | "index"
+            )
+            && !macros.contains_key(cmd)
+        {
+            let mut arg_at =
+                at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+            while let Some(opt_end) =
+                optional_argument_end(source, arg_at).or_else(|| overlay_argument_end(source, arg_at))
+            {
+                arg_at = opt_end;
+            }
+            if let Some((_, end)) = note_argument(source, arg_at, range.end, parameters) {
+                ranges.push(start..end);
+            }
             continue;
         }
         if kind == InvocationKind::Command && cmd == "note" && !macros.contains_key("note") {
@@ -2201,7 +2410,7 @@ fn source_word_location_in_range_with_hidden(
         mode,
         operation,
     )?;
-    let candidate = math::source_location_with_context_mode(
+    let mut candidate = math::source_location_with_context_mode(
         source,
         line,
         lines.clone(),
@@ -2234,6 +2443,38 @@ fn source_word_location_in_range_with_hidden(
         }
         ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
     });
+    let prose_score = prose.map_or(0, |(_, _, score)| score);
+    match source_reference_argument_location(
+        source,
+        line,
+        &lines,
+        within_scope,
+        context,
+        offset,
+        extra_sources,
+        &hidden,
+        &loops,
+        &opaque,
+        mode,
+        operation,
+    ) {
+        Ok(Some((ref_row, ref_byte, ref_score, ref_both_sides)))
+            if candidate.is_none()
+                || (prose_score == 0
+                    && candidate.is_some_and(|(row, _)| row != line)
+                    && ref_score > 0)
+                || (ref_both_sides && ref_score > prose_score) =>
+        {
+            candidate = Some((ref_row, ref_byte));
+        }
+        Ok(_) => {}
+        Err(()) => {
+            operation.check().map_err(|_| ())?;
+            if candidate.is_none() {
+                return Err(());
+            }
+        }
+    }
     if candidate.is_none() && !opaque.is_empty() {
         // An opaque tie is not evidence for document-metadata ownership.
         return Err(());
@@ -2251,6 +2492,1248 @@ fn source_word_location_in_range_with_hidden(
         }
     }
     Ok(candidate)
+}
+
+fn is_direct_reference_command(name: &str) -> bool {
+    matches!(
+        name,
+        "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref"
+    )
+}
+
+fn valid_reference_label_start(
+    source: &str,
+    span: &std::ops::Range<usize>,
+) -> Option<(usize, Vec<String>)> {
+    if span.start >= span.end || span.end > source.len() {
+        return None;
+    }
+    let label_start = skip_source_space(&source[..span.end], span.start);
+    if label_start >= span.end {
+        return None;
+    }
+    let mut visible = String::with_capacity(span.end - label_start);
+    let mut at = label_start;
+    while at < span.end {
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..span.end].find('\n').map_or(span.end - at, |p| p + 1);
+            }
+            b'\\' | b'{' | b'}' | b'#' => return None,
+            _ => {
+                let ch = source[at..span.end].chars().next()?;
+                visible.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+    if visible.split(',').any(|item| item.trim().is_empty()) {
+        return None;
+    }
+    let key_items = visible
+        .split(',')
+        .map(|item| item.trim().to_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect();
+    Some((label_start, key_items))
+}
+
+fn reference_argument_body_at(source: &str, target: usize) -> Option<std::ops::Range<usize>> {
+    if target > source.len()
+        || !["\\ref", "\\eqref", "\\pageref", "\\autoref", "\\cref", "\\Cref"]
+            .iter()
+            .any(|needle| source[..target].contains(needle))
+    {
+        return None;
+    }
+    for (cmd_start, span, _) in nonprinting_source_spans(source) {
+        if cmd_start > target {
+            break;
+        }
+        let (name, _) = math::command(source, cmd_start);
+        if is_direct_reference_command(name)
+            && span.start > cmd_start
+            && source.as_bytes().get(span.start - 1) == Some(&b'{')
+            && source.as_bytes().get(span.end) == Some(&b'}')
+            && (span.start..=span.end).contains(&target)
+            && valid_reference_label_start(source, &span).is_some()
+        {
+            return Some(span.start - 1..span.end + 1);
+        }
+    }
+    None
+}
+
+fn transparent_reference_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "textbf"
+            | "textit"
+            | "emph"
+            | "textrm"
+            | "textsf"
+            | "texttt"
+            | "textnormal"
+            | "textcolor"
+            | "underline"
+            | "mbox"
+            | "hbox"
+            | "vbox"
+            | "vtop"
+            | "vcenter"
+            | "footnote"
+            | "caption"
+            | "frametitle"
+            | "framesubtitle"
+            | "title"
+            | "subtitle"
+            | "author"
+            | "date"
+            | "institute"
+            | "part"
+            | "chapter"
+            | "section"
+            | "subsection"
+            | "subsubsection"
+            | "paragraph"
+            | "subparagraph"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_reference_argument_location(
+    source: &str,
+    line: u32,
+    lines: &std::ops::Range<usize>,
+    within_scope: bool,
+    context: &str,
+    offset: usize,
+    extra_sources: &[&str],
+    hidden: &[std::ops::Range<usize>],
+    loops: &[ForeachLoop<'_>],
+    opaque: &[std::ops::Range<usize>],
+    mode: WordLocationMode,
+    operation: &crate::Operation,
+) -> Result<Option<(u32, usize, isize, bool)>, ()> {
+    operation.check().map_err(|_| ())?;
+    if !loops.is_empty() || !opaque.is_empty() {
+        return Ok(None);
+    }
+    let raw_pdf = words(context);
+    let Some(selected) = word_index_at(context, &raw_pdf, offset).or_else(|| {
+        match context.as_bytes().get(offset).copied() {
+            Some(b'(' | b'[') => word_index_at(context, &raw_pdf, offset + 1),
+            Some(b')' | b']') if offset > 0 => word_index_at(context, &raw_pdf, offset - 1),
+            _ => None,
+        }
+    }) else {
+        return Ok(None);
+    };
+    let pdf: Vec<String> = raw_pdf.iter().map(|(_, word)| normalized_word(word)).collect();
+    if pdf.get(selected).is_none_or(String::is_empty) {
+        return Ok(None);
+    }
+    let anchor = usize::try_from(line.checked_sub(1).ok_or(())?).map_err(|_| ())?;
+    let mut line_starts = Vec::with_capacity(source.lines().count() + 1);
+    let mut acc = 0usize;
+    for raw in source.split_inclusive('\n') {
+        line_starts.push(acc);
+        acc += raw.len();
+    }
+    if line_starts.is_empty() {
+        return Ok(None);
+    }
+    let scope_start = *line_starts.get(lines.start).unwrap_or(&source.len());
+    let scope_end = if lines.end < line_starts.len() {
+        line_starts[lines.end]
+    } else {
+        source.len()
+    };
+    if scope_start >= scope_end {
+        return Ok(None);
+    }
+    let stream_lines = if within_scope {
+        lines.clone()
+    } else {
+        lines.start.min(anchor.saturating_sub(4))
+            ..lines.end.max(anchor.saturating_add(5)).min(line_starts.len())
+    };
+    let stream_start = *line_starts.get(stream_lines.start).unwrap_or(&scope_start);
+    let stream_end = if stream_lines.end < line_starts.len() {
+        line_starts[stream_lines.end]
+    } else {
+        source.len()
+    };
+    if !["\\ref", "\\eqref", "\\pageref", "\\autoref", "\\cref", "\\Cref"]
+        .iter()
+        .any(|needle| source[stream_start..stream_end].contains(needle))
+    {
+        return Ok(None);
+    }
+    if custom_env_prints_word(source, lines, hidden, extra_sources, &pdf[selected], operation) {
+        return Ok(None);
+    }
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let macros = mode.macros(&macro_sources, operation);
+
+    #[derive(Clone)]
+    struct RefCandidate {
+        cmd_start: usize,
+        full_end: usize,
+        label_line: u32,
+        label_byte: usize,
+        start_line: usize,
+        end_line: usize,
+        key_words: Vec<String>,
+        footnote_body: Option<std::ops::Range<usize>>,
+    }
+
+    let mut span_start = stream_start;
+    let mut span_end = stream_end;
+    let mut footnote_bodies = Vec::new();
+    let mut non_transparent_groups = Vec::new();
+    let mut scan = 0usize;
+    while scan < stream_end {
+        operation.check().map_err(|_| ())?;
+        match source.as_bytes()[scan] {
+            b'%' => {
+                scan += source[scan..stream_end]
+                    .find('\n')
+                    .map_or(stream_end - scan, |p| p + 1);
+            }
+            b'\\' => {
+                let (cmd, next) = math::command(source, scan);
+                scan = next;
+                if !cmd
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                {
+                    continue;
+                }
+                if let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, scan) {
+                    if opaque_end > stream_start {
+                        non_transparent_groups.push(scan..opaque_end);
+                    }
+                    scan = opaque_end;
+                    continue;
+                }
+                let mut arg_at =
+                    scan + usize::from(matches!(source.as_bytes().get(scan), Some(b'*' | b'+')));
+                while let Some(opt_end) =
+                    optional_argument_end(source, arg_at).or_else(|| overlay_argument_end(source, arg_at))
+                {
+                    if opt_end > stream_start {
+                        non_transparent_groups.push(arg_at..opt_end);
+                    }
+                    arg_at = opt_end;
+                }
+                // An override may print around its argument, so no built-in role survives it.
+                let overridden = macros.contains_key(cmd);
+                if !overridden
+                    && cmd == "footnote"
+                    && let Some((body, _)) = math::group(source, skip_source_space(source, arg_at))
+                {
+                    if body.end > stream_start {
+                        let fn_line = line_starts
+                            .partition_point(|&s| s <= scan)
+                            .saturating_sub(1);
+                        span_start = span_start.min(line_starts[fn_line]).min(body.start);
+                        span_end = span_end.max(body.end);
+                        footnote_bodies.push(body);
+                    }
+                } else if !is_direct_reference_command(cmd)
+                    && (overridden
+                        || (!transparent_reference_wrapper(cmd)
+                            && !known_formatting_switch(cmd)
+                            && !matches!(
+                                cmd,
+                                "begin"
+                                    | "end"
+                                    | "href"
+                                    | "label"
+                                    | "item"
+                                    | "par"
+                                    | "noindent"
+                                    | "centering"
+                                    | "raggedright"
+                                    | "raggedleft"
+                                    | "pause"
+                                    | "begingroup"
+                                    | "endgroup"
+                                    | "bgroup"
+                                    | "egroup"
+                                    | "smallskip"
+                                    | "medskip"
+                                    | "bigskip"
+                                    | "allowbreak"
+                                    | "linebreak"
+                                    | "pagebreak"
+                                    | "newpage"
+                                    | "clearpage"
+                                    | "cleardoublepage"
+                                    | "vfill"
+                                    | "hfill"
+                                    | "quad"
+                                    | "qquad"
+                                    | "thinspace"
+                                    | "enspace"
+                                    | "slash"
+                                    | "maketitle"
+                                    | "titlepage"
+                            )))
+                    && let Some((body, end)) =
+                        math::group(source, skip_source_space(source, arg_at))
+                    && end > stream_start
+                {
+                    non_transparent_groups.push(body.start.saturating_sub(1)..end);
+                }
+            }
+            _ => {
+                scan += source[scan..stream_end]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8);
+            }
+        }
+    }
+
+    let mut refs = Vec::new();
+    let mut all_spans = Vec::new();
+    for (cmd_start, span, _) in
+        nonprinting_source_spans_with_mode(source, Some(&macros), mode, Some(operation))
+    {
+        if span.end <= span_start || cmd_start >= span_end {
+            continue;
+        }
+        all_spans.push((cmd_start, span.clone()));
+        let (name, _) = math::command(source, cmd_start);
+        if !is_direct_reference_command(name)
+            || macros.contains_key(name)
+            || span.start <= cmd_start
+            || source.as_bytes().get(span.start - 1) != Some(&b'{')
+            || source.as_bytes().get(span.end) != Some(&b'}')
+        {
+            continue;
+        }
+        let full_end = span.end + 1;
+        if non_transparent_groups
+            .iter()
+            .any(|g| g.start <= cmd_start && full_end <= g.end)
+            || opaque.iter().any(|r| r.start < full_end && cmd_start < r.end)
+        {
+            continue;
+        }
+        let Some((label_start, key_words)) = valid_reference_label_start(source, &span) else {
+            continue;
+        };
+        let start_line = line_starts
+            .partition_point(|&s| s <= cmd_start)
+            .saturating_sub(1);
+        let end_line = line_starts
+            .partition_point(|&s| s < full_end)
+            .saturating_sub(1);
+        let in_scope = if within_scope {
+            lines.contains(&start_line) && lines.contains(&end_line)
+        } else {
+            (start_line..=end_line).contains(&anchor)
+        };
+        if !in_scope {
+            continue;
+        }
+        let label_line_idx = line_starts
+            .partition_point(|&s| s <= label_start)
+            .saturating_sub(1);
+        if hidden.iter().any(|r| {
+            r.contains(&label_start) && !(r.start == span.start && r.end == span.end)
+        }) {
+            continue;
+        }
+        let footnote_body = footnote_bodies
+            .iter()
+            .find(|b| b.start <= cmd_start && full_end <= b.end)
+            .cloned();
+        refs.push(RefCandidate {
+            cmd_start,
+            full_end,
+            label_line: label_line_idx as u32 + 1,
+            label_byte: label_start - line_starts[label_line_idx],
+            start_line,
+            end_line,
+            key_words,
+            footnote_body,
+        });
+    }
+    if refs.is_empty() {
+        return Ok(None);
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum StreamItem {
+        Word(String),
+        Ref(usize),
+        OtherGenerated,
+        Boundary,
+        PageBreak(usize, usize, bool),
+    }
+
+    let build_stream =
+        |region: std::ops::Range<usize>, inside_footnote: bool| -> Result<Vec<StreamItem>, ()> {
+            let mut items = Vec::new();
+            let mut bracket_ends = Vec::new();
+            if inside_footnote {
+                items.push(StreamItem::Boundary);
+                items.push(StreamItem::OtherGenerated);
+            }
+            let mut at = region.start;
+            while at < region.end {
+                operation.check().map_err(|_| ())?;
+                if !inside_footnote
+                    && let Some(fn_body) = footnote_bodies
+                        .iter()
+                        .find(|b| b.start.saturating_sub(1) <= at && at <= b.end)
+                {
+                    items.push(StreamItem::OtherGenerated);
+                    at = (fn_body.end + 1).min(region.end);
+                    continue;
+                }
+                if let Some((ref_idx, cand)) = refs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, r)| r.cmd_start == at && r.footnote_body.is_some() == inside_footnote)
+                {
+                    items.push(StreamItem::Ref(ref_idx));
+                    at = cand.full_end.min(region.end);
+                    continue;
+                }
+                match source.as_bytes()[at] {
+                    b'%' => {
+                        at += source[at..region.end]
+                            .find('\n')
+                            .map_or(region.end - at, |p| p + 1);
+                    }
+                    b'\n' => {
+                        let next_line_end = source[at + 1..region.end]
+                            .find('\n')
+                            .map_or(region.end, |p| at + 1 + p);
+                        if source[at + 1..next_line_end].trim().is_empty() {
+                            items.push(StreamItem::Boundary);
+                        }
+                        at += 1;
+                    }
+                    b'&' => {
+                        items.push(StreamItem::Boundary);
+                        at += 1;
+                    }
+                    b'$' => {
+                        items.push(StreamItem::OtherGenerated);
+                        let delim = if source.as_bytes().get(at + 1) == Some(&b'$') {
+                            2
+                        } else {
+                            1
+                        };
+                        at += delim;
+                        while at < region.end {
+                            if source.as_bytes()[at] == b'\\' {
+                                at += 1 + source[at + 1..region.end]
+                                    .chars()
+                                    .next()
+                                    .map_or(0, char::len_utf8);
+                            } else if source.as_bytes()[at] == b'%' {
+                                at += source[at..region.end]
+                                    .find('\n')
+                                    .map_or(region.end - at, |p| p + 1);
+                            } else if source.as_bytes()[at] == b'$' {
+                                at += if delim == 2 && source.as_bytes().get(at + 1) == Some(&b'$') {
+                                    2
+                                } else {
+                                    1
+                                };
+                                break;
+                            } else {
+                                at += source[at..region.end]
+                                    .chars()
+                                    .next()
+                                    .map_or(1, char::len_utf8);
+                            }
+                        }
+                    }
+                    b'\\' => {
+                        if source.as_bytes().get(at + 1) == Some(&b'\\') {
+                            items.push(StreamItem::Boundary);
+                            at += 2;
+                            if let Some(opt_end) = optional_argument_end(source, at) {
+                                at = opt_end;
+                            }
+                            continue;
+                        }
+                        if matches!(source.as_bytes().get(at + 1), Some(b'(' | b'[')) {
+                            let close = if source.as_bytes()[at + 1] == b'(' {
+                                "\\)"
+                            } else {
+                                "\\]"
+                            };
+                            items.push(StreamItem::OtherGenerated);
+                            at = source[at + 2..region.end]
+                                .find(close)
+                                .map_or(region.end, |p| at + 2 + p + 2);
+                            continue;
+                        }
+                        let cmd_pos = at;
+                        let cmd_line = line_starts.partition_point(|&s| s <= cmd_pos).saturating_sub(1);
+                        let (cmd, next) = math::command(source, at);
+                        at = next;
+                        if !cmd
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                        {
+                            continue;
+                        }
+                        if let Some((opaque_end, nonprinting)) =
+                            math::opaque_command_end(source, cmd, at)
+                        {
+                            if !nonprinting {
+                                items.push(StreamItem::OtherGenerated);
+                            }
+                            at = opaque_end.min(region.end);
+                            continue;
+                        }
+                        let in_non_transparent = || {
+                            non_transparent_groups
+                                .iter()
+                                .any(|g| g.contains(&cmd_pos))
+                                || opaque.iter().any(|r| r.contains(&cmd_pos))
+                        };
+                        let mut arg_at =
+                            at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                        if macros.contains_key(cmd) {
+                            // An override may print anything, whatever the built-in does.
+                            items.push(StreamItem::OtherGenerated);
+                            while let Some(opt_end) = optional_argument_end(source, arg_at)
+                                .or_else(|| overlay_argument_end(source, arg_at))
+                            {
+                                arg_at = opt_end;
+                            }
+                            while let Some((_, end)) =
+                                math::group(source, skip_source_space(source, arg_at))
+                            {
+                                arg_at = end;
+                            }
+                            at = arg_at.min(region.end);
+                            continue;
+                        }
+                        if cmd == "item" {
+                            while let Some(ov_end) = overlay_argument_end(source, arg_at) {
+                                arg_at = ov_end;
+                            }
+                            items.push(StreamItem::OtherGenerated);
+                            if let Some(opt_end) = optional_argument_end(source, arg_at) {
+                                bracket_ends.push(opt_end - 1);
+                                at = (skip_source_space(source, arg_at) + 1).min(region.end);
+                            } else {
+                                at = arg_at.min(region.end);
+                            }
+                            continue;
+                        }
+                        while let Some(opt_end) = optional_argument_end(source, arg_at)
+                            .or_else(|| overlay_argument_end(source, arg_at))
+                        {
+                            arg_at = opt_end;
+                        }
+                        if matches!(cmd, "begin" | "end") {
+                            if let Some((body, mut group_end)) =
+                                math::group(source, skip_source_space(source, arg_at))
+                            {
+                                let env = source[body].trim();
+                                if matches!(env, "document" | "frame") && !in_non_transparent() {
+                                    items.push(StreamItem::PageBreak(cmd_line, cmd_pos, true));
+                                } else if cmd == "begin"
+                                    && !matches!(
+                                        env,
+                                        "frame"
+                                            | "center"
+                                            | "flushleft"
+                                            | "flushright"
+                                            | "minipage"
+                                            | "tabular"
+                                            | "tabular*"
+                                            | "tabularx"
+                                            | "array"
+                                            | "figure"
+                                            | "figure*"
+                                            | "table"
+                                            | "table*"
+                                            | "itemize"
+                                            | "enumerate"
+                                            | "description"
+                                    )
+                                {
+                                    items.push(StreamItem::OtherGenerated);
+                                    while let Some(ov_end) = overlay_argument_end(source, group_end)
+                                    {
+                                        group_end = ov_end;
+                                    }
+                                    if let Some(opt_end) = optional_argument_end(source, group_end)
+                                    {
+                                        bracket_ends.push(opt_end - 1);
+                                        at = (skip_source_space(source, group_end) + 1)
+                                            .min(region.end);
+                                        continue;
+                                    }
+                                } else {
+                                    items.push(StreamItem::Boundary);
+                                }
+                                while let Some(opt_end) = optional_argument_end(source, group_end)
+                                    .or_else(|| overlay_argument_end(source, group_end))
+                                {
+                                    group_end = opt_end;
+                                }
+                                if cmd == "begin"
+                                    && matches!(
+                                        env,
+                                        "tabular" | "tabular*" | "tabularx" | "array" | "minipage"
+                                    )
+                                {
+                                    while let Some((_, end)) =
+                                        math::group(source, skip_source_space(source, group_end))
+                                    {
+                                        group_end = end;
+                                    }
+                                }
+                                at = group_end.min(region.end);
+                                continue;
+                            }
+                            items.push(StreamItem::Boundary);
+                            at = arg_at.min(region.end);
+                            continue;
+                        }
+                        if matches!(
+                            cmd,
+                            "clearpage" | "cleardoublepage" | "newpage" | "pagebreak"
+                        ) {
+                            if !in_non_transparent() {
+                                items.push(StreamItem::PageBreak(
+                                    cmd_line,
+                                    cmd_pos,
+                                    matches!(cmd, "clearpage" | "cleardoublepage"),
+                                ));
+                            }
+                            at = arg_at.min(region.end);
+                            continue;
+                        }
+                        if cmd == "par" {
+                            items.push(StreamItem::Boundary);
+                            at = arg_at.min(region.end);
+                            continue;
+                        }
+                        if matches!(
+                            cmd,
+                            "caption"
+                                | "section"
+                                | "subsection"
+                                | "subsubsection"
+                                | "paragraph"
+                                | "subparagraph"
+                                | "part"
+                                | "chapter"
+                                | "frametitle"
+                                | "framesubtitle"
+                                | "maketitle"
+                                | "titlepage"
+                        ) {
+                            items.push(StreamItem::OtherGenerated);
+                        }
+                        if !inside_footnote
+                            && cmd == "footnote"
+                            && let Some((body, end)) =
+                                math::group(source, skip_source_space(source, arg_at))
+                            && footnote_bodies.contains(&body)
+                        {
+                            items.push(StreamItem::OtherGenerated);
+                            at = end.min(region.end);
+                            continue;
+                        }
+                        if let Some((_, span)) = all_spans.iter().find(|(s, _)| *s == cmd_pos) {
+                            if is_direct_reference_command(cmd)
+                                || matches!(
+                                    cmd,
+                                    "cite"
+                                        | "citep"
+                                        | "citet"
+                                        | "parencite"
+                                        | "textcite"
+                                        | "autocite"
+                                        | "footcite"
+                                        | "input"
+                                        | "include"
+                                        | "includegraphics"
+                                        | "includesvg"
+                                        | "verb"
+                                        | "lstinline"
+                                )
+                            {
+                                items.push(StreamItem::OtherGenerated);
+                            }
+                            let span_after = if source.as_bytes().get(span.end) == Some(&b'}') {
+                                span.end + 1
+                            } else {
+                                span.end
+                            };
+                            at = span_after.max(arg_at).min(region.end);
+                            continue;
+                        }
+                        if matches!(cmd, "vspace" | "hspace" | "index" | "hypertarget") {
+                            if let Some((_, end)) =
+                                math::group(source, skip_source_space(source, arg_at))
+                            {
+                                arg_at = end;
+                            }
+                            at = arg_at.min(region.end);
+                            continue;
+                        }
+                        if transparent_reference_wrapper(cmd)
+                            || known_formatting_switch(cmd)
+                            || matches!(
+                                cmd,
+                                "label"
+                                    | "smallskip"
+                                    | "medskip"
+                                    | "bigskip"
+                                    | "noindent"
+                                    | "centering"
+                                    | "raggedright"
+                                    | "raggedleft"
+                                    | "pause"
+                                    | "begingroup"
+                                    | "endgroup"
+                                    | "bgroup"
+                                    | "egroup"
+                                    | "allowbreak"
+                                    | "linebreak"
+                                    | "vfill"
+                                    | "hfill"
+                                    | "quad"
+                                    | "qquad"
+                                    | "thinspace"
+                                    | "enspace"
+                                    | "slash"
+                                    | "href"
+                            )
+                        {
+                            at = arg_at;
+                            continue;
+                        }
+                        items.push(StreamItem::OtherGenerated);
+                        while let Some((_, end)) =
+                            math::group(source, skip_source_space(source, arg_at))
+                        {
+                            arg_at = end;
+                        }
+                        at = arg_at.min(region.end);
+                    }
+                    b']' if bracket_ends.contains(&at) => {
+                        items.push(StreamItem::OtherGenerated);
+                        at += 1;
+                    }
+                    b'{' | b'}' => {
+                        at += 1;
+                    }
+                    _ => {
+                        if let Some((_, span)) = all_spans
+                            .iter()
+                            .find(|(_, s)| s.start <= at && at < s.end)
+                        {
+                            at = span.end.min(region.end);
+                            continue;
+                        }
+                        let line_end = source[at..region.end]
+                            .find(['\n', '%', '\\', '$', '&', '{', '}', ']'])
+                            .map_or(region.end, |p| at + p);
+                        if line_end <= at {
+                            at += source[at..region.end]
+                                .chars()
+                                .next()
+                                .map_or(1, char::len_utf8);
+                            continue;
+                        }
+                        for (_, _, word) in source_words(&source[at..line_end]) {
+                            if !word.is_empty() {
+                                items.push(StreamItem::Word(word));
+                            }
+                        }
+                        at = line_end;
+                    }
+                }
+            }
+            Ok(items)
+        };
+
+    let main_stream = build_stream(span_start..stream_end, false)?;
+    let mut footnote_streams: Vec<(std::ops::Range<usize>, Vec<StreamItem>)> = Vec::new();
+    for fn_body in &footnote_bodies {
+        if !footnote_streams.iter().any(|(b, _)| b == fn_body) {
+            footnote_streams.push((fn_body.clone(), build_stream(fn_body.clone(), true)?));
+        }
+    }
+    let selected_word = &pdf[selected];
+    let mut best: Option<((bool, isize, bool, std::cmp::Reverse<u32>), (u32, usize, isize, bool))> =
+        None;
+    let mut tied = false;
+
+    fn flanks_around(
+        stream: &[StreamItem],
+        left_end: usize,
+        right_start: usize,
+    ) -> (Vec<&String>, bool, bool, Vec<&String>, bool, bool) {
+        let mut left_words = Vec::new();
+        let mut left_adjacent_generated = false;
+        let mut left_crossed_boundary = false;
+        for item in stream[..left_end].iter().rev() {
+            match item {
+                StreamItem::Word(w) => {
+                    left_words.push(w);
+                    if left_words.len() >= 3 {
+                        break;
+                    }
+                }
+                StreamItem::Ref(_) | StreamItem::OtherGenerated => {
+                    if left_words.is_empty() {
+                        left_adjacent_generated = true;
+                    }
+                    break;
+                }
+                StreamItem::Boundary => {
+                    if left_words.is_empty() {
+                        left_crossed_boundary = true;
+                    } else {
+                        break;
+                    }
+                }
+                StreamItem::PageBreak(_, _, _) => {
+                    if left_words.is_empty() {
+                        left_crossed_boundary = true;
+                    }
+                    break;
+                }
+            }
+        }
+        let mut right_words = Vec::new();
+        let mut right_adjacent_generated = false;
+        let mut right_crossed_boundary = false;
+        for item in &stream[right_start..] {
+            match item {
+                StreamItem::Word(w) => {
+                    right_words.push(w);
+                    if right_words.len() >= 3 {
+                        break;
+                    }
+                }
+                StreamItem::Ref(_) | StreamItem::OtherGenerated => {
+                    if right_words.is_empty() {
+                        right_adjacent_generated = true;
+                    }
+                    break;
+                }
+                StreamItem::Boundary => {
+                    if right_words.is_empty() {
+                        right_crossed_boundary = true;
+                    } else {
+                        break;
+                    }
+                }
+                StreamItem::PageBreak(_, _, _) => {
+                    if right_words.is_empty() {
+                        right_crossed_boundary = true;
+                    }
+                    break;
+                }
+            }
+        }
+        (
+            left_words,
+            left_adjacent_generated,
+            left_crossed_boundary,
+            right_words,
+            right_adjacent_generated,
+            right_crossed_boundary,
+        )
+    }
+
+    for (ref_idx, cand) in refs.iter().enumerate() {
+        operation.check().map_err(|_| ())?;
+        if pdf.len() == 1
+            && cand
+                .key_words
+                .iter()
+                .any(|w| w == selected_word && !w.chars().all(|c| c.is_ascii_digit()))
+        {
+            continue;
+        }
+        let cand_pos = cand
+            .footnote_body
+            .as_ref()
+            .map_or(cand.cmd_start, |b| b.start);
+        let main_page_start = main_stream
+            .iter()
+            .rposition(|item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos < cand_pos))
+            .unwrap_or(0);
+        let main_page_end = main_stream
+            .iter()
+            .position(|item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos > cand_pos))
+            .map_or(main_stream.len(), |idx| idx + 1);
+        let main_page_stream = &main_stream[main_page_start..main_page_end];
+        let pb_before = match main_page_stream.first() {
+            Some(&StreamItem::PageBreak(_, pb_pos, true)) if pb_pos < cand_pos => Some(pb_pos),
+            _ => None,
+        };
+        let pb_after = match main_page_stream.last() {
+            Some(&StreamItem::PageBreak(_, pb_pos, true)) if pb_pos > cand_pos => Some(pb_pos),
+            _ => None,
+        };
+        let stream: &[StreamItem] = cand
+            .footnote_body
+            .as_ref()
+            .and_then(|fn_body| {
+                footnote_streams
+                    .iter()
+                    .find(|(b, _)| b == fn_body)
+                    .map(|(_, s)| s.as_slice())
+            })
+            .unwrap_or(main_page_stream);
+        let Some(pos) = stream
+            .iter()
+            .position(|item| *item == StreamItem::Ref(ref_idx))
+        else {
+            continue;
+        };
+        let (
+            left_words,
+            left_adjacent_generated,
+            left_crossed_boundary,
+            right_words,
+            right_adjacent_generated,
+            right_crossed_boundary,
+        ) = flanks_around(stream, pos, pos + 1);
+        if left_adjacent_generated || right_adjacent_generated {
+            continue;
+        }
+        let same_line_pagebreak = stream
+            .iter()
+            .chain(main_page_stream.iter())
+            .any(|item| {
+                matches!(
+                    item,
+                    StreamItem::PageBreak(pb_line, _, _)
+                        if (cand.start_line..=cand.end_line).contains(pb_line) || *pb_line == anchor
+                )
+            });
+        let footnote_starts_at_left =
+            cand.footnote_body.is_some() && pos == 2 + left_words.len();
+
+        let mut pdf_spans = Vec::new();
+        for g_start in 0..pdf.len() {
+            'span: for g_end in g_start..(g_start + 6).min(pdf.len()) {
+                let span_words = &pdf[g_start..=g_end];
+                if left_words
+                    .first()
+                    .copied()
+                    .is_some_and(|lw| span_words.iter().any(|w| w == lw))
+                    || right_words
+                        .first()
+                        .copied()
+                        .is_some_and(|rw| span_words.iter().any(|w| w == rw))
+                {
+                    continue;
+                }
+                let left_matched = if g_start > 0 {
+                    if left_words.first().copied() != pdf.get(g_start - 1) {
+                        continue;
+                    }
+                    true
+                } else {
+                    if cand.footnote_body.is_some()
+                        || same_line_pagebreak
+                        || left_words
+                            .first()
+                            .copied()
+                            .is_some_and(|lw| pdf[g_end + 1..].iter().any(|w| w == lw))
+                    {
+                        continue;
+                    }
+                    left_words.is_empty() || left_crossed_boundary
+                };
+                let right_matched = if g_end + 1 < pdf.len() {
+                    if right_words.first().copied() != pdf.get(g_end + 1) {
+                        continue;
+                    }
+                    true
+                } else {
+                    if same_line_pagebreak
+                        || right_words
+                            .first()
+                            .copied()
+                            .is_some_and(|rw| pdf[..g_start].iter().any(|w| w == rw))
+                    {
+                        continue;
+                    }
+                    right_words.is_empty() || right_crossed_boundary
+                };
+                let mut score = 0isize;
+                let mut vis_left_len = 0usize;
+                let mut footnote_head_word = false;
+                for distance in 1..=3 {
+                    if g_start >= distance
+                        && let Some(expected) = left_words.get(distance - 1).copied()
+                    {
+                        if pdf.get(g_start - distance) == Some(expected) {
+                            score += (4 - distance) as isize;
+                            vis_left_len = distance;
+                        } else if footnote_starts_at_left
+                            && distance >= 2
+                            && distance == left_words.len()
+                            && g_end + 1 < pdf.len()
+                        {
+                            footnote_head_word = true;
+                            break;
+                        } else {
+                            continue 'span;
+                        }
+                    }
+                }
+                for distance in 1..=3 {
+                    if g_end + distance < pdf.len()
+                        && let Some(expected) = right_words.get(distance - 1).copied()
+                    {
+                        if pdf.get(g_end + distance) == Some(expected) {
+                            score += (4 - distance) as isize;
+                        } else {
+                            continue 'span;
+                        }
+                    }
+                }
+                if score == 0 || (cand.footnote_body.is_some() && vis_left_len == 0) {
+                    continue;
+                }
+                let both_sides = left_matched && right_matched;
+                let vis_right_len = (pdf.len() - 1 - g_end).min(right_words.len()).min(3);
+                pdf_spans.push((
+                    g_start,
+                    g_end,
+                    both_sides,
+                    score,
+                    vis_left_len,
+                    vis_right_len,
+                    footnote_head_word,
+                ));
+            }
+        }
+        let mut best_for_ref: Option<(bool, isize)> = None;
+        for &(
+            g_start,
+            g_end,
+            both_sides,
+            score,
+            vis_left_len,
+            vis_right_len,
+            footnote_head_word,
+        ) in &pdf_spans
+        {
+            if !(g_start..=g_end).contains(&selected) {
+                continue;
+            }
+            let mut total_slots = 0usize;
+            let mut ref_only_slots = 0usize;
+            let mut matches_self = false;
+            for (s_body, s) in std::iter::once((None, main_page_stream)).chain(
+                footnote_streams
+                    .iter()
+                    .filter(|(b, _)| {
+                        pb_before.is_none_or(|pb| b.start > pb)
+                            && pb_after.is_none_or(|pb| b.start < pb)
+                    })
+                    .map(|(b, s)| (Some(b), s.as_slice())),
+            ) {
+                let is_cand_stream = s_body == cand.footnote_body.as_ref();
+                if vis_left_len > 0 && vis_right_len > 0 {
+                    for s_start in 0..s.len() {
+                        if !matches!(&s[s_start], StreamItem::Word(rw) if right_words.first().copied() == Some(rw)) {
+                            continue;
+                        }
+                        let (s_left, s_left_adj, _, s_right, s_right_adj, _) =
+                            flanks_around(s, s_start, s_start);
+                        if !s_left_adj
+                            && !s_right_adj
+                            && s_left.len() >= vis_left_len
+                            && s_left[..vis_left_len] == left_words[..vis_left_len]
+                            && (!footnote_head_word
+                                || if s_left.len() >= left_words.len() {
+                                    s_left[vis_left_len] == left_words[vis_left_len]
+                                        || pdf.get(g_start - left_words.len())
+                                            == Some(s_left[vis_left_len])
+                                } else {
+                                    !(s_body.is_some() && s_start == 2 + s_left.len())
+                                })
+                            && s_right.len() >= vis_right_len
+                            && s_right[..vis_right_len] == right_words[..vis_right_len]
+                        {
+                            total_slots += 1;
+                        }
+                    }
+                }
+                for s_start in 0..s.len() {
+                    if matches!(
+                        s[s_start],
+                        StreamItem::Boundary | StreamItem::PageBreak(_, _, _)
+                    ) {
+                        continue;
+                    }
+                    if vis_left_len == 0
+                        && !matches!(s[s_start], StreamItem::Ref(_) | StreamItem::OtherGenerated)
+                    {
+                        continue;
+                    }
+                    for s_end in s_start..(s_start + 6).min(s.len()) {
+                        let seg = &s[s_start..=s_end];
+                        if seg
+                            .iter()
+                            .any(|item| matches!(item, StreamItem::PageBreak(_, _, _)))
+                            || (seg.iter().any(|item| matches!(item, StreamItem::Boundary))
+                                && (vis_left_len == 0 || vis_right_len == 0))
+                        {
+                            break;
+                        }
+                        if matches!(seg.last(), Some(StreamItem::Boundary))
+                            || (seg.iter().any(|item| matches!(item, StreamItem::Boundary))
+                                && !seg.iter().any(|item| {
+                                    matches!(item, StreamItem::Ref(_) | StreamItem::OtherGenerated)
+                                }))
+                        {
+                            continue;
+                        }
+                        if vis_right_len == 0
+                            && !matches!(s[s_end], StreamItem::Ref(_) | StreamItem::OtherGenerated)
+                        {
+                            continue;
+                        }
+                        if vis_left_len == 0 || vis_right_len == 0 {
+                            if seg.iter().any(|item| matches!(item, StreamItem::Word(_))) {
+                                break;
+                            }
+                        } else if seg.iter().any(|item| {
+                            matches!(
+                                item,
+                                StreamItem::Word(w)
+                                    if left_words.first().copied() == Some(w)
+                                        || right_words.first().copied() == Some(w)
+                            )
+                        }) {
+                            continue;
+                        }
+                        let (
+                            s_left,
+                            s_left_adj,
+                            s_left_crossed,
+                            s_right,
+                            s_right_adj,
+                            s_right_crossed,
+                        ) = flanks_around(s, s_start, s_end + 1);
+                        if s_left_adj || s_right_adj {
+                            continue;
+                        }
+                        let left_compat = if vis_left_len > 0 {
+                            s_left.len() >= vis_left_len
+                                && s_left[..vis_left_len] == left_words[..vis_left_len]
+                                && (!footnote_head_word
+                                    || if s_left.len() >= left_words.len() {
+                                        s_left[vis_left_len] == left_words[vis_left_len]
+                                            || pdf.get(g_start - left_words.len())
+                                                == Some(s_left[vis_left_len])
+                                    } else {
+                                        !(s_body.is_some() && s_start == 2 + s_left.len())
+                                    })
+                        } else if left_words.is_empty() || left_crossed_boundary {
+                            s_left.is_empty() || s_left_crossed
+                        } else {
+                            true
+                        };
+                        let right_compat = if vis_right_len > 0 {
+                            s_right.len() >= vis_right_len
+                                && s_right[..vis_right_len] == right_words[..vis_right_len]
+                        } else if right_words.is_empty() || right_crossed_boundary {
+                            s_right.is_empty() || s_right_crossed
+                        } else {
+                            true
+                        };
+                        if left_compat && right_compat {
+                            total_slots += 1;
+                            if s_start == s_end && matches!(s[s_start], StreamItem::Ref(_)) {
+                                ref_only_slots += 1;
+                            }
+                            if is_cand_stream && s_start == pos && s_end == pos {
+                                matches_self = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !matches_self {
+                continue;
+            }
+            let occurrence_proven = pdf_spans.len() == 1 && total_slots == 1;
+            if !occurrence_proven {
+                if best.is_none()
+                    && total_slots > 1
+                    && pdf_spans.len() < total_slots
+                    && ref_only_slots == total_slots
+                {
+                    tied = true;
+                }
+                continue;
+            }
+            let span_rank = (both_sides, score);
+            if best_for_ref.is_none_or(|prev| span_rank > prev) {
+                best_for_ref = Some(span_rank);
+            }
+        }
+        let Some((both_sides, score)) = best_for_ref else {
+            continue;
+        };
+        let on_anchor = (cand.start_line..=cand.end_line).contains(&anchor);
+        let proximity = if within_scope || mode == WordLocationMode::Guess {
+            0
+        } else {
+            cand.label_line.abs_diff(line)
+        };
+        let rank = (both_sides, score, on_anchor, std::cmp::Reverse(proximity));
+        let target = (cand.label_line, cand.label_byte, score, both_sides);
+        match best {
+            Some((best_rank, _)) if rank > best_rank => {
+                best = Some((rank, target));
+                tied = false;
+            }
+            Some((best_rank, best_target))
+                if rank == best_rank
+                    && (best_target.0, best_target.1) != (target.0, target.1) =>
+            {
+                tied = true;
+            }
+            None => {
+                best = Some((rank, target));
+                tied = false;
+            }
+            _ => {}
+        }
+    }
+    if tied {
+        return match mode {
+            WordLocationMode::Strict => Ok(None),
+            WordLocationMode::Guess => Err(()),
+        };
+    }
+    Ok(best.map(|(_, target)| target))
 }
 
 fn has_control_word(text: &str, name: &str) -> bool {
@@ -2678,7 +4161,7 @@ pub(crate) fn source_graphics_location_with_context(
             frame_scope
                 .clone()
                 .or_else(|| source_tabularx_range(source, line))
-                .or_else(|| math::caption_lines(source, line))
+                .or_else(|| math::collected_text_lines(source, line))
                 .filter(|range| line == range.end as u32)
         })
         .flatten();
@@ -3116,7 +4599,14 @@ fn nonprinting_source_spans_with_mode<'a>(
                     if command == "csname" {
                         continue;
                     }
-                    return Some((start, raw_end..end, None));
+                    let hidden_end = if at > end
+                        && source.as_bytes().get(skip_source_space(source, end)) == Some(&b'\\')
+                    {
+                        at
+                    } else {
+                        end
+                    };
+                    return Some((start, raw_end..hidden_end, None));
                 }
                 if overridden {
                     at = end;
@@ -3215,7 +4705,7 @@ fn nonprinting_source_spans_with_mode<'a>(
                     }
                     return Some((start, start..at, None));
                 } else if let Some((heading, contents, full_end)) =
-                    math::caption_arguments(source, command, end)
+                    math::collected_text_arguments(source, command, end)
                 {
                     let first_visible = heading.as_ref().unwrap_or(&contents);
                     let prefix_start = skip_source_space(source, at);
@@ -3276,16 +4766,55 @@ fn nonprinting_source_spans_with_mode<'a>(
                             is_graphics.then_some(body),
                         ));
                     }
+                } else if matches!(
+                    command,
+                    "crefformat"
+                        | "Crefformat"
+                        | "crefrangeformat"
+                        | "Crefrangeformat"
+                        | "crefmultiformat"
+                        | "Crefmultiformat"
+                        | "crefrangemultiformat"
+                        | "Crefrangemultiformat"
+                        | "crefname"
+                        | "Crefname"
+                        | "creflabelformat"
+                        | "crefeqlabelformat"
+                ) {
+                    let arity = match command {
+                        "crefname" | "Crefname" => 3,
+                        "crefmultiformat"
+                        | "Crefmultiformat"
+                        | "crefrangemultiformat"
+                        | "Crefrangemultiformat" => 5,
+                        _ => 2,
+                    };
+                    let mut group_end = at;
+                    let mut consumed = 0usize;
+                    while consumed < arity {
+                        if let Some((_, end)) =
+                            math::group(source, skip_source_space(source, group_end))
+                        {
+                            group_end = end;
+                            consumed += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if group_end > at {
+                        at = group_end;
+                        return Some((start, start..group_end, None));
+                    }
                 } else if matches!(command, "begin" | "end")
                     && let Some((body, mut group_end)) =
                         math::group(source, skip_source_space(source, at))
-                    && matches!(
-                        &source[body.clone()],
-                        "tabularx" | "tabular*" | "tabular" | "array"
-                    )
+                    && (!math::math_environment(&source[body.clone()])
+                        || &source[body.clone()] == "array")
                 {
                     let env = &source[body.clone()];
-                    if command == "begin" {
+                    if command == "begin"
+                        && matches!(env, "tabularx" | "tabular*" | "tabular" | "array")
+                    {
                         if matches!(env, "tabularx" | "tabular*") {
                             if let Some(opt_end) = optional_argument_end(source, group_end) {
                                 group_end = opt_end;
@@ -3303,6 +4832,19 @@ fn nonprinting_source_spans_with_mode<'a>(
                             math::group(source, skip_source_space(source, group_end))
                         {
                             group_end = spec_end;
+                        }
+                    }
+                    // Beamer frame overlays and options configure the frame and never print;
+                    // the mandatory title and subtitle groups after them stay visible. A paragraph
+                    // ends the header, so a bracket after a blank line is printed body text.
+                    if command == "begin" && env == "frame" {
+                        while let Some(option_end) = skip_frame_header_space(source, group_end)
+                            .and_then(|next| {
+                                overlay_argument_end(source, next)
+                                    .or_else(|| optional_argument_end(source, next))
+                            })
+                        {
+                            group_end = option_end;
                         }
                     }
                     at = group_end;
@@ -3544,6 +5086,143 @@ pub(crate) fn source_prose_scored_location_with_loops(
     )
 }
 
+// shortcut: 64 KiB fixed prose macro expansion cap, raise if legitimate zero-arg prose macros exceed 64 KiB.
+const MAX_FIXED_PROSE_MACRO_BYTES: usize = 65_536;
+
+fn append_fixed_prose_macro_text<'a>(
+    text: &'a str,
+    macros: &std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    operation: &crate::Operation,
+    depth: u8,
+    out: &mut String,
+) -> Result<bool, ()> {
+    operation.check().map_err(|_| ())?;
+    if depth >= 8 {
+        return Ok(false);
+    }
+    let mut at = 0usize;
+    while at < text.len() {
+        operation.check().map_err(|_| ())?;
+        if let Some((ch, next)) = tex_accent_at(text, at) {
+            if out.len() + ch.len_utf8() > MAX_FIXED_PROSE_MACRO_BYTES {
+                return Ok(false);
+            }
+            out.push(ch);
+            at = next;
+            continue;
+        }
+        match text.as_bytes()[at] {
+            b'%' | b'$' | b'#' | b'&' | b'~' | b'^' | b'_' => return Ok(false),
+            b'{' => {
+                let Some((inner, next)) = math::group(text, at) else {
+                    return Ok(false);
+                };
+                if !append_fixed_prose_macro_text(&text[inner], macros, operation, depth + 1, out)?
+                {
+                    return Ok(false);
+                }
+                at = next;
+            }
+            b'}' => return Ok(false),
+            b'\\' => {
+                let (cmd, next) = math::command(text, at);
+                if cmd.is_empty() {
+                    return Ok(false);
+                }
+                if let Some(entry) = macros.get(cmd) {
+                    let Some(sub) = entry.as_ref() else {
+                        return Ok(false);
+                    };
+                    if sub.arity != 0 || sub.used_params != 0 {
+                        return Ok(false);
+                    }
+                    let Some(body) = sub.body else {
+                        return Ok(false);
+                    };
+                    if !append_fixed_prose_macro_text(body, macros, operation, depth + 1, out)? {
+                        return Ok(false);
+                    }
+                    if let Some((g, ge)) = math::group(text, next)
+                        && g.is_empty()
+                    {
+                        at = ge;
+                    } else {
+                        at = next;
+                    }
+                } else if known_formatting_switch(cmd) || cmd == "relax" {
+                    if let Some((g, ge)) = math::group(text, next)
+                        && g.is_empty()
+                    {
+                        at = ge;
+                    } else {
+                        at = next;
+                    }
+                } else if matches!(
+                    cmd,
+                    "textbf"
+                        | "textit"
+                        | "emph"
+                        | "textrm"
+                        | "textsf"
+                        | "texttt"
+                        | "textnormal"
+                        | "underline"
+                        | "mbox"
+                ) {
+                    let Some((inner, ge)) = math::group(text, skip_source_space(text, next)) else {
+                        return Ok(false);
+                    };
+                    if !append_fixed_prose_macro_text(
+                        &text[inner],
+                        macros,
+                        operation,
+                        depth + 1,
+                        out,
+                    )? {
+                        return Ok(false);
+                    }
+                    at = ge;
+                } else {
+                    return Ok(false);
+                }
+            }
+            _ => {
+                let ch = text[at..].chars().next().unwrap();
+                if out.len() + ch.len_utf8() > MAX_FIXED_PROSE_MACRO_BYTES {
+                    return Ok(false);
+                }
+                out.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn fixed_prose_macro_words<'a>(
+    def: &math::MacroDef<'a>,
+    macros: &std::collections::BTreeMap<&'a str, Option<math::MacroDef<'a>>>,
+    operation: &crate::Operation,
+) -> Result<Option<Vec<String>>, ()> {
+    operation.check().map_err(|_| ())?;
+    if def.arity != 0 || def.used_params != 0 {
+        return Ok(None);
+    }
+    let Some(body) = def.body else {
+        return Ok(None);
+    };
+    let mut expanded = String::new();
+    if !append_fixed_prose_macro_text(body, macros, operation, 0, &mut expanded)? {
+        return Ok(None);
+    }
+    let words: Vec<String> = source_words(&expanded)
+        .into_iter()
+        .map(|(_, _, w)| w)
+        .filter(|w| !w.is_empty())
+        .collect();
+    Ok((!words.is_empty()).then_some(words))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn source_prose_scored_location_with_mode(
     source: &str,
@@ -3562,7 +5241,7 @@ fn source_prose_scored_location_with_mode(
 ) -> Result<Option<(u32, usize, isize)>, ()> {
     operation.check().map_err(|_| ())?;
     enum ProseToken<'a> {
-        Word(u32, usize, String),
+        Word(u32, usize, String, bool),
         LoopVar(u32, usize, usize, &'a str),
     }
 
@@ -3584,6 +5263,12 @@ fn source_prose_scored_location_with_mode(
     ) {
         return Ok(None);
     }
+    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
+    macro_sources.extend_from_slice(extra_sources);
+    macro_sources.push(source);
+    let mut macros = None;
+    let mut expanded_macros: std::collections::BTreeMap<&str, Option<Vec<String>>> =
+        std::collections::BTreeMap::new();
     let frame_header = within_frame
         && source
             .lines()
@@ -3593,6 +5278,7 @@ fn source_prose_scored_location_with_mode(
     let mut tokens = Vec::new();
     let mut has_loop_var = false;
     let mut line_start = 0;
+    let mut phantom_until = 0usize;
     for (index, raw_row) in source.split_inclusive('\n').enumerate().take(lines.end) {
         operation.check().map_err(|_| ())?;
         if index >= lines.start {
@@ -3605,6 +5291,7 @@ fn source_prose_scored_location_with_mode(
                 if allowed_bytes
                     .as_ref()
                     .is_some_and(|span| !span.contains(&abs))
+                    || abs < phantom_until
                     || hidden.peek().is_some_and(|range| range.contains(&abs))
                     || loops.iter().any(|lp| lp.header.contains(&abs))
                 {
@@ -3615,19 +5302,68 @@ fn source_prose_scored_location_with_mode(
                     if word == pdf[selected] && opaque.iter().any(|range| range.contains(&abs)) {
                         return Err(());
                     }
-                    tokens.push(ProseToken::Word(index as u32 + 1, byte, word));
-                } else if let raw = &text[byte..end]
-                    && loops
-                        .iter()
-                        .any(|lp| lp.body.contains(&(abs - 1)) && lp.vars.contains(&raw))
-                {
-                    has_loop_var = true;
-                    tokens.push(ProseToken::LoopVar(
-                        index as u32 + 1,
-                        byte - 1,
-                        abs - 1,
-                        raw,
-                    ));
+                    tokens.push(ProseToken::Word(index as u32 + 1, byte, word, false));
+                } else {
+                    let macros =
+                        macros.get_or_insert_with(|| mode.macros(&macro_sources, operation));
+                    if matches!(
+                        &text[byte..end],
+                        "phantom" | "hphantom" | "vphantom" | "hspace" | "vspace" | "index"
+                    ) && !macros.contains_key(&text[byte..end])
+                    {
+                        let mut arg_at = line_start
+                            + end
+                            + usize::from(matches!(
+                                text.as_bytes().get(end),
+                                Some(b'*' | b'+')
+                            ));
+                        while let Some(opt_end) = optional_argument_end(source, arg_at)
+                            .or_else(|| overlay_argument_end(source, arg_at))
+                        {
+                            arg_at = opt_end;
+                        }
+                        if let Some((_, arg_end)) =
+                            note_argument(source, arg_at, source.len(), false)
+                        {
+                            phantom_until = phantom_until.max(arg_end);
+                        }
+                    } else if let raw = &text[byte..end]
+                        && loops
+                            .iter()
+                            .any(|lp| lp.body.contains(&(abs - 1)) && lp.vars.contains(&raw))
+                    {
+                        has_loop_var = true;
+                        tokens.push(ProseToken::LoopVar(
+                            index as u32 + 1,
+                            byte - 1,
+                            abs - 1,
+                            raw,
+                        ));
+                    } else if let (cmd, cmd_end) = math::command(text, byte - 1)
+                        && cmd_end == end
+                        && text.as_bytes().get(end) != Some(&b'[')
+                        && (text.as_bytes().get(end) != Some(&b'{')
+                            || math::group(text, end).is_some_and(|(g, _)| g.is_empty()))
+                        && let Some((&macro_name, Some(def))) = macros.get_key_value(cmd)
+                    {
+                        let macro_words = if let Some(cached) = expanded_macros.get(macro_name) {
+                            cached.clone()
+                        } else {
+                            let computed = fixed_prose_macro_words(def, macros, operation)?;
+                            expanded_macros.insert(macro_name, computed.clone());
+                            computed
+                        };
+                        if let Some(macro_words) = macro_words {
+                            if macro_words.iter().any(|w| *w == pdf[selected])
+                                && opaque.iter().any(|range| range.contains(&(abs - 1)))
+                            {
+                                return Err(());
+                            }
+                            for w in macro_words {
+                                tokens.push(ProseToken::Word(index as u32 + 1, byte - 1, w, true));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3638,7 +5374,7 @@ fn source_prose_scored_location_with_mode(
         let candidates: Vec<_> = tokens
             .into_iter()
             .filter_map(|t| match t {
-                ProseToken::Word(r, b, w) => Some((r, b, w)),
+                ProseToken::Word(r, b, w, m) => Some((r, b, w, m)),
                 ProseToken::LoopVar(..) => None,
             })
             .collect();
@@ -3682,7 +5418,7 @@ fn source_prose_scored_location_with_mode(
             let mut candidates = Vec::with_capacity(tokens.len());
             for t in &tokens {
                 match t {
-                    ProseToken::Word(r, b, w) => candidates.push((*r, *b, w.clone())),
+                    ProseToken::Word(r, b, w, m) => candidates.push((*r, *b, w.clone(), *m)),
                     ProseToken::LoopVar(r, b, abs, var) => {
                         if let Some((_, _, val)) = combo
                             .iter()
@@ -3690,7 +5426,7 @@ fn source_prose_scored_location_with_mode(
                             .find(|(body, v, _)| body.contains(abs) && v == var)
                         {
                             for (_, _, w) in source_words(val) {
-                                candidates.push((*r, *b, w));
+                                candidates.push((*r, *b, w, false));
                             }
                         }
                     }
@@ -3699,10 +5435,11 @@ fn source_prose_scored_location_with_mode(
             passes.push(candidates);
         }
     }
-    let mut best = None;
+    let mut best: Option<((isize, bool, isize), u32, u32, usize, bool)> = None;
     let mut tied = false;
+    let mut saw_uncorroborated_macro = false;
     for candidates in &passes {
-        for (index, (row, byte, word)) in candidates.iter().enumerate() {
+        for (index, (row, byte, word, from_macro)) in candidates.iter().enumerate() {
             if *word != pdf[selected] {
                 continue;
             }
@@ -3745,41 +5482,53 @@ fn source_prose_scored_location_with_mode(
                     }
                 }
             }
+            if *from_macro && score == 0 {
+                saw_uncorroborated_macro = true;
+                continue;
+            }
             // A collected frame/caption boundary does not favor its last occurrence.
             let proximity = if within_frame || mode == WordLocationMode::Guess {
                 0
             } else {
                 row.abs_diff(line)
             };
-            let rank = (
+            let base_rank = (
                 score,
                 mode == WordLocationMode::Strict
                     && frame_header
                     && pdf.len() > 1
                     && score == 0
                     && *row as usize == lines.start + 1
-                    && candidates.iter().filter(|(r, _, _)| *r == *row).count() <= 2,
+                    && candidates.iter().filter(|(r, _, _, _)| *r == *row).count() <= 2,
                 context_bonus,
-                std::cmp::Reverse(proximity),
             );
             match best {
-                Some((old, _, _)) if rank < old => {}
-                Some((old, prev_row, prev_byte)) if rank == old => {
-                    tied |= (prev_row, prev_byte) != (*row, *byte);
+                Some((old_base, _, _, _, _)) if base_rank < old_base => {}
+                Some((old_base, old_prox, prev_row, prev_byte, prev_macro))
+                    if base_rank == old_base =>
+                {
+                    if *from_macro || prev_macro {
+                        tied |= (prev_row, prev_byte) != (*row, *byte);
+                    } else if proximity < old_prox {
+                        best = Some((base_rank, proximity, *row, *byte, *from_macro));
+                        tied = false;
+                    } else if proximity == old_prox {
+                        tied |= (prev_row, prev_byte) != (*row, *byte);
+                    }
                 }
                 _ => {
-                    best = Some((rank, *row, *byte));
+                    best = Some((base_rank, proximity, *row, *byte, *from_macro));
                     tied = false;
                 }
             }
         }
     }
-    if mode == WordLocationMode::Guess && tied {
+    if mode == WordLocationMode::Guess && (tied || (best.is_none() && saw_uncorroborated_macro)) {
         return Err(());
     }
     Ok(best
         .filter(|_| !tied)
-        .map(|(rank, row, byte)| (row, byte, rank.0)))
+        .map(|(rank, _, row, byte, _)| (row, byte, rank.0)))
 }
 
 fn clean_lexical_path(path: &std::path::Path) -> std::path::PathBuf {

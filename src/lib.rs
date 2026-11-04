@@ -675,15 +675,18 @@ pub fn resolve_forward_with_selector(
     } else {
         original_line.and_then(|text| ForwardWord::at(text, column))
     };
-    // Collected frame/tabularx/caption/math bodies use their closing compiler line.
+    // Collected frame/tabularx/text/math bodies use their closing compiler line.
     // Keep the original source position for the page hint, and give Beamer priority.
     let view_line = source
         .as_deref()
         .and_then(|source| {
             frame_closing_line(source, line)
                 .or_else(|| tabularx_closing_line(source, line))
-                .or_else(|| original_line.and_then(|_| caption_closing_line(source, line, column)))
-                .or_else(|| math::math_closing_line(source, line, column))
+                .or_else(|| {
+                    original_line
+                        .and_then(|_| collected_text_closing_line(source, line, column))
+                        .max(math::math_closing_line(source, line, column))
+                })
         })
         .unwrap_or(line);
     let candidates = match &cached_sidecar {
@@ -2145,8 +2148,22 @@ impl InverseQuery<'_> {
 fn source_word_compiler_line(source: &str, line: u32, column_char: u32) -> u32 {
     frame_closing_line(source, line)
         .or_else(|| tabularx_closing_line(source, line))
-        .or_else(|| caption_closing_line(source, line, column_char))
-        .or_else(|| math::math_closing_line(source, line, column_char))
+        .or_else(|| {
+            // An enclosing collector, math body or run-in heading ships after inner wrappers.
+            collected_text_closing_line(source, line, column_char)
+                .max(tex::reference_argument_closing_line(
+                    source,
+                    line,
+                    column_char,
+                ))
+                .max(math::math_closing_line(source, line, column_char))
+                .max(tex::run_in_heading_compiler_line(source, line, column_char))
+                .max(tex::line_start_word_compiler_line(
+                    source,
+                    line,
+                    column_char,
+                ))
+        })
         .unwrap_or(line)
 }
 

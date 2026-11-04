@@ -254,6 +254,64 @@ fn clone_synctex_proxy_subtree(
     Ok(index)
 }
 
+fn read_remaining_rows(
+    reader: &mut impl BufRead,
+    operation: Option<&Operation>,
+) -> io::Result<Vec<u8>> {
+    let mut rows = Vec::new();
+    loop {
+        if let Some(op) = operation {
+            op.check()?;
+        }
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if chunk.is_empty() {
+            return Ok(rows);
+        }
+        rows.extend_from_slice(chunk);
+        let consumed = chunk.len();
+        reader.consume(consumed);
+    }
+}
+
+/// The form tags the row loop will register when it reads `rows`. It skips the whole body of a
+/// duplicate or malformed definition, so nothing nested inside one counts.
+fn forms_defined_in(
+    rows: &[u8],
+    registered: &std::collections::HashMap<u32, usize>,
+    operation: Option<&Operation>,
+) -> io::Result<std::collections::HashSet<u32>> {
+    let mut defined = std::collections::HashSet::new();
+    let mut ignored_depth = 0usize;
+    for (index, row) in rows.split(|&byte| byte == b'\n').enumerate() {
+        if index & 1023 == 0
+            && let Some(op) = operation
+        {
+            op.check()?;
+        }
+        match row.first() {
+            Some(b'<') if ignored_depth > 0 => ignored_depth += 1,
+            Some(b'>') if ignored_depth > 0 => ignored_depth -= 1,
+            Some(b'<') => {
+                let tag = std::str::from_utf8(&row[1..])
+                    .ok()
+                    .and_then(parse_synctex_int_prefix)
+                    .and_then(|(tag, _)| u32::try_from(tag).ok())
+                    .filter(|tag| !registered.contains_key(tag));
+                match tag {
+                    Some(tag) if defined.insert(tag) => {}
+                    _ => ignored_depth = 1,
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(defined)
+}
+
 struct SheetEntry {
     page: u32,
     root: usize,
@@ -444,6 +502,8 @@ pub(crate) fn parse_synctex_document_with_options(
     };
 
     let mut row = String::new();
+    let mut later_forms = None::<std::collections::HashSet<u32>>;
+    let mut buffered_rows = None::<io::Cursor<Vec<u8>>>;
     let mut bytes_read = 0usize;
     let mut line_count = 0usize;
     let mut saw_preamble = false;
@@ -457,7 +517,10 @@ pub(crate) fn parse_synctex_document_with_options(
         }
         line_count = line_count.saturating_add(1);
         row.clear();
-        let count = reader.read_line(&mut row)?;
+        let count = match &mut buffered_rows {
+            Some(rows) => rows.read_line(&mut row)?,
+            None => reader.read_line(&mut row)?,
+        };
         if count == 0 {
             break;
         }
@@ -1015,6 +1078,24 @@ pub(crate) fn parse_synctex_document_with_options(
                         };
                         if let Some(p_idx) = parent {
                             check_geom(&[fx, fy])?;
+                            // A reference to a form the sidecar never defines (pdfTeX's clipped
+                            // graphics) has no content or source identity, so it must not disturb
+                            // its neighbors. A definition may follow it, which takes reading on.
+                            let mut defined = forms.contains_key(&ftag);
+                            if !defined {
+                                if later_forms.is_none() {
+                                    let rows = read_remaining_rows(&mut reader, operation)?;
+                                    later_forms = Some(forms_defined_in(&rows, &forms, operation)?);
+                                    buffered_rows = Some(io::Cursor::new(rows));
+                                }
+                                defined = later_forms
+                                    .as_ref()
+                                    .is_some_and(|later| later.contains(&ftag));
+                            }
+                            if !defined {
+                                row.clear();
+                                continue;
+                            }
                             let ref_idx = nodes.len();
                             nodes.push(ForwardNode::new(
                                 b'f',
@@ -2511,9 +2592,34 @@ pub(crate) fn inverse_candidates_in_doc(
         selected_nodes.push(graphics.host_idx);
     }
 
+    // The hull of a box enclosing a graphic absorbs its natural inner box, so containing
+    // the point does not show that such a box was typeset independently of the graphic.
+    let mut graphics_enclosures = std::collections::HashSet::new();
+    for g in &graphics_boxes {
+        let mut ancestor = nodes[g.box_idx].parent;
+        while let Some(current) = ancestor {
+            if !graphics_enclosures.insert(current) {
+                break;
+            }
+            ancestor = nodes[current].parent;
+        }
+    }
+    // Text typeset over an image keeps its own identity, even on the image's source line.
+    let overlaid_on_graphics = |selected: usize| -> bool {
+        let chain = std::iter::successors(Some(selected), |&idx| nodes[idx].parent);
+        !chain.clone().any(|idx| {
+            graphics_boxes
+                .iter()
+                .any(|g| g.box_idx == idx || g.gen_root == Some(idx))
+        }) && chain
+            .take_while(|idx| !graphics_enclosures.contains(idx))
+            .any(|idx| nodes[idx].kind == b'(' && point_in_box(idx))
+    };
+
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for mut idx in selected_nodes {
+        let overlaid = overlaid_on_graphics(idx);
         if parsed.fix_cross_file_tags
             && tag_is_generated_graphics_tex(&parsed.inputs, nodes[idx].tag)
         {
@@ -2565,7 +2671,9 @@ pub(crate) fn inverse_candidates_in_doc(
                 same_anchor_count += 1;
             }
         }
-        let graphics = if hit_same_anchor == 1 && unique_graphics.is_some() {
+        let graphics = if overlaid {
+            None
+        } else if hit_same_anchor == 1 && unique_graphics.is_some() {
             hit_index.map(|index| GraphicsHit::Unique {
                 index,
                 count: same_anchor_count,

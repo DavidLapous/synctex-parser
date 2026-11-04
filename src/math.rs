@@ -413,12 +413,78 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
     }
 }
 
-pub(super) fn caption_arguments(
+fn collected_formatting_command(name: &str) -> bool {
+    matches!(
+        name,
+        "text"
+            | "textbf"
+            | "textit"
+            | "textrm"
+            | "textsf"
+            | "texttt"
+            | "textup"
+            | "textnormal"
+            | "textsc"
+            | "textsl"
+            | "textmd"
+            | "textlf"
+            | "textulc"
+            | "emph"
+            | "bm"
+            | "boldsymbol"
+            | "mathcal"
+            | "mathbb"
+            | "mathbbm"
+            | "mathbbb"
+            | "mathds"
+            | "mathfrak"
+            | "mathscr"
+            | "mathrm"
+            | "mathbf"
+            | "mathbfit"
+            | "mathsf"
+            | "mathsfit"
+            | "mathbfsfit"
+            | "mathbfcal"
+            | "mathbfscr"
+            | "mathtt"
+            | "mathit"
+            | "mathnormal"
+            | "mathbold"
+            | "symrm"
+            | "symit"
+            | "symsf"
+            | "symtt"
+            | "symbb"
+            | "symcal"
+            | "symscr"
+            | "symfrak"
+            | "symnormal"
+            | "symbf"
+            | "symbfit"
+            | "symbfsfit"
+            | "symsfit"
+            | "symbfcal"
+            | "symbffrak"
+            | "symbfscr"
+            | "symbfsf"
+            | "symbftt"
+    )
+}
+
+pub(super) fn collected_text_arguments(
     source: &str,
     name: &str,
     mut at: usize,
 ) -> Option<(Option<Range<usize>>, Range<usize>, usize)> {
     match name {
+        name if collected_formatting_command(name) => {
+            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            // Single-line formatting does not establish an exclusive search region.
+            source[body.clone()]
+                .contains('\n')
+                .then_some((None, body, end))
+        }
         "caption" | "subcaption" => {
             at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
             if let Some(opt_end) = super::optional_argument_end(source, at) {
@@ -469,8 +535,8 @@ pub(super) fn caption_arguments(
     }
 }
 
-/// Find a complete printed caption or subcaption argument owning this literal cursor byte.
-pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
+/// Find the outer collected printed argument owning this literal cursor byte.
+pub(super) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
     if byte >= source.len() || !source.is_char_boundary(byte) {
         return None;
     }
@@ -500,18 +566,22 @@ pub(super) fn caption_argument_at(source: &str, byte: usize) -> Option<Range<usi
             b'\\' => {
                 let (name, end) = command(source, at);
                 at = end;
-                if let Some((end, _)) = opaque_command_end(source, name, at) {
+                if let Some(end) = quoted_token_end(source, name, at)
+                    .or_else(|| opaque_command_end(source, name, at).map(|(end, _)| end))
+                {
                     at = end;
                     if byte < at {
                         return None;
                     }
-                } else if let Some((first, second, end)) = caption_arguments(source, name, at) {
+                } else if let Some((first, second, end)) =
+                    collected_text_arguments(source, name, at)
+                {
                     if let Some(first) = first.filter(|first| first.contains(&byte)) {
                         at = first.start;
-                        body = Some(first.start..second.end);
+                        body.get_or_insert(first.start..second.end);
                     } else if second.contains(&byte) {
                         at = second.start;
-                        body = Some(second);
+                        body.get_or_insert(second);
                     } else {
                         at = end;
                         if byte < at {
@@ -932,9 +1002,8 @@ pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<
     None
 }
 
-/// Captions are collected before expansion, so SyncTeX can report the closing
-/// line for every word. Restrict refinement to that complete literal argument.
-pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
+/// Find a collected argument's search scope, preserving enclosing scopes for formatting.
+pub(super) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usize>> {
     let target = line.checked_sub(1)? as usize;
     let mut hidden = super::nonprinting_source_spans(source).peekable();
     let mut i = 0;
@@ -956,10 +1025,12 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
         } else if ch == '\\' {
             let (name, end) = command(source, i);
             i = end;
-            if let Some((end, _)) = opaque_command_end(source, name, i) {
+            if let Some(end) = quoted_token_end(source, name, i)
+                .or_else(|| opaque_command_end(source, name, i).map(|(end, _)| end))
+            {
                 i = end;
             } else if let Some((first_printed, second_printed, end)) =
-                caption_arguments(source, name, i)
+                collected_text_arguments(source, name, i)
             {
                 let start = first_printed.as_ref().unwrap_or(&second_printed).start;
                 let first = counted_lines
@@ -968,9 +1039,24 @@ pub(super) fn caption_lines(source: &str, line: u32) -> Option<Range<usize>> {
                         .filter(|c| *c == b'\n')
                         .count();
                 let last = first + source[start..end].bytes().filter(|c| *c == b'\n').count();
+                if collected_formatting_command(name) && (first..last).contains(&target) {
+                    // Nonclosing anchors retain ordinary proximity and nested collector discovery.
+                    i = start;
+                    continue;
+                }
                 counted_to = end;
                 counted_lines = last;
                 if (first..=last).contains(&target) {
+                    if collected_formatting_command(name) {
+                        // A trailing style wrapper must not hide the rest of a collected body.
+                        if let Some(enclosing) = super::source_frame_range(source, line)
+                            .or_else(|| super::source_tabularx_range(source, line))
+                            .or_else(|| math_lines(source, line))
+                            .filter(|scope| scope.start <= first && last < scope.end)
+                        {
+                            return Some(enclosing);
+                        }
+                    }
                     return Some(first..last + 1);
                 }
                 if first > target {
@@ -2857,13 +2943,13 @@ mod tests {
     #[test]
     fn caption_scopes_preserve_lines_after_skipped_captions() {
         let source = "prefix\n% ignored\n\\caption{\nfirst\n}\ntext\n\\caption*\n{\nsecond\n}";
-        assert_eq!(caption_lines(source, 4), Some(2..5));
-        assert_eq!(caption_lines(source, 9), Some(7..10));
-        assert_eq!(caption_lines(source, 6), None);
-        assert_eq!(caption_lines(source, 0), None);
+        assert_eq!(collected_text_lines(source, 4), Some(2..5));
+        assert_eq!(collected_text_lines(source, 9), Some(7..10));
+        assert_eq!(collected_text_lines(source, 6), None);
+        assert_eq!(collected_text_lines(source, 0), None);
         let source = "\\caption*[short {nested}]\n% between arguments\n{\nlong\n}";
-        assert_eq!(caption_lines(source, 4), Some(2..5));
-        assert_eq!(caption_lines(source, 1), None);
+        assert_eq!(collected_text_lines(source, 4), Some(2..5));
+        assert_eq!(collected_text_lines(source, 1), None);
     }
 
     #[test]
@@ -2884,13 +2970,14 @@ mod tests {
                 );
                 for word in ["LiteralCopper", "LiteralNickel"] {
                     assert_eq!(
-                        caption_argument_at(&source, source.find(word).unwrap()),
+                        collected_text_argument_at(&source, source.find(word).unwrap()),
                         None,
                         "{environment}, {word}"
                     );
                 }
                 let argument =
-                    caption_argument_at(&source, source.find("VisibleNickel").unwrap()).unwrap();
+                    collected_text_argument_at(&source, source.find("VisibleNickel").unwrap())
+                        .unwrap();
                 assert_eq!(
                     &source[argument],
                     format!("VisibleCopper{newline}VisibleNickel{newline}")
@@ -2916,7 +3003,10 @@ mod tests {
                 opaque_command_end(&source, "begin", 6),
                 Some((visible, false))
             );
-            assert!(caption_argument_at(&source, source.find("VisibleCopper").unwrap()).is_some());
+            assert!(
+                collected_text_argument_at(&source, source.find("VisibleCopper").unwrap())
+                    .is_some()
+            );
         }
     }
 
@@ -3146,9 +3236,9 @@ caption}
 caption}}
 \\caption{Visible
 caption}";
-        assert_eq!(caption_lines(source, 3), None);
-        assert_eq!(caption_lines(source, 6), None);
-        assert_eq!(caption_lines(source, 9), Some(7..9));
+        assert_eq!(collected_text_lines(source, 3), None);
+        assert_eq!(collected_text_lines(source, 6), None);
+        assert_eq!(collected_text_lines(source, 9), Some(7..9));
     }
 
     #[test]
