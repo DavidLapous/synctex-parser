@@ -1145,18 +1145,24 @@ fn resolve_inverse_targets<'a>(
     let mut supported = resolutions
         .iter()
         .enumerate()
-        .filter(|(_, (result, _))| result.location.precise);
+        .filter(|(_, (result, _, _))| result.location.precise);
     let mut ambiguous = None;
-    let selected = if let Some((index, (first, _))) = supported.next() {
-        if supported.any(|(_, (other, _))| !same_source_position(&first.location, &other.location))
+    let selected = if let Some((index, (first, _, _))) = supported.next() {
+        if supported
+            .any(|(_, (other, _, _))| !same_source_position(&first.location, &other.location))
         {
             ambiguous = Some("ambiguous inverse search: multiple precise source locations");
+        } else if resolutions.iter().any(|(other, _, word_tied)| {
+            *word_tied && !same_source_position(&first.location, &other.location)
+        }) {
+            // An anchor with tied words is unresolved, unlike one with no matching word.
+            ambiguous = Some("ambiguous inverse search: tied words oppose a precise location");
         }
         index
     } else {
         if resolutions[1..]
             .iter()
-            .any(|(other, _)| !same_source_position(&resolutions[0].0.location, &other.location))
+            .any(|(other, _, _)| !same_source_position(&resolutions[0].0.location, &other.location))
         {
             ambiguous = Some("ambiguous inverse search: multiple coarse source anchors");
         }
@@ -1172,7 +1178,8 @@ fn resolve_inverse_targets<'a>(
     }
     // The executable's first result is its nearest compiler anchor. Explicit
     // best-guess mode cannot turn an ambiguous word refinement into precision.
-    let (mut chosen, raw) = resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
+    let (mut chosen, raw, _) =
+        resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
     let mut warnings = std::collections::BTreeSet::new();
     if let Some(reason) = ambiguous {
         if let Some(raw) = raw {
@@ -1186,7 +1193,7 @@ fn resolve_inverse_targets<'a>(
     if let Some(warning) = chosen.warning {
         warnings.insert(warning);
     }
-    for (other, _) in resolutions {
+    for (other, _, _) in resolutions {
         if same_source_position(&chosen.location, &other.location)
             && let Some(warning) = other.warning
         {
@@ -1268,7 +1275,14 @@ impl QuerySources<'_> {
     }
 }
 
-type MetadataLocation = (String, Rc<String>, u32, usize, isize);
+type MetadataLocation = (
+    String,
+    Rc<String>,
+    u32,
+    usize,
+    isize,
+    Vec<std::ops::Range<usize>>,
+);
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InverseFailure {
@@ -1458,7 +1472,7 @@ impl InverseQuery<'_> {
     fn resolve_target(
         &mut self,
         target: RawInverseCandidate,
-    ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)> {
         let mut anchor = self.normalize_anchor(target)?;
         let Some(source) = self.qualify_source(&mut anchor)? else {
             return Ok((
@@ -1467,6 +1481,7 @@ impl InverseQuery<'_> {
                     warning: anchor.warning,
                 },
                 None,
+                false,
             ));
         };
         self.refine_target(anchor, source)
@@ -1727,7 +1742,7 @@ impl InverseQuery<'_> {
         &mut self,
         anchor: InverseAnchor,
         mut source: Rc<String>,
-    ) -> io::Result<(InverseResolution, Option<SourceLocation>)> {
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)> {
         let InverseAnchor {
             mut target,
             graphics,
@@ -1744,6 +1759,8 @@ impl InverseQuery<'_> {
             Some(GraphicsHit::Ambiguous) => None,
             None => None,
         };
+        let mut word_tied = false;
+        let mut frame_owns_click = false;
         if !is_generated_graphics
             && (refine_graphics.is_some() || (graphics.is_none() && self.word.is_some()))
         {
@@ -1839,12 +1856,11 @@ impl InverseQuery<'_> {
                     .and_then(|map| map.as_ref().ok())
                     .is_some_and(|map| map.generated.extension().is_some_and(|ext| ext == "vrb"));
             let mut opaque_word = false;
-            let mut word_location = |candidate| match candidate {
-                Ok(location) => location,
-                Err(()) => {
+            let mut word_outcome = |candidate: Result<tex::WordOutcome, ()>| {
+                candidate.unwrap_or_else(|()| {
                     opaque_word = true;
-                    None
-                }
+                    tex::WordOutcome::Absent
+                })
             };
             let mut location = if let Some((index, count)) = refine_graphics {
                 source_graphics_location_with_context(
@@ -1860,40 +1876,47 @@ impl InverseQuery<'_> {
                     self.operation,
                 )
             } else if let Some((context, offset)) = self.word {
-                if fragile_body_proven {
-                    word_location(source_word_location_in_frame_body_with_sources(
-                        &source,
-                        target.line,
-                        context,
-                        offset,
-                        extra_sources,
-                        self.operation,
-                    ))
-                } else if scope_proven {
-                    word_location(source_word_location_with_sources(
-                        &source,
-                        target.line,
-                        context,
-                        offset,
-                        self.radius,
-                        extra_sources,
-                        self.operation,
-                    ))
-                } else {
-                    word_location(source_word_location_in_range_with_sources(
-                        &source,
-                        target.line,
-                        context,
-                        offset,
-                        target.line.saturating_sub(1) as usize..target.line as usize,
-                        false,
-                        extra_sources,
-                        self.operation,
-                    ))
-                }
+                let outcome = word_outcome(scoped_word_outcome(
+                    &source,
+                    target.line,
+                    (context, offset),
+                    self.radius,
+                    extra_sources,
+                    (fragile_body_proven, scope_proven),
+                    self.operation,
+                ));
+                word_tied = outcome == tex::WordOutcome::Tied;
+                outcome.location()
             } else {
                 None
             };
+            self.operation.check()?;
+            // A generated box at the point belongs to the fragile frame its sheet names, so a
+            // matching word on a row outside that frame cannot claim the click.
+            if location.is_some()
+                && refine_graphics.is_none()
+                && !generated
+                && source_map
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|map| map.page_source.as_ref())
+                    .is_some_and(|(path, line)| {
+                        self.sources
+                            .normalize(path)
+                            .is_ok_and(|path| path == Path::new(&target.file))
+                            && fragile_frame_range(&source, *line).is_some_and(|frame| {
+                                *line == frame.end as u32
+                                    && !frame.contains(&(target.line.saturating_sub(1) as usize))
+                            })
+                    })
+            {
+                let geometry = self.source_map(None)?;
+                if geometry.generated_at_point {
+                    location = None;
+                    frame_owns_click = true;
+                    source_map = Some(Ok(geometry));
+                }
+            }
             self.operation.check()?;
             if location.is_none() && !generated {
                 if fragile_frame.is_none()
@@ -1918,6 +1941,7 @@ impl InverseQuery<'_> {
                     match original_source_from_verbatim(map, &mut self.sources, self.operation) {
                         Ok((file, original, anchor)) => {
                             let frame_slide = map.frame_slide;
+                            let mut original_tied = false;
                             let candidate = if let Some((index, count)) = refine_graphics {
                                 source_graphics_location_with_context(
                                     &original,
@@ -1932,7 +1956,7 @@ impl InverseQuery<'_> {
                                     self.operation,
                                 )
                             } else if let Some((context, offset)) = self.word {
-                                word_location(
+                                let outcome = word_outcome(
                                     if map.generated.extension().is_some_and(|ext| ext == "vrb") {
                                         source_word_location_in_frame_body_with_sources(
                                             &original,
@@ -1953,19 +1977,23 @@ impl InverseQuery<'_> {
                                             self.operation,
                                         )
                                     },
-                                )
+                                );
+                                original_tied = outcome == tex::WordOutcome::Tied;
+                                outcome.location()
                             } else {
                                 None
                             };
                             self.operation.check()?;
-                            if self.sources.warning(Path::new(&file)).is_none()
-                                && let Some(candidate) = candidate
-                            {
-                                target.file = file;
-                                target.line = anchor;
-                                source = original;
-                                target_frame = source_frame_range(&source, target.line);
-                                location = Some(candidate);
+                            if self.sources.warning(Path::new(&file)).is_none() {
+                                // The original frame's result replaces the host search's evidence.
+                                word_tied = original_tied;
+                                if let Some(candidate) = candidate {
+                                    target.file = file;
+                                    target.line = anchor;
+                                    source = original;
+                                    target_frame = source_frame_range(&source, target.line);
+                                    location = Some(candidate);
+                                }
                             }
                         }
                         Err(error) => {
@@ -1986,6 +2014,7 @@ impl InverseQuery<'_> {
             }
             if refine_graphics.is_none()
                 && !opaque_word
+                && !frame_owns_click
                 && let Some((context, offset)) = self.word
                 && !generated
                 && let Some(map) = source_map.as_ref().and_then(|result| result.as_ref().ok())
@@ -2012,7 +2041,7 @@ impl InverseQuery<'_> {
                         self.operation,
                     )?);
                 }
-                if let Some((file, original, line, byte, score)) =
+                if let Some((file, original, line, byte, score, arguments)) =
                     self.metadata.as_ref().and_then(Option::as_ref)
                     && if let Some(anchor) = &anchor
                         && *file == anchor.file
@@ -2028,6 +2057,18 @@ impl InverseQuery<'_> {
                                 *line,
                                 (prefix.chars().count() + 1) as u32,
                             ) == anchor.line
+                                // A shared compiler line separates metadata from a tie only when
+                                // blanking its arguments leaves no located word or prose tie.
+                                && (!word_tied
+                                    || scoped_word_outcome(
+                                        &blank_source_words(original, arguments),
+                                        target.line,
+                                        (context, offset),
+                                        self.radius,
+                                        extra_sources,
+                                        (fragile_body_proven, scope_proven),
+                                        self.operation,
+                                    ) == Ok(tex::WordOutcome::Absent))
                         }
                     } else {
                         false
@@ -2051,6 +2092,7 @@ impl InverseQuery<'_> {
             }
             self.operation.check()?;
             if location.is_none()
+                && !frame_owns_click
                 && self.sources.best_guess
                 && !spliced_preamble
                     .as_deref()
@@ -2135,14 +2177,78 @@ impl InverseQuery<'_> {
             }
         }
         self.operation.check()?;
+        // A word displaced by the owning frame still competes with that frame's location.
+        let word_tied = (word_tied || frame_owns_click) && !target.precise;
         Ok((
             InverseResolution {
                 location: target,
                 warning,
             },
             anchor,
+            word_tied,
         ))
     }
+}
+
+fn scoped_word_outcome(
+    source: &str,
+    line: u32,
+    (context, offset): (&str, usize),
+    radius: u32,
+    extra_sources: &[&str],
+    (fragile_body_proven, scope_proven): (bool, bool),
+    operation: &Operation,
+) -> Result<tex::WordOutcome, ()> {
+    if fragile_body_proven {
+        source_word_location_in_frame_body_with_sources(
+            source,
+            line,
+            context,
+            offset,
+            extra_sources,
+            operation,
+        )
+    } else if scope_proven {
+        source_word_location_with_sources(
+            source,
+            line,
+            context,
+            offset,
+            radius,
+            extra_sources,
+            operation,
+        )
+    } else {
+        source_word_location_in_range_with_sources(
+            source,
+            line,
+            context,
+            offset,
+            line.saturating_sub(1) as usize..line as usize,
+            false,
+            extra_sources,
+            operation,
+        )
+    }
+}
+
+/// Removes words from ordered spans while keeping byte offsets and TeX delimiters.
+fn blank_source_words(source: &str, spans: &[std::ops::Range<usize>]) -> String {
+    let mut blanked = String::with_capacity(source.len());
+    let mut at = 0;
+    for span in spans {
+        blanked.push_str(&source[at..span.start]);
+        for ch in source[span.clone()].chars() {
+            if ch.is_alphanumeric() {
+                blanked.extend(std::iter::repeat_n(' ', ch.len_utf8()));
+            } else {
+                blanked.push(ch);
+            }
+        }
+        at = span.end;
+    }
+    blanked.push_str(&source[at..]);
+    blanked
 }
 
 fn source_word_compiler_line(source: &str, line: u32, column_char: u32) -> u32 {
@@ -4244,6 +4350,7 @@ fn document_metadata_word_location_with_context(
         return Ok(None);
     }
     let mut best = None;
+    let mut best_arguments = Vec::new();
     let mut tied = false;
     for (file_index, (_, source)) in files.iter().enumerate() {
         operation.check()?;
@@ -4278,7 +4385,7 @@ fn document_metadata_word_location_with_context(
                         spans.push(body.start..end);
                     }
                     let mut cmd_best: Option<(isize, u32, usize)> = None;
-                    for span in spans {
+                    for span in &spans {
                         let first = source[..span.start]
                             .bytes()
                             .filter(|ch| *ch == b'\n')
@@ -4292,7 +4399,7 @@ fn document_metadata_word_location_with_context(
                             first..last + 1,
                             true,
                             &hidden,
-                            Some(span),
+                            Some(span.clone()),
                             operation,
                         );
                         operation.check()?;
@@ -4311,6 +4418,7 @@ fn document_metadata_word_location_with_context(
                             }
                             _ => {
                                 best = Some((score, file_index, line, byte));
+                                best_arguments = spans;
                                 tied = false;
                             }
                         }
@@ -4328,7 +4436,14 @@ fn document_metadata_word_location_with_context(
     let Some(file) = path.to_str() else {
         return Ok(None);
     };
-    Ok(Some((file.to_owned(), source, line, byte, score)))
+    Ok(Some((
+        file.to_owned(),
+        source,
+        line,
+        byte,
+        score,
+        best_arguments,
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

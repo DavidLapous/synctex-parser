@@ -2496,6 +2496,15 @@ pub(super) fn source_location(
     offset: usize,
     prose: Option<(u32, usize, isize)>,
 ) -> Option<(u32, usize)> {
+    let starts: Vec<_> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let limit = if let Some((row, _, _)) = prose {
+        (*starts.get(lines.end).unwrap_or(&source.len()))
+            .max(*starts.get(row as usize).unwrap_or(&source.len()))
+    } else {
+        *starts.get(lines.end).unwrap_or(&source.len())
+    };
     source_location_with_context_mode(
         source,
         line,
@@ -2503,7 +2512,10 @@ pub(super) fn source_location(
         within_frame,
         context,
         offset,
-        prose,
+        prose.map_or(crate::tex::ProseRank::Absent, |(row, byte, score)| {
+            crate::tex::ProseRank::Unique(row, byte, score)
+        }),
+        regions(source, limit),
         &[],
         &[],
         &[],
@@ -2524,7 +2536,8 @@ pub(super) fn source_location_with_context_mode(
     within_frame: bool,
     context: &str,
     offset: usize,
-    prose: Option<(u32, usize, isize)>,
+    prose: crate::tex::ProseRank,
+    regions: Vec<Range<usize>>,
     extra_sources: &[&str],
     foreach_loops: &[crate::tex::ForeachLoop<'_>],
     opaque: &[Range<usize>],
@@ -2537,13 +2550,11 @@ pub(super) fn source_location_with_context_mode(
     let starts: Vec<_> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
-    let limit = if let Some((row, _, _)) = prose {
-        (*starts.get(lines.end).unwrap_or(&source.len()))
-            .max(*starts.get(row as usize).unwrap_or(&source.len()))
-    } else {
-        *starts.get(lines.end).unwrap_or(&source.len())
+    let (prose, tied_score) = match prose {
+        crate::tex::ProseRank::Absent => (None, None),
+        crate::tex::ProseRank::Unique(row, byte, score) => (Some((row, byte, score)), None),
+        crate::tex::ProseRank::Tied(score) => (None, Some(score)),
     };
-    let regions = regions(source, limit);
     let prose = prose.filter(|(row, byte, _)| {
         let index = starts[*row as usize - 1] + byte;
         !regions.iter().any(|range| range.contains(&index))
@@ -2906,7 +2917,17 @@ pub(super) fn source_location_with_context_mode(
     if prose.is_some() && best.is_some() {
         return Ok(None);
     }
-    Ok(prose.map(|(row, byte, _)| (row, byte)).or(mathematical))
+    // Tied prose competes with a formula just as unique prose does above, unless
+    // no tied occurrence has evidence and an uncontradicted formula has lexical evidence.
+    let math_beats_tie = tied_score.is_none_or(|score| {
+        score == 0
+            && best.is_some_and(|((score, has_lexical, contradictions, _, _), _)| {
+                score > 0 && has_lexical && contradictions.0 == 0
+            })
+    });
+    Ok(prose
+        .map(|(row, byte, _)| (row, byte))
+        .or(mathematical.filter(|_| math_beats_tie)))
 }
 
 #[cfg(test)]

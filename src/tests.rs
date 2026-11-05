@@ -1114,7 +1114,8 @@ fn environment_identifiers_are_not_literal_output_but_titles_remain_visible() {
                 4,
                 &[],
                 &Operation::default(),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(expected),
             "{word}",
         );
@@ -2860,7 +2861,8 @@ fn inverse_raw_control_tokens_preserve_imported_note_ownership() {
                     10,
                     &[spliced.source.as_str()],
                     &Operation::default()
-                ),
+                )
+                .map(WordOutcome::location),
                 Err(()),
                 "{source}",
             );
@@ -2873,7 +2875,8 @@ fn inverse_raw_control_tokens_preserve_imported_note_ownership() {
                     10,
                     &[spliced.source.as_str()],
                     &Operation::default()
-                ),
+                )
+                .map(WordOutcome::location),
                 Ok(Some((5, 0))),
                 "{source}",
             );
@@ -2901,7 +2904,8 @@ fn inverse_raw_control_tokens_preserve_unexpandable_primitives() {
                 10,
                 &[],
                 &Operation::default()
-            ),
+            )
+            .map(WordOutcome::location),
             Err(()),
             "{source}",
         );
@@ -2950,7 +2954,8 @@ fn inverse_raw_control_tokens_in_unused_bodies_preserve_printing_scope() {
                 10,
                 &[spliced.source.as_str()],
                 &Operation::default()
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((4, 6))),
             "{source}",
         );
@@ -7632,7 +7637,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
                 1,
                 extra,
                 &Operation::new(Duration::from_secs(10)),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((2 + line_shift, plain_qx_byte)))
         );
         assert_eq!(
@@ -7659,7 +7665,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
                 1,
                 extra,
                 &Operation::new(Duration::from_secs(10)),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((5 + line_shift, wrapped_qx_byte)))
         );
         assert_eq!(
@@ -7717,7 +7724,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             2,
             &[defs_src],
             &Operation::new(Duration::from_secs(10)),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((2, 4)))
     );
 
@@ -7749,7 +7757,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             2,
             bad_extra,
             &Operation::new(Duration::from_secs(10)),
-        );
+        )
+        .map(WordOutcome::location);
         assert!(
             matches!(strict_res, Ok(None) | Err(())),
             "strict should abstain on {bad_src:?}: {strict_res:?}"
@@ -7797,7 +7806,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
                 2,
                 &[],
                 &Operation::new(Duration::from_secs(10)),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(None)
         );
         assert_eq!(
@@ -7821,7 +7831,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
                 2,
                 &[],
                 &Operation::new(Duration::from_secs(10)),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((2, body_macro_byte)))
         );
         assert_eq!(
@@ -7862,7 +7873,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
                 2,
                 &[],
                 &Operation::new(Duration::from_secs(10)),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(None)
         );
         assert!(matches!(
@@ -7895,7 +7907,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             2,
             &[],
             &Operation::new(Duration::from_secs(10)),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((3, printable_override_byte)))
     );
     assert_eq!(
@@ -7926,7 +7939,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             2,
             &[],
             &Operation::new(Duration::from_secs(10)),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((4, 4)))
     );
     let blowup_src = "\\newcommand{\\Lzero}{Targetword Targetword Targetword Targetword}\n\
@@ -7946,7 +7960,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             2,
             &[],
             &Operation::new(Duration::from_secs(10)),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -7971,7 +7986,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             1,
             &[defs_src],
             &Operation::new(Duration::from_secs(10)),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None) | Err(())
     ));
     assert!(matches!(
@@ -8000,6 +8016,773 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         ),
         Err(())
     );
+}
+
+// Each row earns its evidence from its own neighbors; short neighbors add no context bonus.
+const HIGH_LIT: &str = "fen qua zibbet plo.";
+const HIGH_MAC: &str = "fen qua \\Zib{} plo.";
+const LOW_LIT: &str = "ash qua zibbet elm.";
+const LOW_MAC: &str = "ash qua \\Zib{} elm.";
+const TIE_DEFS: &str =
+    "\\newcommand{\\Zib}{zibbet}\n\\newcommand{\\Rep}{qua zibbet plo qua zibbet plo}\n";
+
+fn macro_literal_tie_strict(rows: &[&str], anchor: u32) -> Result<WordOutcome, ()> {
+    source_word_location_with_sources(
+        &rows.join("\n"),
+        anchor,
+        HIGH_LIT,
+        HIGH_LIT.find("zibbet").unwrap(),
+        4,
+        &[TIE_DEFS],
+        &Operation::new(Duration::from_secs(10)),
+    )
+}
+
+fn macro_literal_tie_guess(
+    rows: &[&str],
+    anchor: u32,
+) -> Result<Option<UnverifiedWordLocation>, ()> {
+    source_word_guess_with_sources(
+        &rows.join("\n"),
+        anchor,
+        HIGH_LIT,
+        HIGH_LIT.find("zibbet").unwrap(),
+        4,
+        &[TIE_DEFS],
+        &Operation::new(Duration::from_secs(10)),
+    )
+}
+
+#[test]
+fn macro_literal_tie_survives_later_literal_proximity() {
+    for (rows, anchor) in [
+        // A nearer literal replaces the retained one after the macro has already tied it.
+        (&[HIGH_LIT, HIGH_MAC, HIGH_LIT][..], 3),
+        (&[HIGH_LIT, HIGH_MAC, HIGH_LIT, HIGH_LIT][..], 4),
+        // Discarding a lower-evidence tie does not hide a new tie at the stronger level.
+        (&[LOW_LIT, LOW_MAC, HIGH_LIT, HIGH_MAC, HIGH_LIT][..], 5),
+        // Reversed proximity and macro-first or macro-last orders stay equally coarse.
+        (&[HIGH_LIT, HIGH_MAC, HIGH_LIT][..], 1),
+        (&[HIGH_MAC, HIGH_LIT, HIGH_LIT][..], 3),
+        (&[HIGH_LIT, HIGH_LIT, HIGH_MAC][..], 2),
+    ] {
+        assert_eq!(
+            macro_literal_tie_strict(rows, anchor),
+            Ok(WordOutcome::Tied),
+            "{rows:?}"
+        );
+        assert_eq!(macro_literal_tie_guess(rows, anchor), Err(()), "{rows:?}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_yields_to_strictly_stronger_evidence() {
+    for (rows, anchor, row, needle) in [
+        (&[HIGH_LIT, LOW_LIT, LOW_MAC, LOW_LIT][..], 4, 1, "zibbet"),
+        (&[LOW_LIT, LOW_MAC, LOW_LIT, HIGH_LIT][..], 3, 4, "zibbet"),
+        (&[HIGH_MAC, LOW_LIT, LOW_MAC][..], 3, 1, "\\Zib"),
+        (&[LOW_LIT, LOW_MAC, HIGH_MAC][..], 1, 3, "\\Zib"),
+    ] {
+        let byte = rows[row as usize - 1].find(needle).unwrap();
+        assert_eq!(
+            macro_literal_tie_strict(rows, anchor),
+            Ok(WordOutcome::Located(row, byte)),
+            "{rows:?}"
+        );
+        assert_eq!(
+            macro_literal_tie_guess(rows, anchor),
+            Ok(Some(UnverifiedWordLocation { line: row, byte })),
+            "{rows:?}"
+        );
+    }
+    // The lower tie is forgotten, so literal proximity decides again at the stronger level.
+    assert_eq!(
+        macro_literal_tie_strict(&[LOW_LIT, LOW_MAC, HIGH_LIT, HIGH_LIT], 4),
+        Ok(WordOutcome::Located(4, HIGH_LIT.find("zibbet").unwrap()))
+    );
+}
+
+#[test]
+fn macro_literal_tie_control_keeps_literal_proximity_and_repeated_tokens() {
+    let byte = HIGH_LIT.find("zibbet").unwrap();
+    for anchor in 1..=3 {
+        assert_eq!(
+            macro_literal_tie_strict(&[HIGH_LIT; 3], anchor),
+            Ok(WordOutcome::Located(anchor, byte))
+        );
+    }
+    // Equidistant literals have no proximity winner.
+    assert_eq!(
+        macro_literal_tie_strict(&[HIGH_LIT, "wig oak.", HIGH_LIT], 2),
+        Ok(WordOutcome::Tied)
+    );
+    // Repeated words in one expansion share the invocation's location, so they do not tie.
+    let context = "qua zibbet plo";
+    let offset = context.find("zibbet").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            "\\Rep{}\n",
+            1,
+            context,
+            offset,
+            1,
+            &[TIE_DEFS],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(WordOutcome::Located(1, 0))
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            "\\Rep{}\n",
+            1,
+            context,
+            offset,
+            1,
+            &[TIE_DEFS],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(Some(UnverifiedWordLocation { line: 1, byte: 0 }))
+    );
+}
+
+fn macro_literal_tie_document(body: &str) -> String {
+    format!(
+        "\\documentclass{{article}}\n\\newcommand{{\\Zib}}{{zibbet}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+    )
+}
+
+// The handwritten sidecar matches the minimized pdflatex witness and clicks outside metadata bands.
+fn macro_literal_tie_public(
+    source: &str,
+    anchor: u32,
+    context: &str,
+    offset: usize,
+    radius: u32,
+    best_guess: bool,
+) -> SourceLocation {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, source).unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
+                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
+                "{{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,300:300,10,0\n",
+                "g1,{anchor}:10,300\nx1,{anchor}:310,300\n)\n]\n}}1\n",
+                "Postamble:\nCount:10\n",
+            ),
+            tex = tex.display(),
+            anchor = anchor,
+        ),
+    )
+    .unwrap();
+    resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 50.0,
+            y_from_top: 295.0,
+            page_height_pt: 792.0,
+        },
+        Some((context, offset)),
+        radius,
+        &Operation::default(),
+        None,
+        best_guess,
+    )
+    .unwrap()
+    .location
+}
+
+#[test]
+fn macro_literal_tie_public_math_and_literal_fallback_stay_coarse() {
+    for (body, anchor, context, radius) in [
+        // Proximity alone must not settle a tie, including when both occurrences share a row.
+        (
+            "qua zibbet\n\nqua \\Zib{}\n\nqua zibbet",
+            8,
+            "qua zibbet",
+            4,
+        ),
+        ("qua zibbet\n\nqua \\Zib{} qua zibbet", 6, "qua zibbet", 2),
+        // A tie must not move to a weaker atom on the clicked row.
+        ("qua zibbet\n\nqua \\Zib{} $zibbet$", 6, "qua zibbet", 2),
+        (
+            "qua zibbet plo.\n\nqua \\Zib{} plo.\n\nqua zibbet plo. $zibbet$",
+            8,
+            "qua zibbet plo.",
+            4,
+        ),
+        (
+            "qua zibbet\n\nwig\n\nqua \\Zib{} $zibbet$\n\nqua zibbet",
+            8,
+            "qua zibbet",
+            4,
+        ),
+    ] {
+        let source = macro_literal_tie_document(body);
+        for best_guess in [false, true] {
+            let location =
+                macro_literal_tie_public(&source, anchor, context, 4, radius, best_guess);
+            assert!(!location.precise, "{body:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, anchor, "{body:?} {best_guess}");
+            assert_eq!(location.byte_column, 0, "{body:?} {best_guess}");
+        }
+    }
+    // Equidistant literals are no more evidence for an atom than one unique literal.
+    let source = "\\documentclass{article}\n\\begin{document}\nqua zibbet\n\n$zibbet$\n\nqua zibbet\n\\end{document}\n";
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(source, 5, "qua zibbet", 4, 2, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 5, "{best_guess}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_public_unsupported_macro_leaves_equal_literal_coarse() {
+    let document = |row: &str| {
+        format!(
+            "\\documentclass{{article}}\n\\newcommand{{\\QX}}{{QX}}\n\\begin{{document}}\n{row}\n\\end{{document}}\n"
+        )
+    };
+    let source = document("\\QX{} QX");
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(&source, 4, "QX", 0, 1, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 4, "{best_guess}");
+    }
+    // Corroboration still separates the literal, and an unused macro is no competitor.
+    let row = "\\QX{} qua QX plo";
+    let location =
+        macro_literal_tie_public(&document(row), 4, "qua QX plo", "qua ".len(), 1, false);
+    assert!(location.precise, "{location:?}");
+    assert_eq!(location.byte_column, row.rfind("QX").unwrap());
+    let location = macro_literal_tie_public(&document("wig QX"), 4, "QX", 0, 1, false);
+    assert!(location.precise, "{location:?}");
+    assert_eq!(location.byte_column, "wig ".len());
+    // A lone unsupported macro still cannot claim its invocation.
+    assert_eq!(
+        source_word_location_with_sources(
+            "See \\Zib{} here.\n",
+            1,
+            "zibbet",
+            0,
+            1,
+            &[TIE_DEFS],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(WordOutcome::Tied)
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            "See \\Zib{} here.\n",
+            1,
+            "zibbet",
+            0,
+            1,
+            &[TIE_DEFS],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Err(())
+    );
+}
+
+#[test]
+fn macro_literal_tie_public_stronger_evidence_keeps_precision() {
+    for (body, anchor, context, byte) in [
+        // Stronger literal corroboration still beats a weaker macro and an uncorroborated atom.
+        (
+            "qua \\Zib{} elm.\n\nqua zibbet plo. $zibbet$",
+            6,
+            "qua zibbet plo.",
+            "qua ".len(),
+        ),
+        // Stronger macro corroboration still beats a weaker literal.
+        (
+            "qua zibbet elm.\n\nqua \\Zib{} plo.",
+            6,
+            "qua zibbet plo.",
+            "qua ".len(),
+        ),
+        // A macro-free literal has no competitor at all.
+        ("qua zibbet plo.", 4, "qua zibbet plo.", "qua ".len()),
+    ] {
+        let source = macro_literal_tie_document(body);
+        for best_guess in [false, true] {
+            let location = macro_literal_tie_public(&source, anchor, context, 4, 4, best_guess);
+            assert!(location.precise, "{body:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, anchor, "{body:?} {best_guess}");
+            assert_eq!(location.byte_column, byte, "{body:?} {best_guess}");
+        }
+    }
+}
+
+#[test]
+fn macro_literal_tie_keeps_math_and_reference_disambiguation() {
+    // Occurrences inside formulas remain separable by the operator between their words.
+    let formulas = "$a+x$\nwig\n$a-x$\n";
+    assert_eq!(
+        source_word_location_with_sources(
+            formulas,
+            2,
+            "a+x",
+            2,
+            2,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(WordOutcome::Located(1, 3))
+    );
+    // Reference flanks must beat the tie, as they must beat a unique prose occurrence.
+    let equal = "qua zibbet\nqua \\Zib{}\nqua \\cref{sec:a}\n";
+    assert_eq!(
+        source_word_location_with_sources(
+            equal,
+            3,
+            "qua zibbet",
+            4,
+            2,
+            &[TIE_DEFS],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(WordOutcome::Tied)
+    );
+    let stronger = "zibbet\nqua \\cref{sec:a} plo\nzibbet\n";
+    let label = stronger.lines().nth(1).unwrap().find("sec:a").unwrap();
+    assert_eq!(
+        source_word_location_with_sources(
+            stronger,
+            2,
+            "qua zibbet plo",
+            4,
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(WordOutcome::Located(2, label))
+    );
+}
+
+// One click between records of different tags yields both compiler anchors, as real boxes do.
+fn macro_literal_tie_two_anchors(
+    source: &str,
+    anchors: (u32, u32),
+    best_guess: bool,
+) -> io::Result<InverseResolution> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, source).unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
+                "Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n",
+                "[1,1:4736286,46220574:26673152,41484288,0\n",
+                "(1,{first}:8799518,8865054:22609920,455111,127431\n",
+                "h1,{first}:8799518,8865054:983040,0,0\n",
+                "x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n",
+                ")\n]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
+            ),
+            tex = tex.display(),
+            first = anchors.0,
+            second = anchors.1,
+        ),
+    )
+    .unwrap();
+    resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 157.84,
+            y_from_top: 134.76,
+            page_height_pt: 792.0,
+        },
+        Some(("qua zibbet", 4)),
+        4,
+        &Operation::default(),
+        None,
+        best_guess,
+    )
+}
+
+#[test]
+fn macro_literal_tie_opposes_a_precise_anchor_but_absent_words_do_not() {
+    let document = |early: &str, middle: &str, near: &str| {
+        macro_literal_tie_document(&format!(
+            "{early}\n\n{middle}\n\n{near}\nwig\n\noak\n\nelm\nqua zibbet"
+        ))
+    };
+    for (source, reason) in [
+        // Anchor 8 ties inside its own window while anchor 14 finds one occurrence.
+        (
+            document("qua zibbet", "qua \\Zib{}", "qua zibbet"),
+            "tied words",
+        ),
+        // Two precise anchors keep their established failure.
+        (
+            document("wig oak", "oak wig", "qua zibbet"),
+            "multiple precise",
+        ),
+    ] {
+        let error = macro_literal_tie_two_anchors(&source, (8, 14), false)
+            .expect_err("competing anchors must stay ambiguous");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<InverseFailure>()),
+            Some(InverseFailure::Ambiguous(_))
+        ));
+        assert!(error.to_string().contains(reason), "{error}");
+        let guess = macro_literal_tie_two_anchors(&source, (8, 14), true).unwrap();
+        assert!(!guess.location.precise, "{:?}", guess.location);
+        assert_eq!(guess.location.line, 8);
+        let warning = guess.warning.unwrap();
+        assert!(warning.contains(reason), "{warning}");
+        assert!(
+            warning.contains("using the first compiler anchor"),
+            "{warning}"
+        );
+    }
+    // An anchor without the word has no competing evidence, so the other anchor stands.
+    let source = document("wig", "oak", "wig oak");
+    for best_guess in [false, true] {
+        let hit = macro_literal_tie_two_anchors(&source, (8, 14), best_guess).unwrap();
+        assert!(hit.location.precise, "{best_guess}: {:?}", hit.location);
+        assert_eq!(hit.location.line, 14, "{best_guess}");
+        assert_eq!(hit.location.byte_column, 4, "{best_guess}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_yields_to_corroborated_math_only_at_zero_evidence() {
+    let beamer = |preamble: &str, body: &str| {
+        format!(
+            "\\documentclass{{beamer}}\n{preamble}\\begin{{document}}\n\\begin{{frame}}\n{body}\n\\end{{frame}}\n\\end{{document}}\n"
+        )
+    };
+    let sin_macro = "\\newcommand{\\Fn}{sin}\n";
+    for (source, anchor, context, offset, line, byte) in [
+        // Neither tied occurrence has evidence, and the formula matches its neighbors.
+        (
+            beamer(sin_macro, "See \\Fn{} wig.\n$\\sin(x)+1$"),
+            7,
+            "sin(x)+1",
+            0,
+            6,
+            1,
+        ),
+        (
+            beamer("", "See a here.\nSee a there.\n$\\alpha+a$"),
+            7,
+            "\u{03b1}+a",
+            "\u{03b1}+".len(),
+            6,
+            8,
+        ),
+        // The same formula without a competing macro.
+        (beamer("", "See wig.\n$\\sin(x)+1$"), 6, "sin(x)+1", 0, 5, 1),
+    ] {
+        for best_guess in [false, true] {
+            let location =
+                macro_literal_tie_public(&source, anchor, context, offset, 4, best_guess);
+            assert!(location.precise, "{source:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, line, "{source:?} {best_guess}");
+            assert_eq!(location.byte_column, byte, "{source:?} {best_guess}");
+        }
+    }
+    // A math atom with no evidence of its own stays tied with the macro.
+    let source = "\\documentclass{article}\n\\newcommand{\\QX}{QX}\n\\begin{document}\n\\QX{} $QX$\n\\end{document}\n";
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(source, 4, "QX", 0, 1, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 4, "{best_guess}");
+    }
+    // A math neighbor cannot outrank a tie whose occurrences have evidence too.
+    let source = macro_literal_tie_document("qua zibbet\n\nqua \\Zib{}\n\n$qua zibbet$");
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(&source, 8, "qua zibbet", 4, 4, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 8, "{best_guess}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_blocks_shared_compiler_line_metadata_only() {
+    let frame = |body: &str| {
+        format!(
+            "\\documentclass{{beamer}}\n\\newcommand{{\\Zib}}{{zibbet}}\n\\begin{{document}}\n\\begin{{frame}}\n{body}\n\\end{{frame}}\n\\end{{document}}\n"
+        )
+    };
+    let tied = frame("\\title{qua zibbet}\nqua \\Zib{}\nqua zibbet");
+    let literal_tied = frame("\\title{qua zibbet}\nqua zibbet\nqua zibbet");
+    for best_guess in [false, true] {
+        // The frame's closing line does not separate an unprinted title from tied body words.
+        for source in [&tied, &literal_tied] {
+            let location = macro_literal_tie_public(source, 8, "qua zibbet", 4, 4, best_guess);
+            assert!(!location.precise, "{source:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, 8, "{source:?} {best_guess}");
+        }
+        // A compiler anchor on the title's own row still names that title.
+        let location = macro_literal_tie_public(&tied, 5, "qua zibbet", 4, 4, best_guess);
+        assert!(location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 5, "{best_guess}");
+        assert_eq!(location.byte_column, "\\title{qua ".len(), "{best_guess}");
+    }
+    // Without a tie the title stays reachable, and an opaque alias still suppresses it.
+    let body = "\\begin{frame}\n\\title{Zephyr}\nNimbus\n";
+    let plain = format!("% no alias here\n{body}wig\n\\end{{frame}}\n");
+    let opaque = format!(
+        "\\let\\cue\\note\\noexpand\\bgroup\\renewcommand{{\\note}}[1]{{#1}}\\noexpand\\egroup\n{body}\\cue{{Zephyr}}\n\\end{{frame}}\n"
+    );
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(&plain, 6, "Zephyr", 0, 10, best_guess);
+        assert!(location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 3, "{best_guess}");
+        assert_eq!(location.byte_column, "\\title{".len(), "{best_guess}");
+        let location = macro_literal_tie_public(&opaque, 6, "Zephyr", 0, 10, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 6, "{best_guess}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_outside_math_does_not_depend_on_source_order() {
+    for (body, anchor) in [
+        ("$qua \\Zib{}$\n$qua zibbet$\nqua zibbet", 5),
+        ("qua zibbet\n$qua zibbet$\n$qua \\Zib{}$", 5),
+        ("$qua zibbet$\nqua zibbet\n$qua \\Zib{}$", 4),
+    ] {
+        let source = macro_literal_tie_document(body);
+        for best_guess in [false, true] {
+            let location =
+                macro_literal_tie_public(&source, anchor, "qua zibbet", 4, 4, best_guess);
+            assert!(!location.precise, "{body:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, anchor, "{body:?} {best_guess}");
+        }
+    }
+    // Without a macro, literal proximity still selects the nearer formula.
+    let source = macro_literal_tie_document("qua zibbet\n$qua zibbet$");
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(&source, 5, "qua zibbet", 4, 4, best_guess);
+        assert!(location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 5, "{best_guess}");
+        assert_eq!(location.byte_column, "$qua ".len(), "{best_guess}");
+    }
+}
+
+#[test]
+fn macro_literal_tie_reference_flanks_guard_math_that_won_a_zero_evidence_tie() {
+    let document = |row: &str| {
+        format!(
+            "\\documentclass{{article}}\n\\newcommand{{\\Fn}}{{sin}}\n\\begin{{document}}\nWig \\Fn{{}} oak.\n{row}\n\\end{{document}}\n"
+        )
+    };
+    let offset = "\u{03b2} ".len();
+    for (row, context, byte) in [
+        // One reference flank does not replace the corroborated formula on the anchor row.
+        (
+            "$\\beta\\sin(x)+1$ \u{03b2} \\cref{b} wig",
+            "\u{03b2} sin(x)+1",
+            6,
+        ),
+        // Both flanks still outrank a zero-evidence tie.
+        (
+            "$\\beta\\sin(x)+1$ \u{03b2} \\cref{b} plo",
+            "\u{03b2} sin plo",
+            26,
+        ),
+    ] {
+        let source = document(row);
+        for best_guess in [false, true] {
+            let location = macro_literal_tie_public(&source, 5, context, offset, 2, best_guess);
+            assert!(location.precise, "{row:?} {best_guess}: {location:?}");
+            assert_eq!(location.line, 5, "{row:?} {best_guess}");
+            assert_eq!(location.byte_column, byte, "{row:?} {best_guess}");
+        }
+    }
+}
+
+#[test]
+fn macro_literal_tie_ignores_repeated_arguments_of_one_metadata_declaration() {
+    let frame = |body: &str| {
+        format!(
+            "\\documentclass{{beamer}}\n\\begin{{document}}\n\\begin{{frame}}\n{body}\n\\end{{frame}}\n\\end{{document}}\n"
+        )
+    };
+    let title = "\\title[qua zibbet]{qua zibbet}\\maketitle";
+    let source = frame(title);
+    for best_guess in [false, true] {
+        // The short and full arguments are one declaration, not competing occurrences.
+        let location = macro_literal_tie_public(&source, 5, "qua zibbet", 4, 4, best_guess);
+        assert!(location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 4, "{best_guess}");
+        assert_eq!(
+            location.byte_column,
+            title.rfind("zibbet").unwrap(),
+            "{best_guess}"
+        );
+    }
+    // An occurrence outside the declaration still blocks the shared compiler line.
+    let source = frame(&format!("{title}\nqua zibbet"));
+    for best_guess in [false, true] {
+        let location = macro_literal_tie_public(&source, 6, "qua zibbet", 4, 4, best_guess);
+        assert!(!location.precise, "{best_guess}: {location:?}");
+        assert_eq!(location.line, 6, "{best_guess}");
+    }
+}
+
+// The click is on a verbatim box of the frame closing on row 10, between two tagged records.
+fn macro_literal_tie_fragile_click(
+    frame_row: &str,
+    tags: (u32, u32),
+    best_guess: bool,
+) -> io::Result<InverseResolution> {
+    let boxes = format!(
+        concat!(
+            "(2,1:8799518,8865054:22609920,455111,127431\n",
+            "h2,1:8799518,8865054:983040,0,0\n",
+            "x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n",
+            ")\n",
+        ),
+        first = tags.0,
+        second = tags.1,
+    );
+    macro_literal_tie_fragile_sheet(frame_row, &boxes, best_guess)
+}
+
+fn macro_literal_tie_fragile_sheet(
+    frame_row: &str,
+    boxes: &str,
+    best_guess: bool,
+) -> io::Result<InverseResolution> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let pdf = root.join("doc.pdf");
+    let tex = root.join("doc.tex");
+    let vrb = root.join("doc.vrb");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(
+        &tex,
+        format!(
+            concat!(
+                "\\documentclass{{beamer}}\n\\newcommand{{\\Zib}}{{zibbet}}\n\\begin{{document}}\n",
+                "qua zibbet\nqua \\Zib{{}}\nqua zibbet\nwig\n",
+                "\\begin{{frame}}[fragile]\n{frame_row}\n\\end{{frame}}\n",
+                "wig\nwig\nwig\nqua zibbet\n\\end{{document}}\n",
+            ),
+            frame_row = frame_row,
+        ),
+    )
+    .unwrap();
+    fs::write(&vrb, format!("{frame_row}\n")).unwrap();
+    fs::write(
+        pdf.with_extension("synctex"),
+        format!(
+            concat!(
+                "SyncTeX Version:1\nInput:1:{tex}\nInput:2:{vrb}\nOutput:pdf\n",
+                "Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n",
+                "[1,10:4736286,46220574:26673152,41484288,0\n",
+                "{boxes}]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
+            ),
+            tex = tex.display(),
+            vrb = vrb.display(),
+            boxes = boxes,
+        ),
+    )
+    .unwrap();
+    resolve_inverse(
+        &pdf,
+        InversePoint {
+            page: 1,
+            x: 157.84,
+            y_from_top: 134.76,
+            page_height_pt: 792.0,
+        },
+        Some(("qua zibbet", 4)),
+        4,
+        &Operation::default(),
+        None,
+        best_guess,
+    )
+}
+
+#[test]
+fn macro_literal_tie_generated_frame_owns_the_click_over_outside_rows() {
+    for (frame_row, tags, reason, first_anchor) in [
+        // Rows 6 and 14 lie outside the owning frame, whether or not it has the word.
+        ("plain oak", (6, 14), "multiple coarse", 6),
+        ("qua zibbet", (6, 14), "multiple coarse", 6),
+        // A displaced word on row 14 still competes with the frame's own location.
+        ("qua zibbet", (9, 14), "tied words", 9),
+    ] {
+        let error = macro_literal_tie_fragile_click(frame_row, tags, false)
+            .expect_err("no anchor owns this click uniquely");
+        assert!(error.to_string().contains(reason), "{tags:?}: {error}");
+        let guess = macro_literal_tie_fragile_click(frame_row, tags, true).unwrap();
+        assert!(!guess.location.precise, "{tags:?}: {:?}", guess.location);
+        assert_eq!(guess.location.line, first_anchor, "{tags:?}");
+        let warning = guess.warning.unwrap();
+        assert!(warning.contains(reason), "{tags:?}: {warning}");
+    }
+    for best_guess in [false, true] {
+        // A word only on an outside row stays coarse, and Best Guess cannot restore it.
+        for frame_row in ["plain oak", "qua zibbet"] {
+            let hit = macro_literal_tie_fragile_click(frame_row, (14, 14), best_guess).unwrap();
+            assert!(!hit.location.precise, "{best_guess}: {:?}", hit.location);
+            assert_eq!(hit.location.line, 14, "{best_guess}");
+        }
+        // Inside the frame the location stands, and a host tie yields to that frame's result.
+        for tags in [(9, 9), (10, 10), (6, 9)] {
+            let hit = macro_literal_tie_fragile_click("qua zibbet", tags, best_guess).unwrap();
+            assert!(hit.location.precise, "{tags:?}: {:?}", hit.location);
+            assert_eq!(hit.location.line, 9, "{tags:?}");
+            assert_eq!(hit.location.byte_column, 4, "{tags:?}");
+        }
+    }
+}
+
+#[test]
+fn macro_literal_tie_frame_ownership_reports_geometry_errors_but_keeps_other_boxes() {
+    let generated_box = concat!(
+        "(2,1:8799518,8865054:22609920,455111,127431\n",
+        "h2,1:8799518,8865054:983040,0,0\n",
+        "x1,14:10182558,8865054\nx1,14:10582558,8865054\n",
+        ")\n",
+    );
+    let host_box_beside_generated = concat!(
+        "(1,14:8799518,8865054:22609920,455111,127431\n",
+        "h1,14:8799518,8865054:983040,0,0\n",
+        "x1,14:10182558,8865054\nx1,14:10582558,8865054\n",
+        ")\n",
+        "(2,1:8799518,30000000:22609920,455111,127431\n",
+        "h2,1:8799518,30000000:983040,0,0\n",
+        "x2,1:10182558,30000000\n",
+        ")\n",
+    );
+    for best_guess in [false, true] {
+        // Only the geometry reader rejects this record, and ownership depends on its answer.
+        let boxes = format!("{generated_box}k1,14:abc\n");
+        let error = macro_literal_tie_fragile_sheet("plain oak", &boxes, best_guess)
+            .expect_err("an unreadable ownership lookup must not keep host precision");
+        assert!(error.to_string().contains("invalid position"), "{error}");
+        // A complete map with a host box at the click does not displace its word.
+        let hit =
+            macro_literal_tie_fragile_sheet("plain oak", host_box_beside_generated, best_guess)
+                .unwrap();
+        assert!(hit.location.precise, "{best_guess}: {:?}", hit.location);
+        assert_eq!(hit.location.line, 14, "{best_guess}");
+        assert_eq!(hit.location.byte_column, 4, "{best_guess}");
+    }
 }
 
 #[test]
@@ -8363,7 +9146,8 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
             2,
             &[replay_spliced.source.as_str()],
             &Operation::default()
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((1, 1))),
     );
 
@@ -9466,6 +10250,7 @@ fn agy_v9_stored_delimiters_preserve_preamble_import_scope() {
                 &[spliced.source.as_str()],
                 &Operation::default()
             )
+            .map(WordOutcome::location)
             .ok()
             .flatten(),
             expected,
@@ -9613,7 +10398,8 @@ fn discarded_begin_tokens_do_not_consume_following_printed_arguments() {
             16,
             &[defs],
             &Operation::default()
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None) | Err(()),
     ));
 }
@@ -9709,7 +10495,8 @@ fn unused_import_defaults_do_not_read_or_change_macro_sources() {
             16,
             &[&spliced.source],
             &Operation::default(),
-        );
+        )
+        .map(WordOutcome::location);
         assert_eq!(actual, Ok(Some((6, 7))), "{imported}");
     }
 }
@@ -9902,7 +10689,8 @@ fn strict_fixed_output_inspection_preserves_unrelated_words() {
                 10,
                 &[],
                 &Operation::default()
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((3, 0))),
             "{body}",
         );
@@ -9946,7 +10734,8 @@ fn strict_fixed_output_nested_helpers_preserve_roots_and_original_owners() {
                 10,
                 &[],
                 &Operation::default()
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some(expected)),
             "{source}",
         );
@@ -9978,7 +10767,8 @@ fn environment_helper_reachability_has_no_depth_cutoff_or_fanout_revisits() {
                 10,
                 &[],
                 &operation
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((anchor - 1, 0))),
         );
         assert_eq!(
@@ -9991,6 +10781,7 @@ fn environment_helper_reachability_has_no_depth_cutoff_or_fanout_revisits() {
                 &[],
                 &operation
             )
+            .map(WordOutcome::location)
             .unwrap_or(None),
             None,
         );
@@ -10020,7 +10811,8 @@ fn equation_helper_graph_reuses_root_context_and_preserves_literal_owner() {
             10,
             &[],
             &Operation::default()
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((anchor - 1, 0))),
     );
 }
@@ -10038,7 +10830,8 @@ fn cancelled_source_refinement_does_not_return_a_literal_owner() {
             1,
             &[],
             &operation
-        ),
+        )
+        .map(WordOutcome::location),
         Err(()),
     );
     assert_eq!(
@@ -10327,7 +11120,8 @@ fn clearpage_bounds_footnote_reference_competitors_to_same_page_segment() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((fn2_line, fn2_sec_byte)))
     );
     assert_eq!(
@@ -10357,7 +11151,8 @@ fn clearpage_bounds_footnote_reference_competitors_to_same_page_segment() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -10400,7 +11195,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -10438,7 +11234,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -10476,7 +11273,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -10516,7 +11314,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(
@@ -10556,7 +11355,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
                     1,
                     &[],
                     &Operation::default(),
-                ),
+                )
+                .map(WordOutcome::location),
                 Ok(None),
                 "pause_ctx={pause_ctx:?} pause_off={pause_off}"
             );
@@ -10604,7 +11404,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(Some((5, expected_byte)))
     );
 }
@@ -10631,7 +11432,8 @@ fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
                 1,
                 &[],
                 &Operation::default(),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(None),
             "sep={sep}"
         );
@@ -10663,7 +11465,8 @@ fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
                 1,
                 &[],
                 &Operation::default(),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(None),
             "frame sep={sep}"
         );
@@ -10701,7 +11504,8 @@ fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
             1,
             &[],
             &Operation::default(),
-        ),
+        )
+        .map(WordOutcome::location),
         Ok(None)
     );
     assert!(matches!(

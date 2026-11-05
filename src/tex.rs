@@ -1148,7 +1148,24 @@ pub(crate) fn source_word_location(
         &crate::Operation::default(),
     )
     .ok()
-    .flatten()
+    .and_then(WordOutcome::location)
+}
+
+/// A word search result; `Tied` found competing evidence and `Absent` found none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WordOutcome {
+    Located(u32, usize),
+    Tied,
+    Absent,
+}
+
+impl WordOutcome {
+    pub(crate) fn location(self) -> Option<(u32, usize)> {
+        match self {
+            Self::Located(line, byte) => Some((line, byte)),
+            Self::Tied | Self::Absent => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1215,7 +1232,11 @@ pub(crate) fn source_word_guess_with_sources(
         WordLocationMode::Guess,
         operation,
     )
-    .map(|location| location.map(|(line, byte)| UnverifiedWordLocation { line, byte }))
+    .map(|outcome| {
+        outcome
+            .location()
+            .map(|(line, byte)| UnverifiedWordLocation { line, byte })
+    })
 }
 
 /// Run-in headings are shipped when TeX starts their following body paragraph.
@@ -1378,7 +1399,7 @@ pub(crate) fn source_word_location_with_sources(
     radius: u32,
     extra_sources: &[&str],
     operation: &crate::Operation,
-) -> Result<Option<(u32, usize)>, ()> {
+) -> Result<WordOutcome, ()> {
     source_word_location_with_sources_mode(
         source,
         line,
@@ -1401,11 +1422,12 @@ fn source_word_location_with_sources_mode(
     extra_sources: &[&str],
     mode: WordLocationMode,
     operation: &crate::Operation,
-) -> Result<Option<(u32, usize)>, ()> {
+) -> Result<WordOutcome, ()> {
     operation.check().map_err(|_| ())?;
     let hidden = nonprinting_source_ranges(source);
-    if let Some(tikz) = source_tikzpicture_range_with_hidden(source, line, &hidden)
-        && let Some(loc) = source_word_location_in_range_with_hidden(
+    let mut tikz_tied = false;
+    if let Some(tikz) = source_tikzpicture_range_with_hidden(source, line, &hidden) {
+        match source_word_location_in_range_with_hidden(
             source,
             line,
             context,
@@ -1416,9 +1438,11 @@ fn source_word_location_with_sources_mode(
             mode,
             operation,
             None,
-        )?
-    {
-        return Ok(Some(loc));
+        )? {
+            WordOutcome::Located(row, byte) => return Ok(WordOutcome::Located(row, byte)),
+            WordOutcome::Tied => tikz_tied = true,
+            WordOutcome::Absent => {}
+        }
     }
     let anchor = line.checked_sub(1).map(|l| l as usize);
     let scope = math::collected_text_lines(source, line)
@@ -1436,7 +1460,7 @@ fn source_word_location_with_sources_mode(
         line.saturating_sub(radius.saturating_add(1)) as usize
             ..(line as usize).saturating_add(radius as usize)
     });
-    source_word_location_in_range_with_hidden(
+    let outcome = source_word_location_in_range_with_hidden(
         source,
         line,
         context,
@@ -1447,7 +1471,12 @@ fn source_word_location_with_sources_mode(
         mode,
         operation,
         None,
-    )
+    )?;
+    Ok(if tikz_tied && outcome == WordOutcome::Absent {
+        WordOutcome::Tied
+    } else {
+        outcome
+    })
 }
 
 struct MacroArgRanges {
@@ -2235,7 +2264,7 @@ pub(crate) fn source_word_location_in_frame_body_with_sources(
     offset: usize,
     extra_sources: &[&str],
     operation: &crate::Operation,
-) -> Result<Option<(u32, usize)>, ()> {
+) -> Result<WordOutcome, ()> {
     operation.check().map_err(|_| ())?;
     let frame = source_frame_range(source, line).ok_or(())?;
     let mut body_start = frame_header_after_begin(source, frame.start).ok_or(())?;
@@ -2310,7 +2339,7 @@ pub(crate) fn source_word_location_in_range_with_sources(
     within_scope: bool,
     extra_sources: &[&str],
     operation: &crate::Operation,
-) -> Result<Option<(u32, usize)>, ()> {
+) -> Result<WordOutcome, ()> {
     source_word_location_in_range_with_hidden(
         source,
         line,
@@ -2348,7 +2377,11 @@ pub(crate) fn source_word_guess_in_range_with_sources(
         operation,
         None,
     )
-    .map(|location| location.map(|(line, byte)| UnverifiedWordLocation { line, byte }))
+    .map(|outcome| {
+        outcome
+            .location()
+            .map(|(line, byte)| UnverifiedWordLocation { line, byte })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2363,7 +2396,7 @@ fn source_word_location_in_range_with_hidden(
     mode: WordLocationMode,
     operation: &crate::Operation,
     execution_scope: Option<&std::ops::Range<usize>>,
-) -> Result<Option<(u32, usize)>, ()> {
+) -> Result<WordOutcome, ()> {
     operation.check().map_err(|_| ())?;
     let MacroArgRanges { mut hidden, opaque } = discarded_macro_arg_ranges(
         source,
@@ -2392,9 +2425,17 @@ fn source_word_location_in_range_with_hidden(
         })
         .unwrap_or(false);
     if !within_scope && closing_layout {
-        return Ok(None);
+        return Ok(WordOutcome::Absent);
     }
     let loops = foreach_loops(source, &lines, extra_sources, operation);
+    let math_regions = math::regions(
+        source,
+        source
+            .split_inclusive('\n')
+            .take(lines.end)
+            .map(str::len)
+            .sum::<usize>(),
+    );
     let prose = source_prose_scored_location_with_mode(
         source,
         line,
@@ -2407,6 +2448,7 @@ fn source_word_location_in_range_with_hidden(
         None,
         &loops,
         extra_sources,
+        &math_regions,
         mode,
         operation,
     )?;
@@ -2418,6 +2460,7 @@ fn source_word_location_in_range_with_hidden(
         context,
         offset,
         prose,
+        math_regions,
         extra_sources,
         &loops,
         &opaque,
@@ -2443,7 +2486,11 @@ fn source_word_location_in_range_with_hidden(
         }
         ordinary_word_source_start(source, context, offset, row, byte).map(|start| (row, start))
     });
-    let prose_score = prose.map_or(0, |(_, _, score)| score);
+    let (prose_score, prose_tied) = match prose {
+        ProseRank::Absent => (0, false),
+        ProseRank::Unique(_, _, score) => (score, false),
+        ProseRank::Tied(score) => (score, true),
+    };
     match source_reference_argument_location(
         source,
         line,
@@ -2459,9 +2506,10 @@ fn source_word_location_in_range_with_hidden(
         operation,
     ) {
         Ok(Some((ref_row, ref_byte, ref_score, ref_both_sides)))
-            if candidate.is_none()
+            if (candidate.is_none() && !prose_tied)
                 || (prose_score == 0
-                    && candidate.is_some_and(|(row, _)| row != line)
+                    && (candidate.is_some_and(|(row, _)| row != line)
+                        || (prose_tied && candidate.is_none()))
                     && ref_score > 0)
                 || (ref_both_sides && ref_score > prose_score) =>
         {
@@ -2491,7 +2539,11 @@ fn source_word_location_in_range_with_hidden(
             return Err(());
         }
     }
-    Ok(candidate)
+    Ok(match candidate {
+        Some((row, byte)) => WordOutcome::Located(row, byte),
+        None if prose_tied => WordOutcome::Tied,
+        None => WordOutcome::Absent,
+    })
 }
 
 fn is_direct_reference_command(name: &str) -> bool {
@@ -5081,9 +5133,25 @@ pub(crate) fn source_prose_scored_location_with_loops(
         allowed_bytes,
         loops,
         extra_sources,
+        &[],
         WordLocationMode::Strict,
         operation,
     )
+    .map(|rank| match rank {
+        ProseRank::Unique(row, byte, score) => Some((row, byte, score)),
+        ProseRank::Absent | ProseRank::Tied(_) => None,
+    })
+}
+
+/// Prose evidence for the selected word, before math and reference ownership apply.
+#[derive(Clone, Copy)]
+pub(super) enum ProseRank {
+    /// No occurrence outside math competes, so math ownership may decide.
+    Absent,
+    /// Line, byte and score of the single best occurrence.
+    Unique(u32, usize, isize),
+    /// Equal evidence outside math at this score; weaker ownership cannot become unique.
+    Tied(isize),
 }
 
 // shortcut: 64 KiB fixed prose macro expansion cap, raise if legitimate zero-arg prose macros exceed 64 KiB.
@@ -5236,21 +5304,22 @@ fn source_prose_scored_location_with_mode(
     allowed_bytes: Option<std::ops::Range<usize>>,
     loops: &[ForeachLoop<'_>],
     extra_sources: &[&str],
+    math_regions: &[std::ops::Range<usize>],
     mode: WordLocationMode,
     operation: &crate::Operation,
-) -> Result<Option<(u32, usize, isize)>, ()> {
+) -> Result<ProseRank, ()> {
     operation.check().map_err(|_| ())?;
     enum ProseToken<'a> {
-        Word(u32, usize, String, bool),
-        LoopVar(u32, usize, usize, &'a str),
+        Word(u32, usize, String, bool, bool),
+        LoopVar(u32, usize, usize, &'a str, bool),
     }
 
     if loops.len() > 2 || loops.iter().any(|lp| lp.items.is_none()) {
-        return Ok(None);
+        return Ok(ProseRank::Absent);
     }
     let pdf = words(context);
     let Some(selected) = word_index_at(context, &pdf, offset) else {
-        return Ok(None);
+        return Ok(ProseRank::Absent);
     };
     let pdf: Vec<_> = pdf.iter().map(|(_, word)| normalized_word(word)).collect();
     if custom_env_prints_word(
@@ -5261,7 +5330,7 @@ fn source_prose_scored_location_with_mode(
         &pdf[selected],
         operation,
     ) {
-        return Ok(None);
+        return Ok(ProseRank::Absent);
     }
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
     macro_sources.extend_from_slice(extra_sources);
@@ -5275,6 +5344,7 @@ fn source_prose_scored_location_with_mode(
             .nth(lines.start)
             .is_some_and(|row| source_line_text(row).contains("\\begin{frame}"));
     let mut hidden = hidden.iter().peekable();
+    let mut math_regions = math_regions.iter().peekable();
     let mut tokens = Vec::new();
     let mut has_loop_var = false;
     let mut line_start = 0;
@@ -5297,12 +5367,24 @@ fn source_prose_scored_location_with_mode(
                 {
                     continue;
                 }
+                while math_regions.peek().is_some_and(|range| range.end <= abs) {
+                    math_regions.next();
+                }
+                let in_math = math_regions
+                    .peek()
+                    .is_some_and(|range| range.contains(&abs));
                 if !has_unescaped_backslash_before(text, byte) {
                     // A better body-context score does not disambiguate displayed note text.
                     if word == pdf[selected] && opaque.iter().any(|range| range.contains(&abs)) {
                         return Err(());
                     }
-                    tokens.push(ProseToken::Word(index as u32 + 1, byte, word, false));
+                    tokens.push(ProseToken::Word(
+                        index as u32 + 1,
+                        byte,
+                        word,
+                        false,
+                        in_math,
+                    ));
                 } else {
                     let macros =
                         macros.get_or_insert_with(|| mode.macros(&macro_sources, operation));
@@ -5338,6 +5420,7 @@ fn source_prose_scored_location_with_mode(
                             byte - 1,
                             abs - 1,
                             raw,
+                            in_math,
                         ));
                     } else if let (cmd, cmd_end) = math::command(text, byte - 1)
                         && cmd_end == end
@@ -5360,7 +5443,13 @@ fn source_prose_scored_location_with_mode(
                                 return Err(());
                             }
                             for w in macro_words {
-                                tokens.push(ProseToken::Word(index as u32 + 1, byte - 1, w, true));
+                                tokens.push(ProseToken::Word(
+                                    index as u32 + 1,
+                                    byte - 1,
+                                    w,
+                                    true,
+                                    in_math,
+                                ));
                             }
                         }
                     }
@@ -5374,7 +5463,7 @@ fn source_prose_scored_location_with_mode(
         let candidates: Vec<_> = tokens
             .into_iter()
             .filter_map(|t| match t {
-                ProseToken::Word(r, b, w, m) => Some((r, b, w, m)),
+                ProseToken::Word(r, b, w, m, in_math) => Some((r, b, w, m, in_math)),
                 ProseToken::LoopVar(..) => None,
             })
             .collect();
@@ -5384,20 +5473,20 @@ fn source_prose_scored_location_with_mode(
             .iter()
             .filter(|lp| {
                 tokens.iter().any(|t| {
-                    matches!(t, ProseToken::LoopVar(_, _, abs, v) if lp.body.contains(abs) && lp.vars.contains(v))
+                    matches!(t, ProseToken::LoopVar(_, _, abs, v, _) if lp.body.contains(abs) && lp.vars.contains(v))
                 })
             })
             .collect();
         if active_loops.is_empty() || active_loops.len() > 2 {
-            return Ok(None);
+            return Ok(ProseRank::Absent);
         }
         let mut combinations: Vec<Vec<(std::ops::Range<usize>, &str, &str)>> = vec![Vec::new()];
         for lp in active_loops {
             let Some(items) = lp.items.as_ref() else {
-                return Ok(None);
+                return Ok(ProseRank::Absent);
             };
             if combinations.len().saturating_mul(items.len()) > 32 {
-                return Ok(None);
+                return Ok(ProseRank::Absent);
             }
             let mut next = Vec::new();
             for prefix in &combinations {
@@ -5405,7 +5494,7 @@ fn source_prose_scored_location_with_mode(
                     let mut combined = prefix.clone();
                     for (&var, val) in lp.vars.iter().zip(item.iter()) {
                         if val.contains('\\') {
-                            return Ok(None);
+                            return Ok(ProseRank::Absent);
                         }
                         combined.push((lp.body.clone(), var, val.as_str()));
                     }
@@ -5418,15 +5507,17 @@ fn source_prose_scored_location_with_mode(
             let mut candidates = Vec::with_capacity(tokens.len());
             for t in &tokens {
                 match t {
-                    ProseToken::Word(r, b, w, m) => candidates.push((*r, *b, w.clone(), *m)),
-                    ProseToken::LoopVar(r, b, abs, var) => {
+                    ProseToken::Word(r, b, w, m, in_math) => {
+                        candidates.push((*r, *b, w.clone(), *m, *in_math));
+                    }
+                    ProseToken::LoopVar(r, b, abs, var, in_math) => {
                         if let Some((_, _, val)) = combo
                             .iter()
                             .rev()
                             .find(|(body, v, _)| body.contains(abs) && v == var)
                         {
                             for (_, _, w) in source_words(val) {
-                                candidates.push((*r, *b, w, false));
+                                candidates.push((*r, *b, w, false, *in_math));
                             }
                         }
                     }
@@ -5435,11 +5526,17 @@ fn source_prose_scored_location_with_mode(
             passes.push(candidates);
         }
     }
-    let mut best: Option<((isize, bool, isize), u32, u32, usize, bool)> = None;
+    let mut best: Option<((isize, bool, isize), u32, u32, usize, bool, bool)> = None;
     let mut tied = false;
-    let mut saw_uncorroborated_macro = false;
+    // Equal-evidence macro ambiguity is not resolved by literal proximity.
+    let mut macro_tied = false;
+    // Math context can only separate occurrences that are all inside formulas.
+    let mut outside_math_at_rank = false;
+    let mut literal_tie_outside_math = false;
+    let mut unsupported_macro: Option<(isize, bool, isize)> = None;
+    let mut unsupported_macro_outside_math: Option<(isize, bool, isize)> = None;
     for candidates in &passes {
-        for (index, (row, byte, word, from_macro)) in candidates.iter().enumerate() {
+        for (index, (row, byte, word, from_macro, in_math)) in candidates.iter().enumerate() {
             if *word != pdf[selected] {
                 continue;
             }
@@ -5482,10 +5579,6 @@ fn source_prose_scored_location_with_mode(
                     }
                 }
             }
-            if *from_macro && score == 0 {
-                saw_uncorroborated_macro = true;
-                continue;
-            }
             // A collected frame/caption boundary does not favor its last occurrence.
             let proximity = if within_frame || mode == WordLocationMode::Guess {
                 0
@@ -5499,36 +5592,73 @@ fn source_prose_scored_location_with_mode(
                     && pdf.len() > 1
                     && score == 0
                     && *row as usize == lines.start + 1
-                    && candidates.iter().filter(|(r, _, _, _)| *r == *row).count() <= 2,
+                    && candidates
+                        .iter()
+                        .filter(|(r, _, _, _, _)| *r == *row)
+                        .take(3)
+                        .count()
+                        <= 2,
                 context_bonus,
             );
+            if *from_macro && score == 0 {
+                unsupported_macro = unsupported_macro.max(Some(base_rank));
+                if !*in_math {
+                    unsupported_macro_outside_math =
+                        unsupported_macro_outside_math.max(Some(base_rank));
+                }
+                continue;
+            }
             match best {
-                Some((old_base, _, _, _, _)) if base_rank < old_base => {}
-                Some((old_base, old_prox, prev_row, prev_byte, prev_macro))
+                Some((old_base, ..)) if base_rank < old_base => {}
+                Some((old_base, old_prox, prev_row, prev_byte, prev_macro, prev_in_math))
                     if base_rank == old_base =>
                 {
+                    let distinct = (prev_row, prev_byte) != (*row, *byte);
+                    outside_math_at_rank |= !*in_math;
                     if *from_macro || prev_macro {
-                        tied |= (prev_row, prev_byte) != (*row, *byte);
+                        tied |= distinct;
+                        macro_tied |= distinct;
                     } else if proximity < old_prox {
-                        best = Some((base_rank, proximity, *row, *byte, *from_macro));
-                        tied = false;
+                        best = Some((base_rank, proximity, *row, *byte, *from_macro, *in_math));
+                        tied = macro_tied;
+                        literal_tie_outside_math = false;
                     } else if proximity == old_prox {
-                        tied |= (prev_row, prev_byte) != (*row, *byte);
+                        tied |= distinct;
+                        literal_tie_outside_math |= distinct && !(prev_in_math && *in_math);
                     }
                 }
                 _ => {
-                    best = Some((base_rank, proximity, *row, *byte, *from_macro));
+                    best = Some((base_rank, proximity, *row, *byte, *from_macro, *in_math));
                     tied = false;
+                    macro_tied = false;
+                    outside_math_at_rank = !*in_math;
+                    literal_tie_outside_math = false;
                 }
             }
         }
     }
-    if mode == WordLocationMode::Guess && (tied || (best.is_none() && saw_uncorroborated_macro)) {
+    let best_rank = best.map(|(rank, ..)| rank);
+    // An uncorroborated macro cannot claim its occurrence, but it still leaves
+    // an equally unsupported literal non-unique.
+    if unsupported_macro.is_some() && unsupported_macro >= best_rank {
+        tied = true;
+        macro_tied = true;
+        outside_math_at_rank |=
+            unsupported_macro_outside_math.is_some() && unsupported_macro_outside_math >= best_rank;
+    }
+    if mode == WordLocationMode::Guess && tied {
         return Err(());
     }
-    Ok(best
-        .filter(|_| !tied)
-        .map(|(rank, _, row, byte, _)| (row, byte, rank.0)))
+    let tied_outside_math = if macro_tied {
+        outside_math_at_rank
+    } else {
+        literal_tie_outside_math
+    };
+    Ok(match best {
+        Some((rank, _, row, byte, _, _)) if !tied => ProseRank::Unique(row, byte, rank.0),
+        _ if tied_outside_math => ProseRank::Tied(best_rank.map_or(0, |rank| rank.0)),
+        _ => ProseRank::Absent,
+    })
 }
 
 fn clean_lexical_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -5811,7 +5941,8 @@ mod remaining_review_tests {
                         0,
                         &[],
                         &operation,
-                    ),
+                    )
+                    .map(WordOutcome::location),
                     Ok(Some((row as u32, byte))),
                     "{header:?} separator {separator:?}",
                 );
@@ -5826,7 +5957,8 @@ mod remaining_review_tests {
                 0,
                 &[],
                 &crate::Operation::default(),
-            ),
+            )
+            .map(WordOutcome::location),
             Ok(Some((2, 6))),
         );
     }
@@ -5877,7 +6009,8 @@ mod remaining_review_tests {
                         },
                         &[],
                         &crate::Operation::default(),
-                    ),
+                    )
+                    .map(WordOutcome::location),
                     Ok(Some((row as u32, byte))),
                     "{gap:?} newline={newline:?}",
                 );
