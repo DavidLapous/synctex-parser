@@ -126,7 +126,10 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
     // A clipped `\includegraphics` leaf holds only a form reference with no `<`
     // definition, and each natural box overlaps its neighboring image.
     let host = |line: u32, x: u32, forms: &[u32]| {
-        let leaf: String = forms.iter().map(|tag| format!("f{tag}:{x},100\n")).collect();
+        let leaf: String = forms
+            .iter()
+            .map(|tag| format!("f{tag}:{x},100\n"))
+            .collect();
         format!(
             concat!(
                 "(1,{line}:{x},100:30,30,0\n",
@@ -427,7 +430,10 @@ fn undefined_form_references_parse_as_if_never_recorded() {
     // The measured failures, stated directly rather than only relative to the deleted form.
     let trailing = document(&hbox("f9:100,100\nk1,7:150,100:10\ng1,7:160,100\n"), "");
     for mode in [false, true] {
-        assert!(!forward(&trailing, 7, mode).unwrap().is_empty(), "mode={mode}");
+        assert!(
+            !forward(&trailing, 7, mode).unwrap().is_empty(),
+            "mode={mode}"
+        );
     }
     assert_eq!(forward(&document(ancestor, ""), 7, true).unwrap().len(), 2);
 
@@ -561,7 +567,9 @@ fn same_line_text_over_graphics_keeps_its_word() {
 #[test]
 fn printing_overrides_of_reference_wrappers_do_not_own_their_text() {
     let source_with = |preamble: &str, body: &str| {
-        format!("\\documentclass{{article}}\n{preamble}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+        format!(
+            "\\documentclass{{article}}\n{preamble}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+        )
     };
     let label_byte = |source: &str| source.lines().nth(3).unwrap().find("sec:a").unwrap();
     for (preamble, body, context) in [
@@ -619,7 +627,8 @@ fn printing_overrides_of_reference_wrappers_do_not_own_their_text() {
 
 #[test]
 fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
-    let multiline = "\\begin{frame} <1->[<+->]\n[label=syntheticish-theorem,\n  t]{Theorem statement}";
+    let multiline =
+        "\\begin{frame} <1->[<+->]\n[label=syntheticish-theorem,\n  t]{Theorem statement}";
     let commented = "\\begin{frame}% keep header\n[label=syntheticish-theorem]{Theorem statement}";
     for (header, anchor, line, context, needle, owned) in [
         (
@@ -638,7 +647,14 @@ fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
             "[label=syntheticish-theorem,",
             false,
         ),
-        (multiline, 5, 5, "Theorem statement", "Theorem statement", true),
+        (
+            multiline,
+            5,
+            5,
+            "Theorem statement",
+            "Theorem statement",
+            true,
+        ),
         // A comment newline continues the header, so the option after it is still metadata.
         (
             commented,
@@ -648,7 +664,14 @@ fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
             "[label=syntheticish-theorem]",
             false,
         ),
-        (commented, 4, 4, "Theorem statement", "Theorem statement", true),
+        (
+            commented,
+            4,
+            4,
+            "Theorem statement",
+            "Theorem statement",
+            true,
+        ),
         // A blank line ends the header: this bracket is printed body text, not an option.
         (
             "\\begin{frame}\n\n[Bracketword ordinary body.]",
@@ -1561,7 +1584,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
                   We check \\cref{sec:alpha} and \\Cref{thm:beta} before \\eqref{eq:gamma} \
                   on page \\pageref{sec:alpha} via \\autoref{thm:beta} and \\ref{sec:alpha} \
                   near \\cref{fig:square}.\n";
-    let context = "We check section 1 and Theorem 1 before (1) on page 1 via Theorem 1 and 1 near fig. 1.";
+    let context =
+        "We check section 1 and Theorem 1 before (1) on page 1 via Theorem 1 and 1 near fig. 1.";
     let row = source.lines().nth(1).unwrap();
     let expected = [
         ("section", "\\cref{", "sec:alpha"),
@@ -1630,7 +1654,10 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             "multiline guess token {token}"
         );
     }
-    let col_char = multiline.lines().nth(1).unwrap()[..first_byte].chars().count() as u32 + 1;
+    let col_char = multiline.lines().nth(1).unwrap()[..first_byte]
+        .chars()
+        .count() as u32
+        + 1;
     assert_eq!(
         tex::reference_argument_closing_line(multiline, 2, col_char),
         Some(3)
@@ -1638,7 +1665,12 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
 
     let custom_format = "\\crefformat{section}{#2#1#3 zone}\nBefore \\cref{sec:alpha} after.\n";
     let custom_ctx = "Before 1 zone after.";
-    let custom_byte = custom_format.lines().nth(1).unwrap().find("sec:alpha").unwrap();
+    let custom_byte = custom_format
+        .lines()
+        .nth(1)
+        .unwrap()
+        .find("sec:alpha")
+        .unwrap();
     for token in ["1", "zone"] {
         let offset = custom_ctx.find(token).unwrap();
         assert_eq!(
@@ -1705,7 +1737,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((1, cap_ref_byte))
     );
 
-    let thm_src = "\\newtheorem{thm}{Theorem}\n\\begin{thm}Claim before \\cref{sec:alpha} done.\\end{thm}\n";
+    let thm_src =
+        "\\newtheorem{thm}{Theorem}\n\\begin{thm}Claim before \\cref{sec:alpha} done.\\end{thm}\n";
     let thm_ctx = "Theorem 1. Claim before section 1 done.";
     let thm_ref_byte = thm_src.lines().nth(1).unwrap().find("sec:alpha").unwrap();
     assert_ne!(
@@ -1753,15 +1786,33 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     );
 
     // Comment-only line between source lines does not create a false paragraph boundary, and off-line reference is not invisible.
-    let twoline_src = "Lead \\cref{sec:first} middle\n% comment line\nand \\cref{sec:second} tail.\n";
+    let twoline_src =
+        "Lead \\cref{sec:first} middle\n% comment line\nand \\cref{sec:second} tail.\n";
     let twoline_ctx = "Lead section 1 middle and section 2 tail.";
-    let second_ref_byte = twoline_src.lines().nth(2).unwrap().find("sec:second").unwrap();
+    let second_ref_byte = twoline_src
+        .lines()
+        .nth(2)
+        .unwrap()
+        .find("sec:second")
+        .unwrap();
     assert_eq!(
-        source_word_location(twoline_src, 3, twoline_ctx, twoline_ctx.rfind("section").unwrap(), 1),
+        source_word_location(
+            twoline_src,
+            3,
+            twoline_ctx,
+            twoline_ctx.rfind("section").unwrap(),
+            1
+        ),
         Some((3, second_ref_byte))
     );
     assert_eq!(
-        source_word_location(twoline_src, 3, twoline_ctx, twoline_ctx.find('2').unwrap(), 1),
+        source_word_location(
+            twoline_src,
+            3,
+            twoline_ctx,
+            twoline_ctx.find('2').unwrap(),
+            1
+        ),
         Some((3, second_ref_byte))
     );
 
@@ -1770,7 +1821,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let ref_before_cite_ctx = "Note section 1 before [7] done.";
     let ref_before_cite_byte = ref_before_cite.find("sec:alpha").unwrap();
     assert_eq!(
-        source_word_location(ref_before_cite, 1, ref_before_cite_ctx, ref_before_cite_ctx.find('7').unwrap(), 1),
+        source_word_location(
+            ref_before_cite,
+            1,
+            ref_before_cite_ctx,
+            ref_before_cite_ctx.find('7').unwrap(),
+            1
+        ),
         None
     );
     assert_eq!(
@@ -1786,7 +1843,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Ok(None)
     );
     assert_eq!(
-        source_word_location(ref_before_cite, 1, ref_before_cite_ctx, ref_before_cite_ctx.find("section").unwrap(), 1),
+        source_word_location(
+            ref_before_cite,
+            1,
+            ref_before_cite_ctx,
+            ref_before_cite_ctx.find("section").unwrap(),
+            1
+        ),
         Some((1, ref_before_cite_byte))
     );
 
@@ -1802,7 +1865,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let invalid_then_valid_ctx = "Lead section 1 middle section 2 tail.";
     let valid_second_byte = invalid_then_valid.find("sec:second").unwrap();
     assert_eq!(
-        source_word_location(invalid_then_valid, 1, invalid_then_valid_ctx, invalid_then_valid_ctx.find("section").unwrap(), 1),
+        source_word_location(
+            invalid_then_valid,
+            1,
+            invalid_then_valid_ctx,
+            invalid_then_valid_ctx.find("section").unwrap(),
+            1
+        ),
         None
     );
     assert_eq!(
@@ -1818,20 +1887,48 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Ok(None)
     );
     assert_eq!(
-        source_word_location(invalid_then_valid, 1, invalid_then_valid_ctx, invalid_then_valid_ctx.rfind("section").unwrap(), 1),
+        source_word_location(
+            invalid_then_valid,
+            1,
+            invalid_then_valid_ctx,
+            invalid_then_valid_ctx.rfind("section").unwrap(),
+            1
+        ),
         Some((1, valid_second_byte))
     );
 
     let adj_lines_src = "First \\cref{sec:one} end.\nSecond \\cref{sec:two} done.\n";
     let adj_lines_ctx = "First section 1 end. Second section 2 done.";
-    let adj_one_byte = adj_lines_src.lines().next().unwrap().find("sec:one").unwrap();
-    let adj_two_byte = adj_lines_src.lines().nth(1).unwrap().find("sec:two").unwrap();
+    let adj_one_byte = adj_lines_src
+        .lines()
+        .next()
+        .unwrap()
+        .find("sec:one")
+        .unwrap();
+    let adj_two_byte = adj_lines_src
+        .lines()
+        .nth(1)
+        .unwrap()
+        .find("sec:two")
+        .unwrap();
     assert_eq!(
-        source_word_location(adj_lines_src, 1, adj_lines_ctx, adj_lines_ctx.find("section").unwrap(), 1),
+        source_word_location(
+            adj_lines_src,
+            1,
+            adj_lines_ctx,
+            adj_lines_ctx.find("section").unwrap(),
+            1
+        ),
         Some((1, adj_one_byte))
     );
     assert_eq!(
-        source_word_location(adj_lines_src, 2, adj_lines_ctx, adj_lines_ctx.rfind("section").unwrap(), 1),
+        source_word_location(
+            adj_lines_src,
+            2,
+            adj_lines_ctx,
+            adj_lines_ctx.rfind("section").unwrap(),
+            1
+        ),
         Some((2, adj_two_byte))
     );
 
@@ -1839,30 +1936,39 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     // with identical surrounding flanks must not be stolen by a reference.
     let rep_cite_src = "By \\cref{sec:a} then \\\\ By \\cite{key} then.\n";
     let rep_cite_ctx = "By section 1 then By [7] then.";
-    for offset in [rep_cite_ctx.find('7').unwrap()] {
-        assert_eq!(source_word_location(rep_cite_src, 1, rep_cite_ctx, offset, 1), None);
-        assert_eq!(
-            source_word_guess_with_sources(
-                rep_cite_src,
-                1,
-                rep_cite_ctx,
-                offset,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(None)
-        );
-    }
+    let rep_cite_offset = rep_cite_ctx.find('7').unwrap();
+    assert_eq!(
+        source_word_location(rep_cite_src, 1, rep_cite_ctx, rep_cite_offset, 1),
+        None
+    );
+    assert_eq!(
+        source_word_guess_with_sources(
+            rep_cite_src,
+            1,
+            rep_cite_ctx,
+            rep_cite_offset,
+            1,
+            &[],
+            &Operation::new(Duration::from_secs(10)),
+        ),
+        Ok(None)
+    );
     assert_eq!(
         source_word_location(rep_cite_src, 1, "By [7] then.", 4, 1),
         None
     );
 
-    let frame_cite_src = "\\begin{frame}\nBy \\cref{sec:a} then.\n\nBy \\cite{key} then.\n\\end{frame}\n";
+    let frame_cite_src =
+        "\\begin{frame}\nBy \\cref{sec:a} then.\n\nBy \\cite{key} then.\n\\end{frame}\n";
     let frame_cite_ctx = "By section 1 then. By [7] then.";
     assert_eq!(
-        source_word_location(frame_cite_src, 5, frame_cite_ctx, frame_cite_ctx.find('7').unwrap(), 4),
+        source_word_location(
+            frame_cite_src,
+            5,
+            frame_cite_ctx,
+            frame_cite_ctx.find('7').unwrap(),
+            4
+        ),
         None
     );
     assert_eq!(
@@ -1900,7 +2006,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let rep_filtered_src = "By \\cref{sec:a} then \\\\ By \\cref{\\keymacro} then.\n";
     let rep_filtered_ctx = "By section 1 then By section 2 then.";
     assert_eq!(
-        source_word_location(rep_filtered_src, 1, rep_filtered_ctx, rep_filtered_ctx.rfind("section").unwrap(), 1),
+        source_word_location(
+            rep_filtered_src,
+            1,
+            rep_filtered_ctx,
+            rep_filtered_ctx.rfind("section").unwrap(),
+            1
+        ),
         None
     );
     assert_eq!(
@@ -1920,7 +2032,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let rep_math_ctx = "By section 1 then By α then.";
     let rep_math_byte = rep_math_src.find("\\alpha").unwrap();
     assert_eq!(
-        source_word_location(rep_math_src, 1, rep_math_ctx, rep_math_ctx.find('α').unwrap(), 1),
+        source_word_location(
+            rep_math_src,
+            1,
+            rep_math_ctx,
+            rep_math_ctx.find('α').unwrap(),
+            1
+        ),
         Some((1, rep_math_byte))
     );
     assert_eq!(
@@ -1943,7 +2061,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let frame_and_ctx = "By section 1 then By section 2 and section 3 then";
     let frame_and_byte = frame_and_src.lines().nth(3).unwrap().find("and").unwrap();
     assert_eq!(
-        source_word_location(frame_and_src, 5, frame_and_ctx, frame_and_ctx.find("and").unwrap(), 4),
+        source_word_location(
+            frame_and_src,
+            5,
+            frame_and_ctx,
+            frame_and_ctx.find("and").unwrap(),
+            4
+        ),
         Some((4, frame_and_byte))
     );
     assert_eq!(
@@ -1962,10 +2086,17 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         }))
     );
 
-    let para_start_rep_src = "Use the \\cref{sec:a} as the base. Use the \\cite{key} as the base.\n";
+    let para_start_rep_src =
+        "Use the \\cref{sec:a} as the base. Use the \\cite{key} as the base.\n";
     let para_start_rep_ctx = "Use the section 1 as the base. Use the [7] as the base.";
     assert_eq!(
-        source_word_location(para_start_rep_src, 1, para_start_rep_ctx, para_start_rep_ctx.find('7').unwrap(), 1),
+        source_word_location(
+            para_start_rep_src,
+            1,
+            para_start_rep_ctx,
+            para_start_rep_ctx.find('7').unwrap(),
+            1
+        ),
         None
     );
     assert!(matches!(
@@ -1982,11 +2113,18 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     ));
 
     // Zero-word source slots paired with mixed generated+literal segments must not shift ordinals or steal literals.
-    let ord_shift_src = "By \\rule{1em}{1pt} then \\\\ By \\cref{sec:a} then \\\\ By \\cite{key} too then.\n";
+    let ord_shift_src =
+        "By \\rule{1em}{1pt} then \\\\ By \\cref{sec:a} then \\\\ By \\cite{key} too then.\n";
     let ord_shift_ctx = "By [7] too then.";
     let ord_too_byte = ord_shift_src.find("too").unwrap();
     assert_eq!(
-        source_word_location(ord_shift_src, 1, ord_shift_ctx, ord_shift_ctx.find('7').unwrap(), 1),
+        source_word_location(
+            ord_shift_src,
+            1,
+            ord_shift_ctx,
+            ord_shift_ctx.find('7').unwrap(),
+            1
+        ),
         None
     );
     assert!(matches!(
@@ -2002,7 +2140,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Ok(None) | Err(())
     ));
     assert_eq!(
-        source_word_location(ord_shift_src, 1, ord_shift_ctx, ord_shift_ctx.find("too").unwrap(), 1),
+        source_word_location(
+            ord_shift_src,
+            1,
+            ord_shift_ctx,
+            ord_shift_ctx.find("too").unwrap(),
+            1
+        ),
         Some((1, ord_too_byte))
     );
     assert_eq!(
@@ -2023,9 +2167,20 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
 
     let tabx_shift_src = "\\begin{tabularx}{\\linewidth}{lll}\nYes & $-$ & ok \\\\\nYes & \\cref{sec:a} & ok \\\\\nYes & \\cite{key} table & ok \\\\\n\\end{tabularx}\n";
     let tabx_shift_ctx = "Yes − ok Yes section 1 ok Yes [7] table ok";
-    let tabx_table_byte = tabx_shift_src.lines().nth(3).unwrap().find("table").unwrap();
+    let tabx_table_byte = tabx_shift_src
+        .lines()
+        .nth(3)
+        .unwrap()
+        .find("table")
+        .unwrap();
     assert_eq!(
-        source_word_location(tabx_shift_src, 5, tabx_shift_ctx, tabx_shift_ctx.find('7').unwrap(), 5),
+        source_word_location(
+            tabx_shift_src,
+            5,
+            tabx_shift_ctx,
+            tabx_shift_ctx.find('7').unwrap(),
+            5
+        ),
         None
     );
     assert!(matches!(
@@ -2041,7 +2196,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Ok(None) | Err(())
     ));
     assert_eq!(
-        source_word_location(tabx_shift_src, 5, tabx_shift_ctx, tabx_shift_ctx.find("table").unwrap(), 5),
+        source_word_location(
+            tabx_shift_src,
+            5,
+            tabx_shift_ctx,
+            tabx_shift_ctx.find("table").unwrap(),
+            5
+        ),
         Some((4, tabx_table_byte))
     );
     assert_eq!(
@@ -2064,7 +2225,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let fn_cite_src = "See \\cite{key} for details.\\footnote{See \\cref{sec:a} for details.}\n";
     let fn_cite_ctx = "See [7] for details.1";
     assert_eq!(
-        source_word_location(fn_cite_src, 1, fn_cite_ctx, fn_cite_ctx.find('7').unwrap(), 1),
+        source_word_location(
+            fn_cite_src,
+            1,
+            fn_cite_ctx,
+            fn_cite_ctx.find('7').unwrap(),
+            1
+        ),
         None
     );
     assert!(matches!(
@@ -2084,7 +2251,13 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let fn_math_ctx = "See α for details.1";
     let fn_alpha_byte = fn_math_src.find("\\alpha").unwrap();
     assert_eq!(
-        source_word_location(fn_math_src, 1, fn_math_ctx, fn_math_ctx.find('α').unwrap(), 1),
+        source_word_location(
+            fn_math_src,
+            1,
+            fn_math_ctx,
+            fn_math_ctx.find('α').unwrap(),
+            1
+        ),
         Some((1, fn_alpha_byte))
     );
     assert_eq!(
@@ -2133,11 +2306,18 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     // Same-line page breaks must not let context-edge spans claim page-furniture numbers.
     for (footer_src, footer_ctx, num) in [
         ("Alpha \\cref{sec:a}\\clearpage\n", "Alpha section 1 5", '5'),
-        ("Beta \\cref{sec:a}\\par\\clearpage\n", "Beta section 1 6", '6'),
+        (
+            "Beta \\cref{sec:a}\\par\\clearpage\n",
+            "Beta section 1 6",
+            '6',
+        ),
         ("\\cref{sec:a} done.\\clearpage\n", "7 section 1 done.", '7'),
     ] {
         let off = footer_ctx.find(num).unwrap();
-        assert_eq!(source_word_location(footer_src, 1, footer_ctx, off, 1), None);
+        assert_eq!(
+            source_word_location(footer_src, 1, footer_ctx, off, 1),
+            None
+        );
         assert!(matches!(
             source_word_guess_with_sources(
                 footer_src,
@@ -2424,7 +2604,12 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     // Global crefformat scanner consumes only its fixed 2 mandatory groups, not following braced prose.
     let crefformat_prose_src = "\\crefformat{section}{#2#1#3 zone}\n{\\itshape Printed} word.\n";
     let crefformat_prose_ctx = "Printed word.";
-    let printed_byte = crefformat_prose_src.lines().nth(1).unwrap().find("Printed").unwrap();
+    let printed_byte = crefformat_prose_src
+        .lines()
+        .nth(1)
+        .unwrap()
+        .find("Printed")
+        .unwrap();
     assert_eq!(
         source_word_location(crefformat_prose_src, 2, crefformat_prose_ctx, 0, 1),
         Some((2, printed_byte))
@@ -2446,7 +2631,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             "expected strict abstention for {bad:?}"
         );
     }
-    let ambiguous_frame = "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\n\\end{frame}\n";
+    let ambiguous_frame =
+        "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\n\\end{frame}\n";
     assert_eq!(
         source_word_location(ambiguous_frame, 4, "See section 1 done.", 4, 4),
         None
@@ -2463,8 +2649,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         ),
         Err(())
     );
-    let tied_frame_with_literal =
-        "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\nLiteral token here.\n\\end{frame}\n";
+    let tied_frame_with_literal = "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\nLiteral token here.\n\\end{frame}\n";
     let tied_frame_ctx = "See section 1 done. Literal token here.";
     assert_eq!(
         source_word_guess_with_sources(
@@ -7732,7 +7917,11 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
     // Equal-context macro/literal, macro/macro, conflicting, conditional, counter/param, hidden, and opaque cases stay conservative.
     for (bad_src, bad_extra, expect_err_in_guess) in [
         ("See \\QX{} here.\nSee QX here.\n", &[defs_src][..], true),
-        ("See \\QX{} here.\nSee \\QX{} here.\n", &[defs_src][..], true),
+        (
+            "See \\QX{} here.\nSee \\QX{} here.\n",
+            &[defs_src][..],
+            true,
+        ),
         (
             "\\renewcommand{\\QX}{\\textbf{QX}}\nSee \\QX{} here.\n",
             &[defs_src][..],
@@ -7795,7 +7984,12 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             "\\Fig{}",
         ),
     ] {
-        let body_macro_byte = heading_src.lines().nth(1).unwrap().find(macro_token).unwrap();
+        let body_macro_byte = heading_src
+            .lines()
+            .nth(1)
+            .unwrap()
+            .find(macro_token)
+            .unwrap();
         let body_pdf_off = heading_ctx.rfind("By ").unwrap() + "By ".len();
         assert_eq!(
             source_word_location_with_sources(
@@ -11345,7 +11539,10 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
         "\\end{document}\n",
     );
     for pause_ctx in ["See 71 1 / 1", "See 71then. 1 / 1"] {
-        for pause_off in [pause_ctx.find("1 / 1").unwrap(), pause_ctx.rfind('1').unwrap()] {
+        for pause_off in [
+            pause_ctx.find("1 / 1").unwrap(),
+            pause_ctx.rfind('1').unwrap(),
+        ] {
             assert_eq!(
                 source_word_location_with_sources(
                     pause_footline,

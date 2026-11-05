@@ -2203,8 +2203,8 @@ fn discarded_macro_args_with_macros(
         {
             let mut arg_at =
                 at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-            while let Some(opt_end) =
-                optional_argument_end(source, arg_at).or_else(|| overlay_argument_end(source, arg_at))
+            while let Some(opt_end) = optional_argument_end(source, arg_at)
+                .or_else(|| overlay_argument_end(source, arg_at))
             {
                 arg_at = opt_end;
             }
@@ -2569,7 +2569,9 @@ fn valid_reference_label_start(
     while at < span.end {
         match source.as_bytes()[at] {
             b'%' => {
-                at += source[at..span.end].find('\n').map_or(span.end - at, |p| p + 1);
+                at += source[at..span.end]
+                    .find('\n')
+                    .map_or(span.end - at, |p| p + 1);
             }
             b'\\' | b'{' | b'}' | b'#' => return None,
             _ => {
@@ -2592,9 +2594,16 @@ fn valid_reference_label_start(
 
 fn reference_argument_body_at(source: &str, target: usize) -> Option<std::ops::Range<usize>> {
     if target > source.len()
-        || !["\\ref", "\\eqref", "\\pageref", "\\autoref", "\\cref", "\\Cref"]
-            .iter()
-            .any(|needle| source[..target].contains(needle))
+        || ![
+            "\\ref",
+            "\\eqref",
+            "\\pageref",
+            "\\autoref",
+            "\\cref",
+            "\\Cref",
+        ]
+        .iter()
+        .any(|needle| source[..target].contains(needle))
     {
         return None;
     }
@@ -2681,7 +2690,10 @@ fn source_reference_argument_location(
     }) else {
         return Ok(None);
     };
-    let pdf: Vec<String> = raw_pdf.iter().map(|(_, word)| normalized_word(word)).collect();
+    let pdf: Vec<String> = raw_pdf
+        .iter()
+        .map(|(_, word)| normalized_word(word))
+        .collect();
     if pdf.get(selected).is_none_or(String::is_empty) {
         return Ok(None);
     }
@@ -2708,7 +2720,10 @@ fn source_reference_argument_location(
         lines.clone()
     } else {
         lines.start.min(anchor.saturating_sub(4))
-            ..lines.end.max(anchor.saturating_add(5)).min(line_starts.len())
+            ..lines
+                .end
+                .max(anchor.saturating_add(5))
+                .min(line_starts.len())
     };
     let stream_start = *line_starts.get(stream_lines.start).unwrap_or(&scope_start);
     let stream_end = if stream_lines.end < line_starts.len() {
@@ -2716,13 +2731,27 @@ fn source_reference_argument_location(
     } else {
         source.len()
     };
-    if !["\\ref", "\\eqref", "\\pageref", "\\autoref", "\\cref", "\\Cref"]
-        .iter()
-        .any(|needle| source[stream_start..stream_end].contains(needle))
+    if ![
+        "\\ref",
+        "\\eqref",
+        "\\pageref",
+        "\\autoref",
+        "\\cref",
+        "\\Cref",
+    ]
+    .iter()
+    .any(|needle| source[stream_start..stream_end].contains(needle))
     {
         return Ok(None);
     }
-    if custom_env_prints_word(source, lines, hidden, extra_sources, &pdf[selected], operation) {
+    if custom_env_prints_word(
+        source,
+        lines,
+        hidden,
+        extra_sources,
+        &pdf[selected],
+        operation,
+    ) {
         return Ok(None);
     }
     let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
@@ -2774,8 +2803,8 @@ fn source_reference_argument_location(
                 }
                 let mut arg_at =
                     scan + usize::from(matches!(source.as_bytes().get(scan), Some(b'*' | b'+')));
-                while let Some(opt_end) =
-                    optional_argument_end(source, arg_at).or_else(|| overlay_argument_end(source, arg_at))
+                while let Some(opt_end) = optional_argument_end(source, arg_at)
+                    .or_else(|| overlay_argument_end(source, arg_at))
                 {
                     if opt_end > stream_start {
                         non_transparent_groups.push(arg_at..opt_end);
@@ -2874,7 +2903,9 @@ fn source_reference_argument_location(
         if non_transparent_groups
             .iter()
             .any(|g| g.start <= cmd_start && full_end <= g.end)
-            || opaque.iter().any(|r| r.start < full_end && cmd_start < r.end)
+            || opaque
+                .iter()
+                .any(|r| r.start < full_end && cmd_start < r.end)
         {
             continue;
         }
@@ -2898,9 +2929,10 @@ fn source_reference_argument_location(
         let label_line_idx = line_starts
             .partition_point(|&s| s <= label_start)
             .saturating_sub(1);
-        if hidden.iter().any(|r| {
-            r.contains(&label_start) && !(r.start == span.start && r.end == span.end)
-        }) {
+        if hidden
+            .iter()
+            .any(|r| r.contains(&label_start) && !(r.start == span.start && r.end == span.end))
+        {
             continue;
         }
         let footnote_body = footnote_bodies
@@ -2931,397 +2963,394 @@ fn source_reference_argument_location(
         PageBreak(usize, usize, bool),
     }
 
-    let build_stream =
-        |region: std::ops::Range<usize>, inside_footnote: bool| -> Result<Vec<StreamItem>, ()> {
-            let mut items = Vec::new();
-            let mut bracket_ends = Vec::new();
-            if inside_footnote {
-                items.push(StreamItem::Boundary);
-                items.push(StreamItem::OtherGenerated);
-            }
-            let mut at = region.start;
-            while at < region.end {
-                operation.check().map_err(|_| ())?;
-                if !inside_footnote
-                    && let Some(fn_body) = footnote_bodies
-                        .iter()
-                        .find(|b| b.start.saturating_sub(1) <= at && at <= b.end)
-                {
-                    items.push(StreamItem::OtherGenerated);
-                    at = (fn_body.end + 1).min(region.end);
-                    continue;
-                }
-                if let Some((ref_idx, cand)) = refs
+    let build_stream = |region: std::ops::Range<usize>,
+                        inside_footnote: bool|
+     -> Result<Vec<StreamItem>, ()> {
+        let mut items = Vec::new();
+        let mut bracket_ends = Vec::new();
+        if inside_footnote {
+            items.push(StreamItem::Boundary);
+            items.push(StreamItem::OtherGenerated);
+        }
+        let mut at = region.start;
+        while at < region.end {
+            operation.check().map_err(|_| ())?;
+            if !inside_footnote
+                && let Some(fn_body) = footnote_bodies
                     .iter()
-                    .enumerate()
-                    .find(|(_, r)| r.cmd_start == at && r.footnote_body.is_some() == inside_footnote)
-                {
-                    items.push(StreamItem::Ref(ref_idx));
-                    at = cand.full_end.min(region.end);
-                    continue;
+                    .find(|b| b.start.saturating_sub(1) <= at && at <= b.end)
+            {
+                items.push(StreamItem::OtherGenerated);
+                at = (fn_body.end + 1).min(region.end);
+                continue;
+            }
+            if let Some((ref_idx, cand)) = refs
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.cmd_start == at && r.footnote_body.is_some() == inside_footnote)
+            {
+                items.push(StreamItem::Ref(ref_idx));
+                at = cand.full_end.min(region.end);
+                continue;
+            }
+            match source.as_bytes()[at] {
+                b'%' => {
+                    at += source[at..region.end]
+                        .find('\n')
+                        .map_or(region.end - at, |p| p + 1);
                 }
-                match source.as_bytes()[at] {
-                    b'%' => {
-                        at += source[at..region.end]
-                            .find('\n')
-                            .map_or(region.end - at, |p| p + 1);
-                    }
-                    b'\n' => {
-                        let next_line_end = source[at + 1..region.end]
-                            .find('\n')
-                            .map_or(region.end, |p| at + 1 + p);
-                        if source[at + 1..next_line_end].trim().is_empty() {
-                            items.push(StreamItem::Boundary);
-                        }
-                        at += 1;
-                    }
-                    b'&' => {
+                b'\n' => {
+                    let next_line_end = source[at + 1..region.end]
+                        .find('\n')
+                        .map_or(region.end, |p| at + 1 + p);
+                    if source[at + 1..next_line_end].trim().is_empty() {
                         items.push(StreamItem::Boundary);
-                        at += 1;
                     }
-                    b'$' => {
-                        items.push(StreamItem::OtherGenerated);
-                        let delim = if source.as_bytes().get(at + 1) == Some(&b'$') {
-                            2
-                        } else {
-                            1
-                        };
-                        at += delim;
-                        while at < region.end {
-                            if source.as_bytes()[at] == b'\\' {
-                                at += 1 + source[at + 1..region.end]
-                                    .chars()
-                                    .next()
-                                    .map_or(0, char::len_utf8);
-                            } else if source.as_bytes()[at] == b'%' {
-                                at += source[at..region.end]
-                                    .find('\n')
-                                    .map_or(region.end - at, |p| p + 1);
-                            } else if source.as_bytes()[at] == b'$' {
-                                at += if delim == 2 && source.as_bytes().get(at + 1) == Some(&b'$') {
-                                    2
-                                } else {
-                                    1
-                                };
-                                break;
+                    at += 1;
+                }
+                b'&' => {
+                    items.push(StreamItem::Boundary);
+                    at += 1;
+                }
+                b'$' => {
+                    items.push(StreamItem::OtherGenerated);
+                    let delim = if source.as_bytes().get(at + 1) == Some(&b'$') {
+                        2
+                    } else {
+                        1
+                    };
+                    at += delim;
+                    while at < region.end {
+                        if source.as_bytes()[at] == b'\\' {
+                            at += 1 + source[at + 1..region.end]
+                                .chars()
+                                .next()
+                                .map_or(0, char::len_utf8);
+                        } else if source.as_bytes()[at] == b'%' {
+                            at += source[at..region.end]
+                                .find('\n')
+                                .map_or(region.end - at, |p| p + 1);
+                        } else if source.as_bytes()[at] == b'$' {
+                            at += if delim == 2 && source.as_bytes().get(at + 1) == Some(&b'$') {
+                                2
                             } else {
-                                at += source[at..region.end]
-                                    .chars()
-                                    .next()
-                                    .map_or(1, char::len_utf8);
-                            }
-                        }
-                    }
-                    b'\\' => {
-                        if source.as_bytes().get(at + 1) == Some(&b'\\') {
-                            items.push(StreamItem::Boundary);
-                            at += 2;
-                            if let Some(opt_end) = optional_argument_end(source, at) {
-                                at = opt_end;
-                            }
-                            continue;
-                        }
-                        if matches!(source.as_bytes().get(at + 1), Some(b'(' | b'[')) {
-                            let close = if source.as_bytes()[at + 1] == b'(' {
-                                "\\)"
-                            } else {
-                                "\\]"
+                                1
                             };
-                            items.push(StreamItem::OtherGenerated);
-                            at = source[at + 2..region.end]
-                                .find(close)
-                                .map_or(region.end, |p| at + 2 + p + 2);
-                            continue;
+                            break;
+                        } else {
+                            at += source[at..region.end]
+                                .chars()
+                                .next()
+                                .map_or(1, char::len_utf8);
                         }
-                        let cmd_pos = at;
-                        let cmd_line = line_starts.partition_point(|&s| s <= cmd_pos).saturating_sub(1);
-                        let (cmd, next) = math::command(source, at);
-                        at = next;
-                        if !cmd
-                            .as_bytes()
-                            .first()
-                            .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
-                        {
-                            continue;
+                    }
+                }
+                b'\\' => {
+                    if source.as_bytes().get(at + 1) == Some(&b'\\') {
+                        items.push(StreamItem::Boundary);
+                        at += 2;
+                        if let Some(opt_end) = optional_argument_end(source, at) {
+                            at = opt_end;
                         }
-                        if let Some((opaque_end, nonprinting)) =
-                            math::opaque_command_end(source, cmd, at)
-                        {
-                            if !nonprinting {
-                                items.push(StreamItem::OtherGenerated);
-                            }
-                            at = opaque_end.min(region.end);
-                            continue;
-                        }
-                        let in_non_transparent = || {
-                            non_transparent_groups
-                                .iter()
-                                .any(|g| g.contains(&cmd_pos))
-                                || opaque.iter().any(|r| r.contains(&cmd_pos))
+                        continue;
+                    }
+                    if matches!(source.as_bytes().get(at + 1), Some(b'(' | b'[')) {
+                        let close = if source.as_bytes()[at + 1] == b'(' {
+                            "\\)"
+                        } else {
+                            "\\]"
                         };
-                        let mut arg_at =
-                            at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                        if macros.contains_key(cmd) {
-                            // An override may print anything, whatever the built-in does.
+                        items.push(StreamItem::OtherGenerated);
+                        at = source[at + 2..region.end]
+                            .find(close)
+                            .map_or(region.end, |p| at + 2 + p + 2);
+                        continue;
+                    }
+                    let cmd_pos = at;
+                    let cmd_line = line_starts
+                        .partition_point(|&s| s <= cmd_pos)
+                        .saturating_sub(1);
+                    let (cmd, next) = math::command(source, at);
+                    at = next;
+                    if !cmd
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == b'@')
+                    {
+                        continue;
+                    }
+                    if let Some((opaque_end, nonprinting)) =
+                        math::opaque_command_end(source, cmd, at)
+                    {
+                        if !nonprinting {
                             items.push(StreamItem::OtherGenerated);
-                            while let Some(opt_end) = optional_argument_end(source, arg_at)
-                                .or_else(|| overlay_argument_end(source, arg_at))
-                            {
-                                arg_at = opt_end;
-                            }
-                            while let Some((_, end)) =
-                                math::group(source, skip_source_space(source, arg_at))
-                            {
-                                arg_at = end;
-                            }
-                            at = arg_at.min(region.end);
-                            continue;
                         }
-                        if cmd == "item" {
-                            while let Some(ov_end) = overlay_argument_end(source, arg_at) {
-                                arg_at = ov_end;
-                            }
-                            items.push(StreamItem::OtherGenerated);
-                            if let Some(opt_end) = optional_argument_end(source, arg_at) {
-                                bracket_ends.push(opt_end - 1);
-                                at = (skip_source_space(source, arg_at) + 1).min(region.end);
-                            } else {
-                                at = arg_at.min(region.end);
-                            }
-                            continue;
-                        }
+                        at = opaque_end.min(region.end);
+                        continue;
+                    }
+                    let in_non_transparent = || {
+                        non_transparent_groups.iter().any(|g| g.contains(&cmd_pos))
+                            || opaque.iter().any(|r| r.contains(&cmd_pos))
+                    };
+                    let mut arg_at =
+                        at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    if macros.contains_key(cmd) {
+                        // An override may print anything, whatever the built-in does.
+                        items.push(StreamItem::OtherGenerated);
                         while let Some(opt_end) = optional_argument_end(source, arg_at)
                             .or_else(|| overlay_argument_end(source, arg_at))
                         {
                             arg_at = opt_end;
                         }
-                        if matches!(cmd, "begin" | "end") {
-                            if let Some((body, mut group_end)) =
-                                math::group(source, skip_source_space(source, arg_at))
-                            {
-                                let env = source[body].trim();
-                                if matches!(env, "document" | "frame") && !in_non_transparent() {
-                                    items.push(StreamItem::PageBreak(cmd_line, cmd_pos, true));
-                                } else if cmd == "begin"
-                                    && !matches!(
-                                        env,
-                                        "frame"
-                                            | "center"
-                                            | "flushleft"
-                                            | "flushright"
-                                            | "minipage"
-                                            | "tabular"
-                                            | "tabular*"
-                                            | "tabularx"
-                                            | "array"
-                                            | "figure"
-                                            | "figure*"
-                                            | "table"
-                                            | "table*"
-                                            | "itemize"
-                                            | "enumerate"
-                                            | "description"
-                                    )
-                                {
-                                    items.push(StreamItem::OtherGenerated);
-                                    while let Some(ov_end) = overlay_argument_end(source, group_end)
-                                    {
-                                        group_end = ov_end;
-                                    }
-                                    if let Some(opt_end) = optional_argument_end(source, group_end)
-                                    {
-                                        bracket_ends.push(opt_end - 1);
-                                        at = (skip_source_space(source, group_end) + 1)
-                                            .min(region.end);
-                                        continue;
-                                    }
-                                } else {
-                                    items.push(StreamItem::Boundary);
-                                }
-                                while let Some(opt_end) = optional_argument_end(source, group_end)
-                                    .or_else(|| overlay_argument_end(source, group_end))
-                                {
-                                    group_end = opt_end;
-                                }
-                                if cmd == "begin"
-                                    && matches!(
-                                        env,
-                                        "tabular" | "tabular*" | "tabularx" | "array" | "minipage"
-                                    )
-                                {
-                                    while let Some((_, end)) =
-                                        math::group(source, skip_source_space(source, group_end))
-                                    {
-                                        group_end = end;
-                                    }
-                                }
-                                at = group_end.min(region.end);
-                                continue;
-                            }
-                            items.push(StreamItem::Boundary);
-                            at = arg_at.min(region.end);
-                            continue;
-                        }
-                        if matches!(
-                            cmd,
-                            "clearpage" | "cleardoublepage" | "newpage" | "pagebreak"
-                        ) {
-                            if !in_non_transparent() {
-                                items.push(StreamItem::PageBreak(
-                                    cmd_line,
-                                    cmd_pos,
-                                    matches!(cmd, "clearpage" | "cleardoublepage"),
-                                ));
-                            }
-                            at = arg_at.min(region.end);
-                            continue;
-                        }
-                        if cmd == "par" {
-                            items.push(StreamItem::Boundary);
-                            at = arg_at.min(region.end);
-                            continue;
-                        }
-                        if matches!(
-                            cmd,
-                            "caption"
-                                | "section"
-                                | "subsection"
-                                | "subsubsection"
-                                | "paragraph"
-                                | "subparagraph"
-                                | "part"
-                                | "chapter"
-                                | "frametitle"
-                                | "framesubtitle"
-                                | "maketitle"
-                                | "titlepage"
-                        ) {
-                            items.push(StreamItem::OtherGenerated);
-                        }
-                        if !inside_footnote
-                            && cmd == "footnote"
-                            && let Some((body, end)) =
-                                math::group(source, skip_source_space(source, arg_at))
-                            && footnote_bodies.contains(&body)
-                        {
-                            items.push(StreamItem::OtherGenerated);
-                            at = end.min(region.end);
-                            continue;
-                        }
-                        if let Some((_, span)) = all_spans.iter().find(|(s, _)| *s == cmd_pos) {
-                            if is_direct_reference_command(cmd)
-                                || matches!(
-                                    cmd,
-                                    "cite"
-                                        | "citep"
-                                        | "citet"
-                                        | "parencite"
-                                        | "textcite"
-                                        | "autocite"
-                                        | "footcite"
-                                        | "input"
-                                        | "include"
-                                        | "includegraphics"
-                                        | "includesvg"
-                                        | "verb"
-                                        | "lstinline"
-                                )
-                            {
-                                items.push(StreamItem::OtherGenerated);
-                            }
-                            let span_after = if source.as_bytes().get(span.end) == Some(&b'}') {
-                                span.end + 1
-                            } else {
-                                span.end
-                            };
-                            at = span_after.max(arg_at).min(region.end);
-                            continue;
-                        }
-                        if matches!(cmd, "vspace" | "hspace" | "index" | "hypertarget") {
-                            if let Some((_, end)) =
-                                math::group(source, skip_source_space(source, arg_at))
-                            {
-                                arg_at = end;
-                            }
-                            at = arg_at.min(region.end);
-                            continue;
-                        }
-                        if transparent_reference_wrapper(cmd)
-                            || known_formatting_switch(cmd)
-                            || matches!(
-                                cmd,
-                                "label"
-                                    | "smallskip"
-                                    | "medskip"
-                                    | "bigskip"
-                                    | "noindent"
-                                    | "centering"
-                                    | "raggedright"
-                                    | "raggedleft"
-                                    | "pause"
-                                    | "begingroup"
-                                    | "endgroup"
-                                    | "bgroup"
-                                    | "egroup"
-                                    | "allowbreak"
-                                    | "linebreak"
-                                    | "vfill"
-                                    | "hfill"
-                                    | "quad"
-                                    | "qquad"
-                                    | "thinspace"
-                                    | "enspace"
-                                    | "slash"
-                                    | "href"
-                            )
-                        {
-                            at = arg_at;
-                            continue;
-                        }
-                        items.push(StreamItem::OtherGenerated);
                         while let Some((_, end)) =
                             math::group(source, skip_source_space(source, arg_at))
                         {
                             arg_at = end;
                         }
                         at = arg_at.min(region.end);
+                        continue;
                     }
-                    b']' if bracket_ends.contains(&at) => {
+                    if cmd == "item" {
+                        while let Some(ov_end) = overlay_argument_end(source, arg_at) {
+                            arg_at = ov_end;
+                        }
                         items.push(StreamItem::OtherGenerated);
-                        at += 1;
+                        if let Some(opt_end) = optional_argument_end(source, arg_at) {
+                            bracket_ends.push(opt_end - 1);
+                            at = (skip_source_space(source, arg_at) + 1).min(region.end);
+                        } else {
+                            at = arg_at.min(region.end);
+                        }
+                        continue;
                     }
-                    b'{' | b'}' => {
-                        at += 1;
+                    while let Some(opt_end) = optional_argument_end(source, arg_at)
+                        .or_else(|| overlay_argument_end(source, arg_at))
+                    {
+                        arg_at = opt_end;
                     }
-                    _ => {
-                        if let Some((_, span)) = all_spans
-                            .iter()
-                            .find(|(_, s)| s.start <= at && at < s.end)
+                    if matches!(cmd, "begin" | "end") {
+                        if let Some((body, mut group_end)) =
+                            math::group(source, skip_source_space(source, arg_at))
                         {
-                            at = span.end.min(region.end);
-                            continue;
-                        }
-                        let line_end = source[at..region.end]
-                            .find(['\n', '%', '\\', '$', '&', '{', '}', ']'])
-                            .map_or(region.end, |p| at + p);
-                        if line_end <= at {
-                            at += source[at..region.end]
-                                .chars()
-                                .next()
-                                .map_or(1, char::len_utf8);
-                            continue;
-                        }
-                        for (_, _, word) in source_words(&source[at..line_end]) {
-                            if !word.is_empty() {
-                                items.push(StreamItem::Word(word));
+                            let env = source[body].trim();
+                            if matches!(env, "document" | "frame") && !in_non_transparent() {
+                                items.push(StreamItem::PageBreak(cmd_line, cmd_pos, true));
+                            } else if cmd == "begin"
+                                && !matches!(
+                                    env,
+                                    "frame"
+                                        | "center"
+                                        | "flushleft"
+                                        | "flushright"
+                                        | "minipage"
+                                        | "tabular"
+                                        | "tabular*"
+                                        | "tabularx"
+                                        | "array"
+                                        | "figure"
+                                        | "figure*"
+                                        | "table"
+                                        | "table*"
+                                        | "itemize"
+                                        | "enumerate"
+                                        | "description"
+                                )
+                            {
+                                items.push(StreamItem::OtherGenerated);
+                                while let Some(ov_end) = overlay_argument_end(source, group_end) {
+                                    group_end = ov_end;
+                                }
+                                if let Some(opt_end) = optional_argument_end(source, group_end) {
+                                    bracket_ends.push(opt_end - 1);
+                                    at = (skip_source_space(source, group_end) + 1).min(region.end);
+                                    continue;
+                                }
+                            } else {
+                                items.push(StreamItem::Boundary);
                             }
+                            while let Some(opt_end) = optional_argument_end(source, group_end)
+                                .or_else(|| overlay_argument_end(source, group_end))
+                            {
+                                group_end = opt_end;
+                            }
+                            if cmd == "begin"
+                                && matches!(
+                                    env,
+                                    "tabular" | "tabular*" | "tabularx" | "array" | "minipage"
+                                )
+                            {
+                                while let Some((_, end)) =
+                                    math::group(source, skip_source_space(source, group_end))
+                                {
+                                    group_end = end;
+                                }
+                            }
+                            at = group_end.min(region.end);
+                            continue;
                         }
-                        at = line_end;
+                        items.push(StreamItem::Boundary);
+                        at = arg_at.min(region.end);
+                        continue;
                     }
+                    if matches!(
+                        cmd,
+                        "clearpage" | "cleardoublepage" | "newpage" | "pagebreak"
+                    ) {
+                        if !in_non_transparent() {
+                            items.push(StreamItem::PageBreak(
+                                cmd_line,
+                                cmd_pos,
+                                matches!(cmd, "clearpage" | "cleardoublepage"),
+                            ));
+                        }
+                        at = arg_at.min(region.end);
+                        continue;
+                    }
+                    if cmd == "par" {
+                        items.push(StreamItem::Boundary);
+                        at = arg_at.min(region.end);
+                        continue;
+                    }
+                    if matches!(
+                        cmd,
+                        "caption"
+                            | "section"
+                            | "subsection"
+                            | "subsubsection"
+                            | "paragraph"
+                            | "subparagraph"
+                            | "part"
+                            | "chapter"
+                            | "frametitle"
+                            | "framesubtitle"
+                            | "maketitle"
+                            | "titlepage"
+                    ) {
+                        items.push(StreamItem::OtherGenerated);
+                    }
+                    if !inside_footnote
+                        && cmd == "footnote"
+                        && let Some((body, end)) =
+                            math::group(source, skip_source_space(source, arg_at))
+                        && footnote_bodies.contains(&body)
+                    {
+                        items.push(StreamItem::OtherGenerated);
+                        at = end.min(region.end);
+                        continue;
+                    }
+                    if let Some((_, span)) = all_spans.iter().find(|(s, _)| *s == cmd_pos) {
+                        if is_direct_reference_command(cmd)
+                            || matches!(
+                                cmd,
+                                "cite"
+                                    | "citep"
+                                    | "citet"
+                                    | "parencite"
+                                    | "textcite"
+                                    | "autocite"
+                                    | "footcite"
+                                    | "input"
+                                    | "include"
+                                    | "includegraphics"
+                                    | "includesvg"
+                                    | "verb"
+                                    | "lstinline"
+                            )
+                        {
+                            items.push(StreamItem::OtherGenerated);
+                        }
+                        let span_after = if source.as_bytes().get(span.end) == Some(&b'}') {
+                            span.end + 1
+                        } else {
+                            span.end
+                        };
+                        at = span_after.max(arg_at).min(region.end);
+                        continue;
+                    }
+                    if matches!(cmd, "vspace" | "hspace" | "index" | "hypertarget") {
+                        if let Some((_, end)) =
+                            math::group(source, skip_source_space(source, arg_at))
+                        {
+                            arg_at = end;
+                        }
+                        at = arg_at.min(region.end);
+                        continue;
+                    }
+                    if transparent_reference_wrapper(cmd)
+                        || known_formatting_switch(cmd)
+                        || matches!(
+                            cmd,
+                            "label"
+                                | "smallskip"
+                                | "medskip"
+                                | "bigskip"
+                                | "noindent"
+                                | "centering"
+                                | "raggedright"
+                                | "raggedleft"
+                                | "pause"
+                                | "begingroup"
+                                | "endgroup"
+                                | "bgroup"
+                                | "egroup"
+                                | "allowbreak"
+                                | "linebreak"
+                                | "vfill"
+                                | "hfill"
+                                | "quad"
+                                | "qquad"
+                                | "thinspace"
+                                | "enspace"
+                                | "slash"
+                                | "href"
+                        )
+                    {
+                        at = arg_at;
+                        continue;
+                    }
+                    items.push(StreamItem::OtherGenerated);
+                    while let Some((_, end)) =
+                        math::group(source, skip_source_space(source, arg_at))
+                    {
+                        arg_at = end;
+                    }
+                    at = arg_at.min(region.end);
+                }
+                b']' if bracket_ends.contains(&at) => {
+                    items.push(StreamItem::OtherGenerated);
+                    at += 1;
+                }
+                b'{' | b'}' => {
+                    at += 1;
+                }
+                _ => {
+                    if let Some((_, span)) =
+                        all_spans.iter().find(|(_, s)| s.start <= at && at < s.end)
+                    {
+                        at = span.end.min(region.end);
+                        continue;
+                    }
+                    let line_end = source[at..region.end]
+                        .find(['\n', '%', '\\', '$', '&', '{', '}', ']'])
+                        .map_or(region.end, |p| at + p);
+                    if line_end <= at {
+                        at += source[at..region.end]
+                            .chars()
+                            .next()
+                            .map_or(1, char::len_utf8);
+                        continue;
+                    }
+                    for (_, _, word) in source_words(&source[at..line_end]) {
+                        if !word.is_empty() {
+                            items.push(StreamItem::Word(word));
+                        }
+                    }
+                    at = line_end;
                 }
             }
-            Ok(items)
-        };
+        }
+        Ok(items)
+    };
 
     let main_stream = build_stream(span_start..stream_end, false)?;
     let mut footnote_streams: Vec<(std::ops::Range<usize>, Vec<StreamItem>)> = Vec::new();
@@ -3331,8 +3360,8 @@ fn source_reference_argument_location(
         }
     }
     let selected_word = &pdf[selected];
-    let mut best: Option<((bool, isize, bool, std::cmp::Reverse<u32>), (u32, usize, isize, bool))> =
-        None;
+    type Rank = (bool, isize, bool, std::cmp::Reverse<u32>);
+    let mut best: Option<(Rank, (u32, usize, isize, bool))> = None;
     let mut tied = false;
 
     fn flanks_around(
@@ -3430,11 +3459,15 @@ fn source_reference_argument_location(
             .map_or(cand.cmd_start, |b| b.start);
         let main_page_start = main_stream
             .iter()
-            .rposition(|item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos < cand_pos))
+            .rposition(
+                |item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos < cand_pos),
+            )
             .unwrap_or(0);
         let main_page_end = main_stream
             .iter()
-            .position(|item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos > cand_pos))
+            .position(
+                |item| matches!(item, StreamItem::PageBreak(_, pb_pos, true) if *pb_pos > cand_pos),
+            )
             .map_or(main_stream.len(), |idx| idx + 1);
         let main_page_stream = &main_stream[main_page_start..main_page_end];
         let pb_before = match main_page_stream.first() {
@@ -3472,18 +3505,14 @@ fn source_reference_argument_location(
         if left_adjacent_generated || right_adjacent_generated {
             continue;
         }
-        let same_line_pagebreak = stream
-            .iter()
-            .chain(main_page_stream.iter())
-            .any(|item| {
-                matches!(
-                    item,
-                    StreamItem::PageBreak(pb_line, _, _)
-                        if (cand.start_line..=cand.end_line).contains(pb_line) || *pb_line == anchor
-                )
-            });
-        let footnote_starts_at_left =
-            cand.footnote_body.is_some() && pos == 2 + left_words.len();
+        let same_line_pagebreak = stream.iter().chain(main_page_stream.iter()).any(|item| {
+            matches!(
+                item,
+                StreamItem::PageBreak(pb_line, _, _)
+                    if (cand.start_line..=cand.end_line).contains(pb_line) || *pb_line == anchor
+            )
+        });
+        let footnote_starts_at_left = cand.footnote_body.is_some() && pos == 2 + left_words.len();
 
         let mut pdf_spans = Vec::new();
         for g_start in 0..pdf.len() {
@@ -3583,15 +3612,8 @@ fn source_reference_argument_location(
             }
         }
         let mut best_for_ref: Option<(bool, isize)> = None;
-        for &(
-            g_start,
-            g_end,
-            both_sides,
-            score,
-            vis_left_len,
-            vis_right_len,
-            footnote_head_word,
-        ) in &pdf_spans
+        for &(g_start, g_end, both_sides, score, vis_left_len, vis_right_len, footnote_head_word) in
+            &pdf_spans
         {
             if !(g_start..=g_end).contains(&selected) {
                 continue;
@@ -3611,7 +3633,8 @@ fn source_reference_argument_location(
                 let is_cand_stream = s_body == cand.footnote_body.as_ref();
                 if vis_left_len > 0 && vis_right_len > 0 {
                     for s_start in 0..s.len() {
-                        if !matches!(&s[s_start], StreamItem::Word(rw) if right_words.first().copied() == Some(rw)) {
+                        if !matches!(&s[s_start], StreamItem::Word(rw) if right_words.first().copied() == Some(rw))
+                        {
                             continue;
                         }
                         let (s_left, s_left_adj, _, s_right, s_right_adj, _) =
@@ -3767,8 +3790,7 @@ fn source_reference_argument_location(
                 tied = false;
             }
             Some((best_rank, best_target))
-                if rank == best_rank
-                    && (best_target.0, best_target.1) != (target.0, target.1) =>
+                if rank == best_rank && (best_target.0, best_target.1) != (target.0, target.1) =>
             {
                 tied = true;
             }
@@ -5395,10 +5417,7 @@ fn source_prose_scored_location_with_mode(
                     {
                         let mut arg_at = line_start
                             + end
-                            + usize::from(matches!(
-                                text.as_bytes().get(end),
-                                Some(b'*' | b'+')
-                            ));
+                            + usize::from(matches!(text.as_bytes().get(end), Some(b'*' | b'+')));
                         while let Some(opt_end) = optional_argument_end(source, arg_at)
                             .or_else(|| overlay_argument_end(source, arg_at))
                         {
@@ -5526,15 +5545,16 @@ fn source_prose_scored_location_with_mode(
             passes.push(candidates);
         }
     }
-    let mut best: Option<((isize, bool, isize), u32, u32, usize, bool, bool)> = None;
+    type BaseRank = (isize, bool, isize);
+    let mut best: Option<(BaseRank, u32, u32, usize, bool, bool)> = None;
     let mut tied = false;
     // Equal-evidence macro ambiguity is not resolved by literal proximity.
     let mut macro_tied = false;
     // Math context can only separate occurrences that are all inside formulas.
     let mut outside_math_at_rank = false;
     let mut literal_tie_outside_math = false;
-    let mut unsupported_macro: Option<(isize, bool, isize)> = None;
-    let mut unsupported_macro_outside_math: Option<(isize, bool, isize)> = None;
+    let mut unsupported_macro: Option<BaseRank> = None;
+    let mut unsupported_macro_outside_math: Option<BaseRank> = None;
     for candidates in &passes {
         for (index, (row, byte, word, from_macro, in_math)) in candidates.iter().enumerate() {
             if *word != pdf[selected] {
