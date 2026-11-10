@@ -19,14 +19,25 @@ synctex-parser = "0.1"
 
 ```rust,no_run
 use std::path::Path;
-use synctex_parser::{InversePoint, Operation, SyncTeXCache, resolve_forward, resolve_inverse_with_cache};
+use synctex_parser::{
+    ForwardSource, InversePoint, Operation, SyncTeXCache, resolve_forward_with_selector,
+    resolve_inverse_with_cache,
+};
 
 fn main() -> std::io::Result<()> {
     let pdf = Path::new("/abs/path/paper.pdf");
     let tex = Path::new("/abs/path/paper.tex");
 
     // Forward search: 1-based line and 1-based Unicode scalar column -> PDF box
-    let forward = resolve_forward(pdf, tex, 42, 10)?;
+    // The selector may refine the compiler anchor using PDF text; this one keeps it.
+    let forward = resolve_forward_with_selector(
+        pdf,
+        tex,
+        42,
+        10,
+        ForwardSource::default(),
+        |_, _, _, anchor| Ok(anchor),
+    )?;
     println!("page {} @ ({}, {})", forward.page, forward.h, forward.v);
 
     // Inverse search: PDF click -> 1-based line and UTF-8 / UTF-16 / char columns

@@ -2,20 +2,13 @@
 
 mod math;
 mod parser;
-mod source_snapshot;
 mod symbols;
 #[cfg(test)]
 mod tests;
 mod tex;
 
-use crate::source_snapshot::{valid_absolute_path, valid_warning};
 use parser::*;
-pub use parser::{
-    forward_candidates, forward_candidates_from_reader, inverse_candidates,
-    inverse_candidates_from_reader,
-};
 use serde::{Deserialize, Serialize};
-pub use source_snapshot::MAX_WARNING_BYTES;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -25,7 +18,10 @@ use std::time::{Duration, Instant};
 use std::{
     fs,
     io::{self, BufRead, BufReader, Read},
-    os::unix::fs::MetadataExt,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
 };
 use tex::*;
@@ -39,6 +35,8 @@ pub struct SearchRect {
     pub top: f32,
     pub right: f32,
 }
+
+pub const MAX_WARNING_BYTES: usize = 4096;
 
 pub const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -152,51 +150,38 @@ pub fn set_build_directory(path: Option<PathBuf>) {
     *BUILD_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = path;
 }
 
-/// Process-wide default build directory; resolved once at operation entry.
-pub fn build_directory() -> Option<PathBuf> {
-    BUILD_DIRECTORY
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .or_else(|| {
-            std::env::var_os("SYNCTEX_BUILD_DIRECTORY")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-}
-
+/// An explicit build directory, else the process-wide default, else `SYNCTEX_BUILD_DIRECTORY`;
+/// resolved once at operation entry.
 pub(crate) fn resolve_build_directory(build_directory: Option<&Path>) -> Option<PathBuf> {
-    build_directory
-        .map(Path::to_path_buf)
-        .or_else(crate::build_directory)
+    build_directory.map(Path::to_path_buf).or_else(|| {
+        BUILD_DIRECTORY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .or_else(|| {
+                std::env::var_os("SYNCTEX_BUILD_DIRECTORY")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+    })
 }
 
-pub(crate) fn synctex_candidates(
-    pdf: &Path,
-    build_directory: Option<&Path>,
-) -> Vec<(PathBuf, bool)> {
+pub(crate) fn synctex_candidates(pdf: &Path, build_directory: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push_pair = |base: &Path| {
-        for (extension, compressed) in [("synctex.gz", true), ("synctex", false)] {
-            let candidate = base.with_extension(extension);
-            if !candidates
-                .iter()
-                .any(|(existing, _)| existing == &candidate)
-            {
-                candidates.push((candidate, compressed));
+        let mut push = |candidate: PathBuf| {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
+        };
+        for extension in ["synctex.gz", "synctex"] {
+            push(base.with_extension(extension));
         }
         if base.extension().is_some() {
-            for (suffix, compressed) in [(".synctex.gz", true), (".synctex", false)] {
+            for suffix in [".synctex.gz", ".synctex"] {
                 let mut os = base.as_os_str().to_os_string();
                 os.push(suffix);
-                let candidate = PathBuf::from(os);
-                if !candidates
-                    .iter()
-                    .any(|(existing, _)| existing == &candidate)
-                {
-                    candidates.push((candidate, compressed));
-                }
+                push(PathBuf::from(os));
             }
         }
     };
@@ -214,20 +199,6 @@ pub(crate) fn synctex_candidates(
     candidates
 }
 
-pub(crate) fn locate_synctex_resolved(
-    pdf: &Path,
-    build_directory: Option<&Path>,
-) -> Option<PathBuf> {
-    synctex_candidates(pdf, build_directory)
-        .into_iter()
-        .find_map(|(candidate, _)| PdfRevision::read(&candidate).ok().map(|_| candidate))
-}
-
-pub fn locate_synctex(pdf: &Path) -> Option<PathBuf> {
-    let build_directory = resolve_build_directory(None);
-    locate_synctex_resolved(pdf, build_directory.as_deref())
-}
-
 /// Metadata identity of both files observed when PDFium opens a document.
 /// Stability does not prove a common build; producers must publish a completed
 /// PDF/SyncTeX pair before requesting navigation.
@@ -235,15 +206,15 @@ pub fn locate_synctex(pdf: &Path) -> Option<PathBuf> {
 #[serde(deny_unknown_fields)]
 pub struct DocumentRevision {
     pub pdf: PdfRevision,
-    companion: Option<(bool, PdfRevision)>,
+    companion: Option<PdfRevision>,
 }
 pub(crate) fn companion_revision_and_path_in(
     path: &Path,
     build_directory: Option<&Path>,
-) -> io::Result<Option<((bool, PdfRevision), PathBuf)>> {
-    for (candidate, compressed) in synctex_candidates(path, build_directory) {
+) -> io::Result<Option<(PdfRevision, PathBuf)>> {
+    for candidate in synctex_candidates(path, build_directory) {
         match PdfRevision::read(&candidate) {
-            Ok(revision) => return Ok(Some(((compressed, revision), candidate))),
+            Ok(revision) => return Ok(Some((revision, candidate))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -254,7 +225,7 @@ pub(crate) fn companion_revision_and_path_in(
 pub(crate) fn companion_revision_in(
     path: &Path,
     build_directory: Option<&Path>,
-) -> io::Result<Option<(bool, PdfRevision)>> {
+) -> io::Result<Option<PdfRevision>> {
     Ok(companion_revision_and_path_in(path, build_directory)?.map(|(companion, _)| companion))
 }
 
@@ -474,7 +445,7 @@ pub struct ForwardSource<'a> {
 /// No usable compiler geometry exists for this otherwise valid request.
 /// Explicit editor best-guess commands distinguish this from operational errors.
 #[derive(Debug)]
-pub struct ForwardUnavailable(&'static str);
+pub(crate) struct ForwardUnavailable(&'static str);
 
 impl std::fmt::Display for ForwardUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -488,22 +459,6 @@ pub fn is_forward_unavailable(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|error| error.is::<ForwardUnavailable>())
-}
-
-pub fn resolve_forward(
-    pdf: &Path,
-    file: &Path,
-    line: u32,
-    column: u32,
-) -> io::Result<ForwardRequest> {
-    resolve_forward_with_selector(
-        pdf,
-        file,
-        line,
-        column,
-        ForwardSource::default(),
-        |_, _, _, anchor| Ok(anchor),
-    )
 }
 
 pub fn resolve_forward_with_selector(
@@ -526,7 +481,7 @@ pub fn resolve_forward_with_selector(
     let resolved_build_directory = resolve_build_directory(context.build_directory);
     let build_directory = resolved_build_directory.as_deref();
     let allow_anchor = context.best_guess || context.anchor_only;
-    drop(crate::source_snapshot::open_regular(&pdf)?);
+    drop(open_regular(&pdf)?);
     let document_revision = DocumentRevision::read_resolved(&pdf, build_directory)?;
     if document_revision.companion.is_none() {
         return Err(if allow_anchor {
@@ -544,7 +499,7 @@ pub fn resolve_forward_with_selector(
     let file = if context.anchor_only {
         match fs::canonicalize(file) {
             Ok(file) => file,
-            Err(_) => crate::source_snapshot::normalize_absolute(file, &std::env::current_dir()?)?,
+            Err(_) => normalize_absolute(file, &std::env::current_dir()?)?,
         }
     } else {
         fs::canonicalize(file)?
@@ -585,7 +540,7 @@ pub fn resolve_forward_with_selector(
         None => None,
     };
     if let Some(source_revision) = source_revision
-        && document_revision.companion.is_some_and(|(_, companion)| {
+        && document_revision.companion.is_some_and(|companion| {
             (
                 source_revision.modified_seconds,
                 source_revision.modified_nanoseconds,
@@ -730,20 +685,40 @@ pub fn resolve_inverse(
     resolve_inverse_with_cache(pdf, point, word, radius, operation, best_guess, None)
 }
 
-type StructuralMapKey = (u32, PathBuf, Option<PathBuf>);
+/// `(page, generated, working directory, strict input resolution)`: both
+/// resolution modes consult the working directory for relative inputs.
+type StructuralMapKey = (u32, PathBuf, Option<PathBuf>, bool);
+
+fn structural_map_key(
+    page: u32,
+    generated: &Path,
+    current_dir: Option<&Path>,
+    best_guess: bool,
+) -> StructuralMapKey {
+    (
+        page,
+        generated.to_owned(),
+        current_dir.map(Path::to_owned),
+        best_guess,
+    )
+}
 
 #[derive(Default)]
 pub struct SyncTeXCache {
     entry: Option<CachedSyncTeX>,
 }
 
+type StructuralMaps = std::collections::HashMap<StructuralMapKey, Result<Rc<SourceMap>, String>>;
+
 struct CachedSyncTeX {
     pdf: PathBuf,
-    companion: (bool, PdfRevision),
+    companion: PdfRevision,
     sidecar_dir: Option<PathBuf>,
+    /// The decoded sidecar, so a newly clicked page parses without decompressing again.
     raw: Vec<u8>,
+    /// Single-sheet parses, each carrying the source provenance of its sheet.
     pages: std::collections::HashMap<u32, parser::ParsedSynctex>,
-    structural_maps: std::collections::HashMap<StructuralMapKey, Result<Rc<SourceMap>, String>>,
+    structural_maps: StructuralMaps,
 }
 
 impl SyncTeXCache {
@@ -753,11 +728,7 @@ impl SyncTeXCache {
         point: InversePoint,
         operation: &Operation,
         build_directory: Option<&Path>,
-    ) -> io::Result<(
-        Vec<RawInverseCandidate>,
-        (bool, PdfRevision),
-        &mut CachedSyncTeX,
-    )> {
+    ) -> io::Result<(Vec<RawInverseCandidate>, PdfRevision, &mut CachedSyncTeX)> {
         operation.check()?;
         parser::validate_inverse_point(point)?;
         let Some((companion, sidecar_path)) = companion_revision_and_path_in(pdf, build_directory)?
@@ -768,18 +739,19 @@ impl SyncTeXCache {
                     io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
                 }));
         };
-        let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
+        let sidecar_dir = canonical_sidecar_dir(&sidecar_path);
         if self
             .entry
             .as_ref()
             .is_none_or(|entry| entry.pdf != pdf || entry.companion != companion)
         {
-            let (mut reader, opened_path) = open_synctex_with_path_in(pdf, build_directory)?;
+            let mut reader = decode_synctex_file(
+                open_regular(&sidecar_path)?,
+                parser::MAX_SYNCTEX_BYTES as u64 + 1,
+            )?;
             let raw = parser::read_remaining_rows(&mut reader, 0, Some(operation))?;
             operation.check()?;
-            if companion_revision_and_path_in(pdf, build_directory)?
-                != Some((companion, opened_path))
-            {
+            if PdfRevision::read(&sidecar_path)? != companion {
                 return Err(io::Error::other(
                     "displayed PDF/SyncTeX revision changed; wait for reload and click again",
                 ));
@@ -865,46 +837,52 @@ fn resolve_inverse_resolved(
         ..
     } = req;
     operation.check()?;
-    if !parser::inverse_point_valid(point) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "inverse search requires a positive page and finite compiler coordinates",
-        ));
-    }
+    parser::validate_inverse_point(point)?;
     let pdf = std::path::absolute(pdf)?;
     let raw_revision = if best_guess {
-        drop(crate::source_snapshot::open_regular(&pdf)?);
+        drop(open_regular(&pdf)?);
         Some(DocumentRevision::read_resolved(&pdf, build_directory)?)
     } else {
         None
     };
     operation.check()?;
-    let (targets, cached_companion, cache_entry, uncached_sidecar_dir) =
-        if let Some(cache) = cache.as_deref_mut() {
-            let (targets, companion, entry) =
-                cache.candidates_and_entry(&pdf, point, operation, build_directory)?;
-            (targets, Some(companion), Some(entry), None)
-        } else {
-            let (reader, sidecar_path) = open_synctex_with_path_in(&pdf, build_directory)?;
-            let parsed = parser::parse_synctex_document_with_options(
-                reader,
-                true,
-                Some(point.page),
-                Some(operation),
-            )?;
-            operation.check()?;
-            let targets = parser::inverse_candidates_in_doc(&parsed, point)?;
-            let sidecar_dir = (!targets.is_empty())
-                .then(|| crate::source_snapshot::canonical_sidecar_dir(&sidecar_path))
-                .flatten();
-            (targets, None, None, sidecar_dir)
-        };
+    let (targets, cached_companion, sidecar_dir, sheet) = if let Some(cache) = cache.as_deref_mut()
+    {
+        let (targets, companion, entry) =
+            cache.candidates_and_entry(&pdf, point, operation, build_directory)?;
+        let sidecar_dir = entry.sidecar_dir.clone();
+        (
+            targets,
+            Some(companion),
+            sidecar_dir,
+            SheetSource::Cached(entry),
+        )
+    } else {
+        let (reader, sidecar_path) = open_synctex_with_path_in(&pdf, build_directory)?;
+        let parsed = parser::parse_synctex_document_with_options(
+            reader,
+            true,
+            Some(point.page),
+            Some(operation),
+        )?;
+        operation.check()?;
+        let targets = parser::inverse_candidates_in_doc(&parsed, point)?;
+        let sidecar_dir = (!targets.is_empty())
+            .then(|| canonical_sidecar_dir(&sidecar_path))
+            .flatten();
+        (
+            targets,
+            None,
+            sidecar_dir,
+            SheetSource::Parsed(Box::new(parsed)),
+        )
+    };
     let sources = QuerySources {
         best_guess,
-        sidecar_dir: uncached_sidecar_dir,
+        sidecar_dir,
         ..QuerySources::default()
     };
-    let result = InverseQuery::new(InverseRequest { pdf: &pdf, ..req }, sources, cache_entry)
+    let result = InverseQuery::new(InverseRequest { pdf: &pdf, ..req }, sources, sheet)
         .resolve_targets(targets)?;
     if let Some(revision) = raw_revision {
         revision.check_resolved(&pdf, build_directory)?;
@@ -938,13 +916,7 @@ struct QuerySources<'a> {
 impl QuerySources<'_> {
     fn normalize(&self, path: &Path) -> io::Result<PathBuf> {
         fs::canonicalize(path).or_else(|err| {
-            crate::source_snapshot::resolve_relative_input(
-                path,
-                None,
-                self.pdf_dir,
-                self.sidecar_dir.as_deref(),
-            )
-            .ok_or(err)
+            resolve_relative_input(path, None, self.pdf_dir, self.sidecar_dir.as_deref()).ok_or(err)
         })
     }
 
@@ -973,7 +945,7 @@ type MetadataLocation = (
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InverseFailure {
+pub(crate) enum InverseFailure {
     NoMatch,
     Ambiguous(&'static str),
     InvalidSourceAnchor {
@@ -1005,10 +977,6 @@ impl std::fmt::Display for InverseFailure {
 
 impl std::error::Error for InverseFailure {}
 
-pub fn inverse_failure(error: &io::Error) -> Option<&InverseFailure> {
-    error.get_ref()?.downcast_ref::<InverseFailure>()
-}
-
 struct InverseAnchor {
     target: SourceLocation,
     compiler_column: Option<usize>,
@@ -1019,11 +987,11 @@ struct InverseAnchor {
 }
 
 fn is_generated_sidecar(path: &Path, pdf: &Path) -> bool {
-    path.file_stem() == pdf.file_stem() && crate::source_snapshot::is_compiler_sidecar_input(path)
+    path.file_stem() == pdf.file_stem() && is_compiler_sidecar_input(path)
 }
 
 fn is_generated_or_sidecar_input(path: &Path) -> bool {
-    crate::source_snapshot::is_compiler_sidecar_input(path)
+    is_compiler_sidecar_input(path)
         || path
             .to_str()
             .is_some_and(crate::parser::is_generated_graphics_tex)
@@ -1075,6 +1043,14 @@ impl<'q> QueryAnalysisScope<'q> {
     }
 }
 
+/// Where an inverse query reads the clicked sheet's source map from.
+pub(crate) enum SheetSource<'a> {
+    /// The query's own parse of the clicked sheet.
+    Parsed(Box<parser::ParsedSynctex>),
+    /// A cached parse of the clicked sheet; structural maps persist across queries.
+    Cached(&'a mut CachedSyncTeX),
+}
+
 pub(crate) struct InverseQuery<'a> {
     pdf: &'a Path,
     point: InversePoint,
@@ -1082,9 +1058,9 @@ pub(crate) struct InverseQuery<'a> {
     radius: u32,
     operation: &'a Operation,
     sources: QuerySources<'a>,
-    synctex_cache: Option<&'a mut CachedSyncTeX>,
-    build_directory: Option<&'a Path>,
-    structural_map: Option<(PathBuf, Result<Rc<SourceMap>, String>)>,
+    sheet: SheetSource<'a>,
+    /// Structural maps of an uncached sheet; a cached sheet keeps its own.
+    structural_maps: StructuralMaps,
     geometry_map: Option<Result<Rc<SourceMap>, String>>,
     metadata: Option<Option<MetadataLocation>>,
     spliced_preamble: Option<Option<Rc<String>>>,
@@ -1094,7 +1070,7 @@ impl<'a> InverseQuery<'a> {
     pub(crate) fn new(
         req: InverseRequest<'a>,
         mut sources: QuerySources<'a>,
-        synctex_cache: Option<&'a mut CachedSyncTeX>,
+        sheet: SheetSource<'a>,
     ) -> Self {
         sources.pdf_dir = req.pdf.parent();
         Self {
@@ -1104,9 +1080,8 @@ impl<'a> InverseQuery<'a> {
             radius: req.radius,
             operation: req.operation,
             sources,
-            synctex_cache,
-            build_directory: req.build_directory,
-            structural_map: None,
+            sheet,
+            structural_maps: StructuralMaps::new(),
             geometry_map: None,
             metadata: None,
             spliced_preamble: None,
@@ -1122,15 +1097,6 @@ impl<'a> InverseQuery<'a> {
                 io::ErrorKind::NotFound,
                 InverseFailure::NoMatch,
             ));
-        }
-        if self.sources.sidecar_dir.is_none() {
-            self.sources.sidecar_dir = self
-                .synctex_cache
-                .as_deref()
-                .and_then(|c| c.sidecar_dir.clone())
-                .or_else(|| {
-                    crate::source_snapshot::sidecar_dir_for(self.pdf, self.build_directory)
-                });
         }
         let best_guess = self.sources.best_guess;
         let operation = self.operation;
@@ -1222,106 +1188,98 @@ impl<'a> InverseQuery<'a> {
 
     fn load_source_map(
         &self,
-        generated_path: &Path,
+        generated: &Path,
         geometry_required: bool,
         input_cwd: Option<&Path>,
     ) -> Result<Rc<SourceMap>, String> {
-        let loaded = if let Some(cache) = self.synctex_cache.as_deref() {
-            source_map_from_reader_in(
-                std::io::Cursor::new(&cache.raw),
-                self.pdf,
-                self.point,
-                generated_path,
-                geometry_required,
-                self.operation,
-                input_cwd,
-                self.sources.sidecar_dir.as_deref(),
-            )
-        } else {
-            read_source_map_in(
-                self.pdf,
-                self.point,
-                generated_path,
-                geometry_required,
-                self.operation,
-                input_cwd,
-                self.build_directory,
-            )
+        let request = parser::SourceMapRequest {
+            pdf: self.pdf,
+            point: self.point,
+            generated,
+            geometry_required,
+            input_cwd,
+            sidecar_dir: self.sources.sidecar_dir.as_deref(),
+            operation: self.operation,
+        };
+        let loaded = match &self.sheet {
+            SheetSource::Parsed(parsed) => parsed.source_map(request),
+            SheetSource::Cached(cache) => cache.pages.get(&self.point.page).map_or_else(
+                || Err(io::Error::other("SyncTeX cache lost the clicked sheet")),
+                |parsed| parsed.source_map(request),
+            ),
         };
         loaded.map(Rc::new).map_err(|error| error.to_string())
     }
 
+    /// Best-guess navigation fails outright when the clicked sheet's source map cannot load.
+    fn require_source_map_for_best_guess(
+        &self,
+        source_map: &Option<io::Result<Rc<SourceMap>>>,
+    ) -> io::Result<()> {
+        if self.sources.best_guess
+            && let Some(Err(error)) = source_map
+        {
+            self.operation.check()?;
+            return Err(io::Error::other(error.to_string()));
+        }
+        Ok(())
+    }
+
+    fn structural_maps(&mut self) -> &mut StructuralMaps {
+        match &mut self.sheet {
+            SheetSource::Cached(cache) => &mut cache.structural_maps,
+            _ => &mut self.structural_maps,
+        }
+    }
+
     fn source_map(&mut self, generated: Option<&Path>) -> io::Result<Rc<SourceMap>> {
         self.operation.check()?;
-        let current_dir = self
-            .sources
-            .best_guess
-            .then(std::env::current_dir)
-            .transpose()?;
-        let input_cwd = current_dir.as_deref();
+        let best_guess = self.sources.best_guess;
+        let current_dir = if best_guess {
+            Some(std::env::current_dir()?)
+        } else {
+            // Non-strict input resolution still tries the working directory.
+            std::env::current_dir().ok()
+        };
+        let input_cwd = current_dir.as_deref().filter(|_| best_guess);
         let default_vrb = self.pdf.with_extension("vrb");
-        let generated_path = generated.unwrap_or(&default_vrb);
-        let result = if let Some(generated) = generated {
-            if generated == default_vrb
-                && let Some(geometry) = &self.geometry_map
-            {
-                geometry.clone()
-            } else if self.synctex_cache.is_some() {
-                let key = (
-                    self.point.page,
-                    generated.to_owned(),
-                    input_cwd.map(Path::to_owned),
-                );
-                if let Some(existing) = self
-                    .synctex_cache
-                    .as_deref()
-                    .and_then(|cache| cache.structural_maps.get(&key))
-                {
+        let page = self.point.page;
+        let key = |generated: &Path| {
+            structural_map_key(page, generated, current_dir.as_deref(), best_guess)
+        };
+        let result = match generated {
+            Some(generated) if generated == default_vrb && self.geometry_map.is_some() => {
+                self.geometry_map.clone().unwrap()
+            }
+            Some(generated) => {
+                let key = key(generated);
+                if let Some(existing) = self.structural_maps().get(&key) {
                     existing.clone()
                 } else {
-                    let loaded = self.load_source_map(generated_path, false, input_cwd);
+                    let loaded = self.load_source_map(generated, false, input_cwd);
                     self.operation.check()?;
-                    let cache = self.synctex_cache.as_deref_mut().unwrap();
-                    if cache.structural_maps.len() >= 32 {
-                        cache.structural_maps.clear();
+                    let maps = self.structural_maps();
+                    if maps.len() >= 32 {
+                        maps.clear();
                     }
-                    cache.structural_maps.insert(key, loaded.clone());
+                    maps.insert(key, loaded.clone());
                     loaded
                 }
-            } else {
-                if self
-                    .structural_map
-                    .as_ref()
-                    .is_none_or(|(cached, _)| cached != generated)
-                {
-                    let loaded = self.load_source_map(generated_path, false, input_cwd);
-                    self.structural_map = Some((generated.to_owned(), loaded));
-                }
-                self.structural_map.as_ref().unwrap().1.clone()
             }
-        } else {
-            if self.geometry_map.is_none() {
-                if let Some((cached, Ok(map))) = &self.structural_map
-                    && cached == &default_vrb
-                    && map.page_source.is_none()
-                {
-                    self.geometry_map = Some(Ok(Rc::clone(map)));
-                } else if let Some(cache) = self.synctex_cache.as_deref()
-                    && let Some(Ok(map)) = cache.structural_maps.get(&(
-                        self.point.page,
-                        default_vrb.clone(),
-                        input_cwd.map(Path::to_owned),
-                    ))
+            None => {
+                // A structural map without fragile-frame provenance is also the geometry map.
+                let default_key = key(&default_vrb);
+                if self.geometry_map.is_none()
+                    && let Some(Ok(map)) = self.structural_maps().get(&default_key)
                     && map.page_source.is_none()
                 {
                     self.geometry_map = Some(Ok(Rc::clone(map)));
                 }
+                if self.geometry_map.is_none() {
+                    self.geometry_map = Some(self.load_source_map(&default_vrb, true, input_cwd));
+                }
+                self.geometry_map.clone().unwrap()
             }
-            if self.geometry_map.is_none() {
-                let loaded = self.load_source_map(generated_path, true, input_cwd);
-                self.geometry_map = Some(loaded);
-            }
-            self.geometry_map.as_ref().unwrap().clone()
         };
         self.operation.check()?;
         result.map_err(io::Error::other)
@@ -1357,13 +1315,7 @@ impl<'a> InverseQuery<'a> {
         let resolved = if self.sources.best_guess {
             let absolute: PathBuf = std::path::absolute(path)?.components().collect();
             if !path.is_absolute() && fs::symlink_metadata(&absolute).is_err() {
-                crate::source_snapshot::resolve_relative_input(
-                    path,
-                    None,
-                    Some(pdf_dir),
-                    sidecar_dir,
-                )
-                .unwrap_or(absolute)
+                resolve_relative_input(path, None, Some(pdf_dir), sidecar_dir).unwrap_or(absolute)
             } else {
                 absolute
             }
@@ -1372,12 +1324,8 @@ impl<'a> InverseQuery<'a> {
                 .ok()
                 .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
             if !path.is_absolute()
-                && let Some(found) = crate::source_snapshot::resolve_relative_input(
-                    path,
-                    current_dir.as_deref(),
-                    Some(pdf_dir),
-                    sidecar_dir,
-                )
+                && let Some(found) =
+                    resolve_relative_input(path, current_dir.as_deref(), Some(pdf_dir), sidecar_dir)
             {
                 found
             } else {
@@ -1405,12 +1353,7 @@ impl<'a> InverseQuery<'a> {
         // Known generated hits use structural sheet provenance before any
         // source bounds, and never read the final reused .vrb / sidecar file.
         let source_map = generated.then(|| self.source_map(Some(Path::new(&file))));
-        if self.sources.best_guess
-            && let Some(Err(error)) = &source_map
-        {
-            self.operation.check()?;
-            return Err(io::Error::other(error.to_string()));
-        }
+        self.require_source_map_for_best_guess(&source_map)?;
         Ok(InverseAnchor {
             target: SourceLocation {
                 file,
@@ -1626,12 +1569,7 @@ impl<'a> InverseQuery<'a> {
                 let default_vrb = self.pdf.with_extension("vrb");
                 source_map = Some(self.source_map(fragile_frame.is_none().then_some(&default_vrb)));
             }
-            if self.sources.best_guess
-                && let Some(Err(error)) = &source_map
-            {
-                self.operation.check()?;
-                return Err(io::Error::other(error.to_string()));
-            }
+            self.require_source_map_for_best_guess(&source_map)?;
             self.operation.check()?;
             // A fragile sheet also contains nongenerated headings and footers.
             // Sheet-wide .vrb participation does not prove this point is body text.
@@ -1767,12 +1705,7 @@ impl<'a> InverseQuery<'a> {
                         .is_some_and(|map| map.page_source.is_some())
                 {
                     source_map = Some(self.source_map(None));
-                    if self.sources.best_guess
-                        && let Some(Err(error)) = &source_map
-                    {
-                        self.operation.check()?;
-                        return Err(io::Error::other(error.to_string()));
-                    }
+                    self.require_source_map_for_best_guess(&source_map)?;
                 }
                 if let Some(map) = source_map
                     .as_ref()
@@ -2184,7 +2117,7 @@ fn metadata_beats_frame(
 }
 
 fn read_source(path: &Path) -> io::Result<String> {
-    let file = crate::source_snapshot::open_regular(path).map_err(|e| {
+    let file = open_regular(path).map_err(|e| {
         if e.kind() == io::ErrorKind::InvalidData {
             io::Error::other("source refinement requires a regular file")
         } else {
@@ -2212,94 +2145,181 @@ struct SourceMap {
     adjacent_origins: Vec<(PathBuf, u32)>,
 }
 
-#[derive(Clone, Copy)]
-struct SourceBox {
-    bounds: [f64; 4],
-    generated: bool,
+pub(crate) fn is_compiler_sidecar_input(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "aux"
+                    | "nav"
+                    | "out"
+                    | "toc"
+                    | "w18"
+                    | "vrb"
+                    | "snm"
+                    | "bbl"
+                    | "blg"
+                    | "log"
+                    | "fls"
+                    | "fdb_latexmk"
+            )
+        })
 }
 
-fn source_box_bounds(row: &str, position: [f64; 2]) -> io::Result<Option<[f64; 4]>> {
-    let parse = || {
-        let size = row.split(':').nth(2)?;
-        let mut size = size.split(',');
-        let [width, height, depth] = [size.next()?, size.next()?, size.next()?]
-            .map(|value| value.parse::<f64>().ok().filter(|value| value.is_finite()));
-        Some([position[0], position[1], width?, height?, depth?])
-    };
-    let [x, y, width, height, depth] =
-        parse().ok_or_else(|| io::Error::other("SyncTeX horizontal box has invalid geometry"))?;
-    Ok((width > 0.0 && height + depth > 0.0).then_some([x, y - height, x + width, y + depth]))
+pub(crate) fn valid_absolute_path(path: &Path) -> bool {
+    path.is_absolute() && path.to_str().is_some() && !path.as_os_str().as_bytes().contains(&0)
 }
 
-fn source_map_position(row: &str, last_v: &mut f64) -> io::Result<[f64; 2]> {
-    let position = row
-        .split(':')
-        .nth(1)
-        .and_then(|position| position.split_once(','))
-        .ok_or_else(|| io::Error::other("SyncTeX node has invalid position"))?;
-    let x = source_map_number(position.0)?;
-    let y = if position.1 == "=" {
-        *last_v
+pub(crate) fn valid_warning(warning: &str) -> bool {
+    !warning.is_empty()
+        && warning.len() <= MAX_WARNING_BYTES
+        && !warning.chars().any(char::is_control)
+}
+
+pub(crate) fn normalize_absolute(path: &Path, cwd: &Path) -> io::Result<PathBuf> {
+    let absolute: PathBuf = if path.is_absolute() {
+        path.components().collect()
     } else {
-        let y = source_map_number(position.1)?;
-        *last_v = y;
-        y
+        cwd.components().chain(path.components()).collect()
     };
-    Ok([x, y])
+    if !valid_absolute_path(&absolute) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source path must be a valid absolute UTF-8 path",
+        ));
+    }
+    Ok(absolute)
 }
 
-fn generated_box_at_point(
-    boxes: &[SourceBox],
-    x: f64,
-    y: f64,
-    operation: &Operation,
-) -> io::Result<bool> {
-    let contains =
-        |a: [f64; 4], b: [f64; 4]| a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3];
-    let mut nearest: Vec<SourceBox> = Vec::new();
-    for candidate in boxes {
-        operation.check()?;
-        if !contains(candidate.bounds, [x, y, x, y]) {
+pub(crate) fn canonical_sidecar_dir(sidecar: &Path) -> Option<PathBuf> {
+    sidecar
+        .parent()
+        .and_then(|dir| fs::canonicalize(dir).ok())
+        .or_else(|| sidecar.parent().map(Path::to_owned))
+}
+
+pub(crate) fn resolve_relative_input(
+    raw_path: &Path,
+    cwd: Option<&Path>,
+    pdf_dir: Option<&Path>,
+    sidecar_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if raw_path.is_absolute() {
+        return None;
+    }
+    for base in [cwd, pdf_dir, sidecar_dir].into_iter().flatten() {
+        if let Ok(cand) = normalize_absolute(raw_path, base)
+            && let Ok(resolved) = fs::canonicalize(cand)
+        {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// The path of a declared `Input:`. `Ok(cwd)` resolves strictly against the compiler's working
+/// directory; `Err(cwd)` resolves leniently, ignoring the trailing blanks some engines pad
+/// `Input:` rows with, and falls back to the PDF directory.
+pub(crate) fn resolve_declared_input(
+    raw: &str,
+    cwd: Result<&Path, Option<&Path>>,
+    pdf_dir: Option<&Path>,
+    sidecar_dir: Option<&Path>,
+) -> Result<PathBuf, &'static str> {
+    let raw = Path::new(if cwd.is_ok() {
+        raw
+    } else {
+        raw.trim_end_matches(' ')
+    });
+    match cwd {
+        Ok(_) if raw.as_os_str().is_empty() => Err("invalid SyncTeX input declaration"),
+        Ok(_) if raw.is_absolute() && !valid_absolute_path(raw) => {
+            Err("invalid SyncTeX input path")
+        }
+        _ if raw.is_absolute() => Ok(raw.to_owned()),
+        Ok(cwd) => {
+            let joined = cwd.join(raw);
+            if !valid_absolute_path(&joined) {
+                return Err("invalid SyncTeX input path");
+            }
+            Ok(if fs::symlink_metadata(&joined).is_err() {
+                resolve_relative_input(raw, None, pdf_dir, sidecar_dir).unwrap_or(joined)
+            } else {
+                joined
+            })
+        }
+        Err(cwd) => Ok(resolve_relative_input(raw, cwd, pdf_dir, sidecar_dir)
+            .unwrap_or_else(|| pdf_dir.unwrap_or(Path::new(".")).join(raw))),
+    }
+}
+
+/// The `Input:` tags naming `file`, latest declaration first: the tag a forward query uses and
+/// every matching tag. An unresolvable relative input matches by file name only when all such
+/// declarations name the same raw path.
+pub(crate) fn forward_input_tags(
+    inputs: &[(u32, String)],
+    file: &Path,
+    pdf: &Path,
+    sidecar_dir: Option<&Path>,
+) -> Option<(u32, std::collections::HashSet<u32>)> {
+    let pdf_dir = pdf.parent().unwrap_or(Path::new("."));
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.map(|dir| fs::canonicalize(&dir).unwrap_or(dir));
+    let resolve =
+        |raw: &Path| resolve_relative_input(raw, cwd.as_deref(), Some(pdf_dir), sidecar_dir);
+    let mut matching = std::collections::HashSet::new();
+    let mut input_tag = None;
+    for (tag, raw_path) in inputs.iter().rev() {
+        let raw = Path::new(raw_path);
+        let normalized = if raw.is_absolute() {
+            Some(fs::canonicalize(raw).unwrap_or_else(|_| raw.to_owned()))
+        } else {
+            resolve(raw).or_else(|| {
+                let path = normalize_absolute(raw, pdf_dir).ok()?;
+                Some(fs::canonicalize(&path).unwrap_or(path))
+            })
+        };
+        if normalized.as_deref() == Some(file) {
+            matching.insert(*tag);
+            input_tag.get_or_insert(*tag);
+        }
+    }
+    if input_tag.is_some() {
+        return input_tag.map(|tag| (tag, matching));
+    }
+    let name = file.file_name()?;
+    let mut matched_path = None::<&str>;
+    for (tag, raw_path) in inputs.iter().rev() {
+        let raw = Path::new(raw_path);
+        if raw.file_name() != Some(name) || resolve(raw).is_some() {
             continue;
         }
-        if let Some(equal) = nearest
-            .iter_mut()
-            .find(|old| old.bounds == candidate.bounds)
-        {
-            equal.generated &= candidate.generated;
-        } else if !nearest
-            .iter()
-            .any(|old| contains(candidate.bounds, old.bounds))
-        {
-            nearest.retain(|old| !contains(old.bounds, candidate.bounds));
-            nearest.push(*candidate);
+        match matched_path {
+            None => {
+                matched_path = Some(raw_path);
+                input_tag = Some(*tag);
+            }
+            Some(prev) if prev != raw_path => return None,
+            Some(_) => {}
         }
+        matching.insert(*tag);
     }
-    // Conflicting nonnested overlaps and equal boxes with mixed ownership abstain.
-    Ok(nearest.len() == 1 && nearest[0].generated)
+    input_tag.map(|tag| (tag, matching))
 }
 
-fn source_map_number(value: &str) -> io::Result<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| io::Error::other("SyncTeX transform has an invalid number"))
-}
-
-fn source_map_dimension(value: &str) -> io::Result<f64> {
-    let trimmed = value.trim();
-    if let Some(unit_start) = trimmed.len().checked_sub(2)
-        && let Some(scale) = trimmed.get(unit_start..).and_then(synctex_unit_scale)
-        && let Some(number) = trimmed.get(..unit_start)
-    {
-        return source_map_number(number).map(|number| number * scale);
+pub(crate) fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source metadata requires a regular file",
+        ));
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "SyncTeX post dimension has an invalid unit",
-    ))
+    Ok(file)
 }
 
 pub(crate) fn decode_synctex_file(file: fs::File, limit: u64) -> io::Result<Box<dyn BufRead>> {
@@ -2319,8 +2339,8 @@ pub(crate) fn open_synctex_with_path_in(
     build_directory: Option<&Path>,
 ) -> io::Result<(Box<dyn BufRead>, PathBuf)> {
     let mut last_not_found = None;
-    for (candidate, _) in synctex_candidates(pdf, build_directory) {
-        match crate::source_snapshot::open_regular(&candidate) {
+    for candidate in synctex_candidates(pdf, build_directory) {
+        match open_regular(&candidate) {
             Ok(file) => {
                 return Ok((
                     decode_synctex_file(file, crate::parser::MAX_SYNCTEX_BYTES as u64 + 1)?,
@@ -2333,483 +2353,6 @@ pub(crate) fn open_synctex_with_path_in(
     }
     Err(last_not_found
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")))
-}
-
-fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
-    let (link, _) = row.get(1..)?.split_once(':')?;
-    let (tag, rest) = link.split_once(',')?;
-    Some((
-        tag.parse::<u32>().ok()?,
-        rest.split(',').next()?.parse::<u32>().ok()?,
-    ))
-}
-
-fn read_source_map_in(
-    pdf: &Path,
-    point: InversePoint,
-    generated: &Path,
-    geometry_required: bool,
-    operation: &Operation,
-    input_cwd: Option<&Path>,
-    build_directory: Option<&Path>,
-) -> io::Result<SourceMap> {
-    let (reader, sidecar_path) = open_synctex_with_path_in(pdf, build_directory)?;
-    let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
-    source_map_from_reader_in(
-        reader,
-        pdf,
-        point,
-        generated,
-        geometry_required,
-        operation,
-        input_cwd,
-        sidecar_dir.as_deref(),
-    )
-}
-
-#[cfg(test)]
-fn source_map_from_reader(
-    reader: impl BufRead,
-    pdf: &Path,
-    point: InversePoint,
-    generated: &Path,
-    operation: &Operation,
-) -> io::Result<SourceMap> {
-    source_map_from_reader_in(reader, pdf, point, generated, true, operation, None, None)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn source_map_from_reader_in(
-    reader: impl BufRead,
-    pdf: &Path,
-    point: InversePoint,
-    generated: &Path,
-    geometry_required: bool,
-    operation: &Operation,
-    input_cwd: Option<&Path>,
-    sidecar_dir: Option<&Path>,
-) -> io::Result<SourceMap> {
-    let mut reader = reader.take(crate::parser::MAX_SYNCTEX_BYTES as u64 + 1);
-    let mut inputs = std::collections::HashMap::new();
-    let mut generated_tags = std::collections::HashSet::new();
-    let mut row = String::new();
-    let mut in_page = false;
-    let mut page_complete = false;
-    let mut origin = None;
-    let mut active_sheet: Option<(u32, Option<(u32, u32)>)> = None;
-    let mut sheet_origins: Vec<(u32, (u32, u32))> = Vec::new();
-    let mut generated_on_page = false;
-    let mut page_tags = std::collections::HashSet::new();
-    let mut stack: Vec<(u8, Option<[f64; 4]>, bool)> = Vec::new();
-    let mut boxes = Vec::new();
-    let mut defined_forms = std::collections::HashSet::new();
-    let mut sheet_form_refs = std::collections::HashSet::new();
-    let mut unit = None;
-    let mut magnification = None;
-    let mut x_offset = None;
-    let mut y_offset = None;
-    let mut post_magnification = 1.0;
-    let mut post_x_offset = None;
-    let mut post_y_offset = None;
-    let mut post_scriptum = false;
-    let mut postamble = false;
-    let mut postamble_count = false;
-    let mut bytes_read = 0;
-    let mut lines = 0usize;
-    let mut last_v = -1.0;
-    let current_dir = if input_cwd.is_none() {
-        std::env::current_dir()
-            .ok()
-            .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)))
-    } else {
-        None
-    };
-    loop {
-        if lines & 1023 == 0 {
-            operation.check()?;
-        }
-        lines = lines.wrapping_add(1);
-        row.clear();
-        let count = reader.read_line(&mut row)?;
-        bytes_read += count;
-        if bytes_read >= crate::parser::MAX_SYNCTEX_BYTES {
-            return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
-        }
-        if count == 0 {
-            break;
-        }
-        let row = row.trim_end_matches(['\r', '\n']);
-        if (geometry_required || input_cwd.is_some()) && row == "Postamble:" {
-            postamble = true;
-        } else if (geometry_required || input_cwd.is_some())
-            && postamble
-            && let Some(value) = row.strip_prefix("Count:")
-        {
-            value
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| io::Error::other("SyncTeX postamble has invalid Count"))?;
-            postamble_count = true;
-        }
-        if geometry_required && row == "Post scriptum:" {
-            post_scriptum = true;
-        } else if geometry_required && let Some(value) = row.strip_prefix("Unit:") {
-            unit = Some(source_map_number(value)?);
-        } else if geometry_required && let Some(value) = row.strip_prefix("Magnification:") {
-            let value = source_map_number(value)?;
-            if post_scriptum {
-                post_magnification = value;
-            } else {
-                magnification = Some(value);
-            }
-        } else if geometry_required && let Some(value) = row.strip_prefix("X Offset:") {
-            if post_scriptum {
-                post_x_offset = Some(source_map_dimension(value)?);
-            } else {
-                x_offset = Some(source_map_number(value)?);
-            }
-        } else if geometry_required && let Some(value) = row.strip_prefix("Y Offset:") {
-            if post_scriptum {
-                post_y_offset = Some(source_map_dimension(value)?);
-            } else {
-                y_offset = Some(source_map_number(value)?);
-            }
-        }
-        // Compressed ",=" reuses the scanner's global last vertical value,
-        // including records from earlier sheets and form definitions.
-        // Later positions cannot affect this query's completed sheet, but the
-        // remaining input tags, transforms, and postamble still require a scan.
-        let position = if geometry_required
-            && !page_complete
-            && matches!(
-                row.as_bytes().first(),
-                Some(b'[' | b'(' | b'v' | b'h' | b'x' | b'k' | b'g' | b'r' | b'$' | b'f')
-            ) {
-            Some(source_map_position(row, &mut last_v)?)
-        } else {
-            None
-        };
-        if geometry_required && let Some(tag) = row.strip_prefix('<') {
-            let tag = tag
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|tag| *tag > 0)
-                .ok_or_else(|| io::Error::other("SyncTeX form has an invalid tag"))?;
-            defined_forms.insert(tag);
-        }
-        if let Some(input) = row.strip_prefix("Input:") {
-            if let Some((tag, path)) = input.split_once(':')
-                && let Ok(tag) = tag.parse::<u32>()
-            {
-                let path = Path::new(path);
-                if input_cwd.is_some() && (tag == 0 || path.as_os_str().is_empty()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid SyncTeX input declaration",
-                    ));
-                }
-                let path = if path.is_absolute() {
-                    if input_cwd.is_some() && !valid_absolute_path(path) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid SyncTeX input path",
-                        ));
-                    }
-                    path.to_owned()
-                } else if let Some(cwd) = input_cwd {
-                    let joined = cwd.join(path);
-                    if !valid_absolute_path(&joined) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid SyncTeX input path",
-                        ));
-                    }
-                    if fs::symlink_metadata(&joined).is_err() {
-                        crate::source_snapshot::resolve_relative_input(
-                            path,
-                            None,
-                            pdf.parent(),
-                            sidecar_dir,
-                        )
-                        .unwrap_or(joined)
-                    } else {
-                        joined
-                    }
-                } else {
-                    crate::source_snapshot::resolve_relative_input(
-                        path,
-                        current_dir.as_deref(),
-                        pdf.parent(),
-                        sidecar_dir,
-                    )
-                    .unwrap_or_else(|| pdf.parent().unwrap_or(Path::new(".")).join(path))
-                };
-                // TeX can emit .vrb in the build cwd while the PDF is in a
-                // separate output directory. Jobname is the map identity;
-                // the final generated file is neither read nor trusted.
-                if path.file_name() == generated.file_name() {
-                    generated_tags.insert(tag);
-                }
-                match inputs.entry(tag) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if input_cwd.is_some() && entry.get() != &path {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "conflicting SyncTeX input tag",
-                            ));
-                        }
-                        if input_cwd.is_none() && !page_complete {
-                            entry.insert(path);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(path);
-                    }
-                }
-            } else if input_cwd.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "malformed SyncTeX input declaration",
-                ));
-            }
-        } else if let Some(page) = row.strip_prefix('{') {
-            let parsed_page = page.trim().parse::<u32>().ok();
-            in_page = parsed_page == Some(point.page);
-            if in_page && page_complete {
-                return Err(io::Error::other(
-                    "SyncTeX source map repeats the clicked sheet",
-                ));
-            }
-            active_sheet = parsed_page.map(|p| (p, None));
-        } else if in_page && row.starts_with('}') {
-            if row[1..].trim().parse::<u32>() != Ok(point.page) || !stack.is_empty() {
-                return Err(io::Error::other(
-                    "SyncTeX source map has mismatched sheet bounds",
-                ));
-            }
-            page_complete = true;
-            in_page = false;
-            active_sheet = None;
-            if let Some(orig) = origin {
-                sheet_origins.push((point.page, orig));
-            }
-        } else if in_page {
-            if geometry_required && matches!(row.as_bytes().first(), Some(b'<' | b'>')) {
-                return Err(io::Error::other(
-                    "SyncTeX fragile body ownership cannot resolve sheet form transforms",
-                ));
-            }
-            if geometry_required && let Some(reference) = row.strip_prefix('f') {
-                let tag = reference
-                    .split_once(':')
-                    .and_then(|(tag, _)| tag.parse::<u32>().ok())
-                    .filter(|tag| *tag > 0)
-                    .ok_or_else(|| io::Error::other("SyncTeX form reference has an invalid tag"))?;
-                sheet_form_refs.insert(tag);
-            }
-            let link = synctex_node_link(row);
-            // Only the first box enclosing the whole sheet proves provenance.
-            if origin.is_none() {
-                if !matches!(row.as_bytes().first(), Some(b'[' | b'(')) || link.is_none() {
-                    return Err(io::Error::other(
-                        "SyncTeX sheet has no enclosing source box",
-                    ));
-                }
-                origin = link;
-            }
-            let generated_node = link.is_some_and(|(tag, _)| generated_tags.contains(&tag));
-            if geometry_required {
-                match row.as_bytes().first() {
-                    Some(kind @ (b'[' | b'(')) => {
-                        let bounds = if *kind == b'(' {
-                            source_box_bounds(
-                                row,
-                                position.ok_or_else(|| {
-                                    io::Error::other("SyncTeX horizontal box has no position")
-                                })?,
-                            )?
-                        } else {
-                            None
-                        };
-                        stack.push((*kind, bounds, generated_node));
-                    }
-                    Some(b']' | b')') => {
-                        let (kind, bounds, generated) = stack.pop().ok_or_else(|| {
-                            io::Error::other("SyncTeX sheet has an unmatched box close")
-                        })?;
-                        if (kind == b'(') != row.starts_with(')') {
-                            return Err(io::Error::other(
-                                "SyncTeX sheet has mismatched box bounds",
-                            ));
-                        }
-                        if let Some(bounds) = bounds {
-                            boxes.push(SourceBox { bounds, generated });
-                        }
-                        if let Some(parent) = stack.last_mut() {
-                            parent.2 |= generated;
-                        }
-                    }
-                    _ => {
-                        if generated_node && let Some(parent) = stack.last_mut() {
-                            parent.2 = true;
-                        }
-                    }
-                }
-            }
-            if matches!(
-                row.as_bytes().first(),
-                Some(b'[' | b'(' | b'v' | b'h' | b'k' | b'g' | b'x' | b'$' | b'r')
-            ) && let Some((tag, _)) = link
-            {
-                generated_on_page |= generated_tags.contains(&tag);
-                if input_cwd.is_some() && !geometry_required {
-                    page_tags.insert(tag);
-                }
-            }
-        } else if let Some((_, sheet_origin)) = &mut active_sheet {
-            if let Some(page) = row.strip_prefix('}') {
-                if let Some((p, Some(orig))) = active_sheet.take()
-                    && page.trim().parse::<u32>() == Ok(p)
-                {
-                    sheet_origins.push((p, orig));
-                }
-            } else if sheet_origin.is_none() && matches!(row.as_bytes().first(), Some(b'[' | b'('))
-            {
-                *sheet_origin = synctex_node_link(row);
-            }
-        }
-    }
-    operation.check()?;
-    if !page_complete || ((geometry_required || input_cwd.is_some()) && !postamble_count) {
-        return Err(io::Error::other("SyncTeX source map is incomplete"));
-    }
-    let is_vrb = generated.extension().is_some_and(|ext| ext == "vrb");
-    let is_sidecar_tag = |tag: u32| {
-        generated_tags.contains(&tag)
-            || inputs
-                .get(&tag)
-                .is_some_and(|path| is_generated_or_sidecar_input(path))
-    };
-    let adjacent_tags: Vec<(u32, u32)> = match origin {
-        Some((tag, _)) if is_sidecar_tag(tag) && !is_vrb => {
-            let prev = sheet_origins
-                .iter()
-                .rev()
-                .find(|&&(p, (t, _))| p < point.page && !is_sidecar_tag(t))
-                .map(|&(_, orig)| orig);
-            let next = sheet_origins
-                .iter()
-                .find(|&&(p, (t, _))| p > point.page && !is_sidecar_tag(t))
-                .map(|&(_, orig)| orig);
-            match (prev, next) {
-                (Some(p), Some(n)) if n.0 == p.0 => vec![n, p],
-                (Some(p), Some(n)) => vec![p, n],
-                (Some(p), None) => vec![p],
-                (None, Some(n)) => vec![n],
-                (None, None) => Vec::new(),
-            }
-        }
-        _ => Vec::new(),
-    };
-    let frame_slide = origin
-        .and_then(|orig| {
-            u32::try_from(
-                sheet_origins
-                    .iter()
-                    .filter(|&&(p, o)| p <= point.page && o == orig)
-                    .count(),
-            )
-            .ok()
-        })
-        .filter(|&n| n > 0);
-    let build_map = |inputs: std::collections::HashMap<u32, PathBuf>,
-                     generated_on_page: bool,
-                     generated_at_point: bool|
-     -> io::Result<SourceMap> {
-        let main = inputs
-            .get(&1)
-            .cloned()
-            .ok_or_else(|| io::Error::other("SyncTeX source map has no main input"))?;
-        let page_source = origin
-            .filter(|_| generated_on_page)
-            .and_then(|(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)));
-        let adjacent_origins = if generated_on_page {
-            adjacent_tags
-                .iter()
-                .filter_map(|&(tag, line)| inputs.get(&tag).cloned().map(|path| (path, line)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Ok(SourceMap {
-            main,
-            inputs: inputs.into_values().collect(),
-            page_source,
-            generated_at_point,
-            frame_slide,
-            generated: generated.to_path_buf(),
-            adjacent_origins,
-        })
-    };
-    if !geometry_required {
-        generated_on_page |= page_tags.iter().any(|tag| generated_tags.contains(tag));
-        return build_map(inputs, generated_on_page, false);
-    }
-    // With form recording disabled, TeX still emits sheet references whose
-    // definitions are absent. The native SyncTeX parser removes those refs:
-    // they carry no source ownership. Do not invent geometry or source tags.
-    if sheet_form_refs
-        .iter()
-        .any(|tag| defined_forms.contains(tag))
-    {
-        return Err(io::Error::other(
-            "SyncTeX fragile body ownership cannot resolve recorded sheet form transforms",
-        ));
-    }
-    // Match SyncTeX's effective preamble/Post scriptum transform. The offsets
-    // are not magnified; post offsets are dimensions in scaled TeX points.
-    let unit = unit
-        .filter(|unit| *unit > 0.0)
-        .ok_or_else(|| io::Error::other("SyncTeX source map has no positive Unit"))?;
-    let magnification = magnification
-        .filter(|magnification| *magnification > 0.0)
-        .ok_or_else(|| io::Error::other("SyncTeX source map has no positive Magnification"))?;
-    if post_magnification <= 0.0 {
-        return Err(io::Error::other(
-            "SyncTeX post magnification is not positive",
-        ));
-    }
-    let pre_unit = unit / 65781.76;
-    let visible_unit = pre_unit * magnification / 1000.0 * post_magnification;
-    let (x_offset, y_offset) = if let Some(x) = post_x_offset {
-        let y = post_y_offset
-            .ok_or_else(|| io::Error::other("SyncTeX post X Offset has no Y Offset"))?;
-        (x / 65781.76, y / 65781.76)
-    } else {
-        (
-            x_offset.ok_or_else(|| io::Error::other("SyncTeX source map has no X Offset"))?
-                * pre_unit,
-            y_offset.ok_or_else(|| io::Error::other("SyncTeX source map has no Y Offset"))?
-                * pre_unit,
-        )
-    };
-    if !visible_unit.is_finite()
-        || visible_unit <= 0.0
-        || !x_offset.is_finite()
-        || !y_offset.is_finite()
-    {
-        return Err(io::Error::other(
-            "SyncTeX effective transform is not finite",
-        ));
-    }
-    let generated_at_point = generated_box_at_point(
-        &boxes,
-        (f64::from(point.x) - x_offset) / visible_unit,
-        (f64::from(point.y_from_top) - y_offset) / visible_unit,
-        operation,
-    )?;
-    build_map(inputs, generated_on_page, generated_at_point)
 }
 
 /// Beamer reopens the same .vrb for successive fragile frames. The clicked
@@ -3483,60 +3026,4 @@ pub(crate) fn apply_compiler_column(
         target.column = prefix.encode_utf16().count() + 1;
         target.column_char = prefix.chars().count() + 1;
     }
-}
-
-pub(crate) fn materialize_raw_candidates(
-    candidates: Vec<RawInverseCandidate>,
-    pdf: Option<&Path>,
-    sidecar_dir: Option<&Path>,
-) -> Vec<SourceLocation> {
-    let current_dir = std::env::current_dir()
-        .ok()
-        .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
-    let pdf_dir = pdf.and_then(Path::parent);
-    let mut loaded_sources = std::collections::HashMap::<PathBuf, Option<String>>::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::with_capacity(candidates.len());
-    for cand in candidates {
-        let mut loc = SourceLocation {
-            file: cand.file,
-            line: cand.line,
-            byte_column: 0,
-            column: 1,
-            column_char: 1,
-            precise: false,
-        };
-        if let Some(column) = cand.compiler_column.filter(|&col| col > 1) {
-            let raw_path = Path::new(&loc.file);
-            let resolved = if raw_path.is_absolute() {
-                raw_path.to_owned()
-            } else {
-                crate::source_snapshot::resolve_relative_input(
-                    raw_path,
-                    current_dir.as_deref(),
-                    pdf_dir,
-                    sidecar_dir,
-                )
-                .unwrap_or_else(|| raw_path.to_owned())
-            };
-            if !crate::source_snapshot::is_compiler_sidecar_input(&resolved) {
-                let source = loaded_sources
-                    .entry(resolved.clone())
-                    .or_insert_with(|| read_source(&resolved).ok());
-                if let Some(source) = source.as_deref() {
-                    if let Ok(text) = validate_inverse_source_line(source, loc.line, &resolved) {
-                        apply_compiler_column(&mut loc, text, column);
-                    }
-                } else {
-                    loc.byte_column = column - 1;
-                    loc.column = column;
-                    loc.column_char = column;
-                }
-            }
-        }
-        if seen.insert((loc.file.clone(), loc.line, loc.byte_column)) {
-            results.push(loc);
-        }
-    }
-    results
 }

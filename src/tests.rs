@@ -106,13 +106,31 @@ fn macros_from_sources<'a>(sources: &[&'a str]) -> math::MacroTable<'a> {
     math::macros_from_sources_with_mode(sources, false, &[], &Operation::default())
 }
 
+fn resolve_forward(pdf: &Path, file: &Path, line: u32, column: u32) -> io::Result<ForwardRequest> {
+    forward_with(pdf, file, (line, column), ForwardSource::default())
+}
+
+fn inverse_failure(error: &io::Error) -> Option<&InverseFailure> {
+    error.get_ref()?.downcast_ref::<InverseFailure>()
+}
+
 fn source_map_from_reader(
     reader: impl BufRead,
     pdf: &Path,
     point: InversePoint,
     generated: &Path,
 ) -> io::Result<SourceMap> {
-    crate::source_map_from_reader(reader, pdf, point, generated, &Operation::default())
+    let operation = &Operation::default();
+    parser::parse_synctex_document_with_options(reader, true, Some(point.page), Some(operation))?
+        .source_map(parser::SourceMapRequest {
+            pdf,
+            point,
+            generated,
+            geometry_required: true,
+            input_cwd: None,
+            sidecar_dir: None,
+            operation,
+        })
 }
 
 /// Find a `tikzpicture` environment enclosing the one-based SyncTeX line, or
@@ -432,10 +450,25 @@ fn resolve_inverse_output(
     radius: u32,
     operation: &Operation,
     output: &str,
-    sources: QuerySources,
+    mut sources: QuerySources,
 ) -> io::Result<InverseResolution> {
     let targets = parse_cli_synctex_edit_candidates(output);
     let build_directory = sources.sidecar_dir.clone();
+    // Parse the clicked sheet of the sidecar on disk, if one is present and valid.
+    let (parsed, sidecar_dir) = open_synctex_with_path_in(pdf, build_directory.as_deref())
+        .and_then(|(reader, sidecar_path)| {
+            let parsed = parser::parse_synctex_document_with_options(
+                reader,
+                true,
+                Some(point.page),
+                Some(operation),
+            )?;
+            Ok((parsed, canonical_sidecar_dir(&sidecar_path)))
+        })
+        .unwrap_or_default();
+    if sources.sidecar_dir.is_none() {
+        sources.sidecar_dir = sidecar_dir;
+    }
     InverseQuery::new(
         InverseRequest {
             pdf,
@@ -447,7 +480,7 @@ fn resolve_inverse_output(
             build_directory: build_directory.as_deref(),
         },
         sources,
-        None,
+        SheetSource::Parsed(Box::new(parsed)),
     )
     .resolve_targets(targets)
 }
@@ -2606,22 +2639,11 @@ fn inverse_body_ownership_uses_specific_boxes_and_effective_transform() {
             .is_err()
         );
     }
-    let generated = SourceBox {
-        bounds: [0.0, 0.0, 20.0, 20.0],
-        generated: true,
-    };
-    for other in [
-        SourceBox {
-            generated: false,
-            ..generated
-        },
-        SourceBox {
-            bounds: [10.0, 0.0, 30.0, 20.0],
-            generated: false,
-        },
-    ] {
+    let operation = Operation::default();
+    let generated = ([0.0, 0.0, 20.0, 20.0], true);
+    for other in [(generated.0, false), ([10.0, 0.0, 30.0, 20.0], false)] {
         assert!(
-            !generated_box_at_point(&[generated, other], 15.0, 15.0, &Operation::default())
+            !parser::generated_box_at_point([generated, other].into_iter(), 15.0, 15.0, &operation)
                 .unwrap()
         );
     }
@@ -8770,6 +8792,68 @@ fn note_consumed_command_does_not_discard_following_printed_word() {
 fn located_on(source: &str, row: &str, needle: &str) -> Option<(u32, usize)> {
     let line = source.lines().position(|line| line == row)?;
     Some((line as u32 + 1, source.lines().nth(line)?.find(needle)?))
+}
+
+#[test]
+fn lenient_source_map_inputs_ignore_trailing_blanks() {
+    let (_directory, root) = temp_project(&[]);
+    let source = root.join("deck.tex");
+    fs::write(&source, "Plume.\n").unwrap();
+    let pdf = root.join("deck.pdf");
+    let contents = format!(
+        "SyncTeX Version:1\nInput:1:{}   \nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\n\
+         Content:\n{{1\n[1,1:0,0:1,1,0\nx1,1:0,0\n]\n}}1\nPostamble:\nCount:3\nPost scriptum:\n",
+        source.display()
+    );
+    let map = source_map_from_reader(
+        contents.as_bytes(),
+        &pdf,
+        ipt(1, 0.0, 0.0, 1.0),
+        &root.join("deck.vrb"),
+    )
+    .unwrap();
+    assert_eq!(map.main, source);
+    assert!(
+        map.inputs.iter().all(|input| input == &source),
+        "{:?}",
+        map.inputs
+    );
+    // The geometry parser reads the same declaration identically.
+    let parsed =
+        parser::parse_synctex_document_with_options(contents.as_bytes(), true, Some(1), None)
+            .unwrap();
+    assert_eq!(
+        parsed
+            .source_map(parser::SourceMapRequest {
+                pdf: &pdf,
+                point: ipt(1, 0.0, 0.0, 1.0),
+                generated: &root.join("deck.vrb"),
+                geometry_required: true,
+                input_cwd: None,
+                sidecar_dir: None,
+                operation: &Operation::default(),
+            })
+            .unwrap()
+            .main,
+        source
+    );
+}
+
+#[test]
+fn structural_map_cache_keys_track_working_directory_in_both_modes() {
+    let generated = Path::new("/synthetic/deck.vrb");
+    let first = Some(Path::new("/synthetic/one"));
+    let second = Some(Path::new("/synthetic/two"));
+    for best_guess in [false, true] {
+        assert_ne!(
+            structural_map_key(1, generated, first, best_guess),
+            structural_map_key(1, generated, second, best_guess),
+        );
+    }
+    assert_ne!(
+        structural_map_key(1, generated, first, false),
+        structural_map_key(1, generated, first, true),
+    );
 }
 
 #[test]
