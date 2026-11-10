@@ -1,4 +1,494 @@
 use super::*;
+use std::ops::Range;
+use std::process::Command;
+
+// Test-only entry points for `tex` lookups with default context.
+
+/// Find the literal frame whose body closes at or after the one-based
+/// SyncTeX line. Beamer forwards map interior lines to the closing line.
+fn frame_closing_line(source: &str, line: u32) -> Option<u32> {
+    collected_lines(source, line, "frame", &default_ignored(source)).map(|lines| lines.end as u32)
+}
+
+/// Opaque and nonprinting ranges an environment boundary scan ignores by default.
+fn default_ignored(source: &str) -> Vec<Range<usize>> {
+    environment_ignored_ranges(source, &nonprinting_source_ranges(source))
+}
+
+/// Find the literal `tabularx` environment whose body closes at or after the
+/// one-based SyncTeX line. `tabularx` collects its body before trial passes,
+/// stamping interior records with the `\end{tabularx}` line.
+fn tabularx_closing_line(source: &str, line: u32) -> Option<u32> {
+    collected_lines(source, line, "tabularx", &default_ignored(source))
+        .map(|lines| lines.end as u32)
+}
+
+/// Strict nonprinting spans of `source`.
+fn spans(source: &str) -> Vec<Span> {
+    nonprinting_source_spans(source).collect()
+}
+
+fn collected_text_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    collected_text_closing_line_with_spans(source, line, column, &spans(source))
+}
+
+fn reference_argument_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    reference_argument_closing_line_with_spans(source, line, column, &spans(source))
+}
+
+pub(crate) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
+    math::collected_text_argument_at_with_spans(source, byte, &spans(source))
+}
+
+pub(crate) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usize>> {
+    math::collected_text_lines_with_spans(source, line, &spans(source), &default_ignored(source))
+}
+
+fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
+    math::math_lines_with_spans(source, line, &spans(source))
+}
+
+fn math_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    math::math_closing_line_with_spans(source, line, column, &spans(source))
+}
+
+fn source_word_compiler_line(source: &str, line: u32, column: u32) -> u32 {
+    let index = tex::SourceFileIndex::new(source, &Operation::default());
+    source_word_compiler_line_with_index(source, line, column, &index)
+}
+
+/// Runs `f` with a default operation and a fresh per-query analysis scope.
+fn with_scope<R>(f: impl for<'q> FnOnce(&'q Operation, QueryAnalysisScope<'q>) -> R) -> R {
+    let operation = Operation::default();
+    let arena = SourceArena::default();
+    let analyses = tex::AnalysisCache::default();
+    f(
+        &operation,
+        QueryAnalysisScope {
+            arena: &arena,
+            analyses: &analyses,
+        },
+    )
+}
+
+/// Literal document metadata of `main` alone owning the PDF word at `offset` of `context`.
+fn metadata_at(main: &Path, context: &str, offset: usize) -> Option<MetadataLocation> {
+    with_scope(|op, scope| {
+        let sources = &mut QuerySources::default();
+        document_metadata_word_location_with_context(
+            main, None, None, context, offset, sources, op, scope,
+        )
+    })
+    .unwrap()
+}
+
+/// The preamble of `main` with its macro inputs spliced in.
+fn macro_preamble_source(
+    main: &Path,
+    compiled_inputs: Option<&[PathBuf]>,
+    pdf_dir: Option<&Path>,
+    sources: &mut QuerySources<'_>,
+) -> Option<String> {
+    with_scope(|op, scope| {
+        macro_preamble_source_with_scope(main, compiled_inputs, pdf_dir, sources, op, scope)
+    })
+    .unwrap()
+}
+
+fn original_source_from_verbatim(map: &SourceMap) -> io::Result<(String, Rc<String>, u32)> {
+    with_scope(|op, scope| {
+        original_source_from_verbatim_with_scope(map, &mut QuerySources::default(), op, scope)
+    })
+}
+
+/// The macro table of `sources` without guessing.
+fn macros_from_sources<'a>(sources: &[&'a str]) -> math::MacroTable<'a> {
+    math::macros_from_sources_with_mode(sources, false, &[], &Operation::default())
+}
+
+fn source_map_from_reader(
+    reader: impl BufRead,
+    pdf: &Path,
+    point: InversePoint,
+    generated: &Path,
+) -> io::Result<SourceMap> {
+    crate::source_map_from_reader(reader, pdf, point, generated, &Operation::default())
+}
+
+/// Find a `tikzpicture` environment enclosing the one-based SyncTeX line, or
+/// immediately following up to 3 box/layout wrapper lines (`\centering`, `\resizebox`).
+fn source_tikzpicture_range(source: &str, line: u32) -> Option<Range<usize>> {
+    if !source.contains("tikzpicture") {
+        return None;
+    }
+    source_tikzpicture_range_with_ignored(
+        source,
+        &LineIndex::new(source),
+        line,
+        &default_ignored(source),
+    )
+}
+
+/// Refine prose and mathematical atoms without expanding arbitrary TeX macros.
+fn source_word_location(
+    source: &str,
+    line: u32,
+    context: &str,
+    offset: usize,
+    radius: u32,
+) -> Option<(u32, usize)> {
+    strict(source, line, context, offset, radius).location()
+}
+
+/// Word refinement in `source` with the preamble `extra` sources. A guess is never occurrence
+/// ownership, even when the lexical match is unique.
+fn word_outcome(
+    (source, line): (&str, u32),
+    (context, offset): (&str, usize),
+    radius: u32,
+    extra: &[&str],
+    mode: WordLocationMode,
+    operation: &Operation,
+) -> WordOutcome {
+    let analysis = SourceAnalysis::new(source, extra, operation);
+    source_word_location_with_analysis(&analysis, line, (context, offset), radius, mode)
+}
+
+/// [`source_word_location`] of the first `needle` in `context`.
+fn word_at(src: &str, line: u32, ctx: &str, needle: &str, radius: u32) -> Option<(u32, usize)> {
+    source_word_location(src, line, ctx, ctx.find(needle).unwrap(), radius)
+}
+
+/// [`guess`] of the first `needle` in `context`.
+fn guess_at(src: &str, line: u32, ctx: &str, needle: &str, radius: u32) -> WordOutcome {
+    guess(src, line, ctx, ctx.find(needle).unwrap(), radius)
+}
+
+fn guess(source: &str, line: u32, context: &str, offset: usize, radius: u32) -> WordOutcome {
+    guess_in(source, line, context, offset, radius, &[])
+}
+
+fn guess_in(
+    src: &str,
+    line: u32,
+    ctx: &str,
+    at: usize,
+    radius: u32,
+    extra: &[&str],
+) -> WordOutcome {
+    let operation = Operation::default();
+    word_outcome(
+        (src, line),
+        (ctx, at),
+        radius,
+        extra,
+        WordLocationMode::Guess,
+        &operation,
+    )
+}
+
+fn strict(source: &str, line: u32, context: &str, offset: usize, radius: u32) -> WordOutcome {
+    strict_in(source, line, context, offset, radius, &[])
+}
+
+/// Opaque word ownership also prohibits document-metadata fallback.
+fn strict_in(
+    src: &str,
+    line: u32,
+    ctx: &str,
+    at: usize,
+    radius: u32,
+    extra: &[&str],
+) -> WordOutcome {
+    let operation = Operation::default();
+    word_outcome(
+        (src, line),
+        (ctx, at),
+        radius,
+        extra,
+        WordLocationMode::Strict,
+        &operation,
+    )
+}
+
+/// Run-in headings are shipped when TeX starts their following body paragraph.
+fn run_in_heading_compiler_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    run_in_heading_compiler_line_with_spans(source, line, column, &spans(source))
+}
+
+fn line_start_word_compiler_line(source: &str, line: u32, column: u32) -> Option<u32> {
+    line_start_word_compiler_line_with_spans(source, line, column, &spans(source))
+}
+
+fn source_graphics_location(
+    source: &str,
+    line: u32,
+    index: usize,
+    count: usize,
+    scope_proven: bool,
+) -> Option<(u32, usize)> {
+    let operation = crate::Operation::default();
+    let analysis = SourceAnalysis::new(source, &[], &operation);
+    source_graphics_location_with_context(
+        &analysis,
+        line,
+        (index, count),
+        scope_proven,
+        None,
+        WordLocationMode::Strict,
+    )
+}
+
+fn forward_candidates_from_reader_with_options(
+    reader: impl BufRead,
+    pdf: &Path,
+    file: &Path,
+    page_hint: Option<u32>,
+    view_line: u32,
+    fix_readahead: bool,
+) -> io::Result<Vec<ForwardCandidate>> {
+    parser::forward_candidates_from_reader_in(
+        reader,
+        parser::ForwardLookup {
+            pdf,
+            file,
+            view_line,
+            fix_readahead,
+            page_hint,
+            sidecar_dir: None,
+        },
+    )
+}
+
+fn forward_candidates_from_reader(
+    reader: impl BufRead,
+    pdf: &Path,
+    file: &Path,
+    view_line: u32,
+) -> io::Result<Vec<ForwardCandidate>> {
+    forward_candidates_from_reader_with_options(reader, pdf, file, None, view_line, true)
+}
+
+/// Raw inverse candidates of a sidecar, as the parser reports them before source refinement.
+fn inverse_candidates_from_reader(
+    reader: impl BufRead,
+    point: InversePoint,
+    fix_cross_file_tags: bool,
+) -> io::Result<Vec<RawInverseCandidate>> {
+    parser::validate_inverse_point(point)?;
+    let parsed = parser::parse_synctex_document_with_options(
+        reader,
+        fix_cross_file_tags,
+        Some(point.page),
+        None,
+    )?;
+    parser::inverse_candidates_in_doc(&parsed, point)
+}
+
+/// Raw inverse candidates of the sidecar a PDF's companion lookup finds.
+fn inverse_candidates(pdf: &Path, point: InversePoint) -> io::Result<Vec<RawInverseCandidate>> {
+    parser::validate_inverse_point(point)?;
+    let build_directory = resolve_build_directory(None);
+    let (reader, _) = open_synctex_with_path_in(pdf, build_directory.as_deref())?;
+    inverse_candidates_from_reader(reader, point, true)
+}
+
+fn ipt(page: u32, x: f32, y_from_top: f32, page_height_pt: f32) -> InversePoint {
+    InversePoint {
+        page,
+        x,
+        y_from_top,
+        page_height_pt,
+    }
+}
+
+fn inverse_at(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    best_guess: bool,
+) -> io::Result<InverseResolution> {
+    resolve_inverse(pdf, point, word, radius, &Operation::default(), best_guess)
+}
+
+/// `(byte_column, column, column_char)` of a compiler column on a source line.
+fn compiler_columns(text: &str, compiler_column: usize) -> (usize, usize, usize) {
+    let mut location = SourceLocation {
+        file: String::new(),
+        line: 1,
+        byte_column: 0,
+        column: 1,
+        column_char: 1,
+        precise: false,
+    };
+    apply_compiler_column(&mut location, text, compiler_column);
+    (location.byte_column, location.column, location.column_char)
+}
+
+/// A canonical temporary project directory holding `files` as `(relative path, contents)`.
+fn temp_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    for (name, contents) in files {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    (dir, root)
+}
+
+/// A complete SyncTeX sidecar (`Unit:1`, no offsets) declaring `inputs` as tags `1..`, with
+/// `sheets[i]` as the body of sheet `i + 1`.
+fn synctex_doc(inputs: &[&Path], sheets: &[&str]) -> String {
+    synctex_doc_unit(1, inputs, sheets)
+}
+
+/// [`synctex_doc`] with an explicit `Unit:`.
+fn synctex_doc_unit(unit: u32, inputs: &[&Path], sheets: &[&str]) -> String {
+    let mut doc = String::from("SyncTeX Version:1\n");
+    for (index, input) in inputs.iter().enumerate() {
+        doc.push_str(&format!("Input:{}:{}\n", index + 1, input.display()));
+    }
+    doc.push_str(&format!(
+        "Output:pdf\nMagnification:1000\nUnit:{unit}\nX Offset:0\nY Offset:0\nContent:\n"
+    ));
+    for (index, body) in sheets.iter().enumerate() {
+        doc.push_str(&format!("{{{page}\n{body}}}{page}\n", page = index + 1));
+    }
+    let records: usize = sheets.iter().map(|body| body.lines().count()).sum();
+    doc.push_str(&format!("Postamble:\nCount:{records}\n"));
+    doc
+}
+
+/// A sheet body: a page vbox at `(tag, line)` holding one text line hbox at `text`, whose
+/// glyph sits at (20pt, 100pt) under `Unit:1`.
+fn text_sheet((tag, line): (u32, u32), (text_tag, text_line): (u32, u32)) -> String {
+    format!(
+        "[{tag},{line}:0,0:30000000,40000000,0\n\
+         ({text_tag},{text_line}:655360,6553600:6553600,655360,0\n\
+         x{text_tag},{text_line}:1310720,6553600\n)\n]\n"
+    )
+}
+
+/// The `(file, line, compiler column)` anchors of raw candidates, without graphics hits.
+fn compiler_anchors(candidates: Vec<RawInverseCandidate>) -> Vec<(String, u32, Option<usize>)> {
+    candidates
+        .into_iter()
+        .map(|candidate| (candidate.file, candidate.line, candidate.compiler_column))
+        .collect()
+}
+
+fn parse_cli_synctex_edit_candidates(output: &str) -> Vec<RawInverseCandidate> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current_file = None::<String>;
+    let mut current_line = None::<u32>;
+    let mut current_column = None::<usize>;
+    let mut flush = |file: &mut Option<String>, line: &mut Option<u32>, col: &mut Option<usize>| {
+        if let (Some(f), Some(l)) = (file.take(), line.take())
+            && !f.is_empty()
+            && l > 0
+        {
+            let compiler_column = col.take().filter(|&c| c > 1);
+            if seen.insert((f.clone(), l, compiler_column)) {
+                results.push(RawInverseCandidate {
+                    file: f,
+                    line: l,
+                    compiler_column,
+                    graphics: None,
+                });
+            }
+        }
+        *file = None;
+        *line = None;
+        *col = None;
+    };
+    for raw in output.lines() {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix("Input:") {
+            flush(&mut current_file, &mut current_line, &mut current_column);
+            current_file = Some(rest.trim().to_owned());
+        } else if let Some(rest) = trimmed.strip_prefix("Line:") {
+            current_line = rest.trim().parse::<u32>().ok();
+        } else if let Some(rest) = trimmed.strip_prefix("Column:") {
+            current_column = rest
+                .trim()
+                .parse::<isize>()
+                .ok()
+                .and_then(|c| usize::try_from(c).ok());
+        } else if trimmed == "SyncTeX result end" {
+            break;
+        }
+    }
+    flush(&mut current_file, &mut current_line, &mut current_column);
+    results
+}
+
+fn resolve_inverse_output(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    operation: &Operation,
+    output: &str,
+    sources: QuerySources,
+) -> io::Result<InverseResolution> {
+    let targets = parse_cli_synctex_edit_candidates(output);
+    let build_directory = sources.sidecar_dir.clone();
+    InverseQuery::new(
+        InverseRequest {
+            pdf,
+            point,
+            word,
+            radius,
+            operation,
+            best_guess: sources.best_guess,
+            build_directory: build_directory.as_deref(),
+        },
+        sources,
+        None,
+    )
+    .resolve_targets(targets)
+}
+
+/// [`resolve_inverse_output`] under a default operation and sources.
+fn inverse_output_at(
+    pdf: &Path,
+    point: InversePoint,
+    word: Option<(&str, usize)>,
+    radius: u32,
+    output: &str,
+) -> io::Result<InverseResolution> {
+    let operation = &Operation::default();
+    resolve_inverse_output(
+        pdf,
+        point,
+        word,
+        radius,
+        operation,
+        output,
+        QuerySources::default(),
+    )
+}
+
+/// `(line, byte_column, precise)` of an inverse result.
+fn spot(result: &InverseResolution) -> (u32, usize, bool) {
+    let location = &result.location;
+    (location.line, location.byte_column, location.precise)
+}
+
+/// [`resolve_forward`] with explicit editor context.
+fn forward_with(
+    pdf: &Path,
+    file: &Path,
+    (line, column): (u32, u32),
+    source: ForwardSource<'_>,
+) -> io::Result<ForwardRequest> {
+    resolve_forward_with_selector(pdf, file, line, column, source, |_, _, _, anchor| {
+        Ok(anchor)
+    })
+}
 
 #[test]
 fn inverse_validation_precedes_io_and_respects_cancellation() {
@@ -7,28 +497,11 @@ fn inverse_validation_precedes_io_and_respects_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let missing = directory.path().join("missing.pdf");
-    let snapshot = directory.path().join("missing.json");
-    let valid = InversePoint {
-        page: 1,
-        x: -1.0,
-        y_from_top: -0.0,
-        page_height_pt: f32::MIN_POSITIVE,
-    };
+    let valid = ipt(1, -1.0, -0.0, f32::MIN_POSITIVE);
     let resolve = |point, operation: &Operation| {
         [
-            resolve_inverse_in(
-                &missing,
-                point,
-                None,
-                1,
-                operation,
-                Some(&snapshot),
-                false,
-                None,
-            ),
-            resolve_inverse_with_cache_in(
-                &missing, point, None, 1, operation, None, false, None, None,
-            ),
+            resolve_inverse(&missing, point, None, 1, operation, false),
+            resolve_inverse_with_cache(&missing, point, None, 1, operation, false, None),
         ]
     };
     for point in [
@@ -72,20 +545,16 @@ fn scaled_graphics_native_selection_keeps_overlay_prose() {
     let graphics = [(3, 50), (4, 100)]
         .map(|(line, x)| {
             format!(
-                concat!(
-                    "(1,{line}:{x},100:30,30,0\n",
-                    "(1,{line}:{x},100:30,30,0\n",
-                    "(1,{line}:{x},100:0,30,0\n",
-                    "(1,{line}:{x},100:0,60,0\n",
-                    "(1,{line}:{x},100:200,60,0\n",
-                    "k1,{line}:{right},100:0\n",
-                    ")\n",
-                    "k1,{line}:{x},100:-200\n",
-                    ")\n)\n)\n)\n",
-                ),
-                line = line,
-                x = x,
-                right = x + 200,
+                "(1,{line}:{x},100:30,30,0\n\
+                 (1,{line}:{x},100:30,30,0\n\
+                 (1,{line}:{x},100:0,30,0\n\
+                 (1,{line}:{x},100:0,60,0\n\
+                 (1,{line}:{x},100:200,60,0\n\
+                 k1,{line}:{right},100:0\n\
+                 )\n\
+                 k1,{line}:{x},100:-200\n\
+                 )\n)\n)\n)\n",
+                right = x + 200
             )
         })
         .join("");
@@ -96,25 +565,14 @@ fn scaled_graphics_native_selection_keeps_overlay_prose() {
             ""
         };
         let synctex = format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:doc.tex\nOutput:pdf\n",
-                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                "{{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n",
-                "{graphics}{prose})\n]\n}}1\nPostamble:\nCount:40\n",
-            ),
-            graphics = graphics,
-            prose = prose,
+            "SyncTeX Version:1\nInput:1:doc.tex\nOutput:pdf\n\
+             Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n\
+             {graphics}{prose})\n]\n}}1\nPostamble:\nCount:40\n"
         );
-        let candidates = inverse_candidates_from_reader(
-            synctex.as_bytes(),
-            InversePoint {
-                page: 1,
-                x: 115.0,
-                y_from_top: 85.0,
-                page_height_pt: 792.0,
-            },
-        )
-        .unwrap();
+        let candidates =
+            inverse_candidates_from_reader(synctex.as_bytes(), ipt(1, 115.0, 85.0, 792.0), false)
+                .unwrap();
         assert_eq!(candidates.len(), 1, "overlay={overlay}: {candidates:?}");
         assert_eq!(candidates[0].file, "doc.tex");
         assert_eq!(candidates[0].line, if overlay { 5 } else { 4 });
@@ -131,34 +589,27 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
             .map(|tag| format!("f{tag}:{x},100\n"))
             .collect();
         format!(
-            concat!(
-                "(1,{line}:{x},100:30,30,0\n",
-                "(1,{line}:{x},100:30,30,0\n",
-                "(1,{line}:{x},100:0,30,0\n",
-                "(1,{line}:{x},100:0,60,0\n",
-                "(1,{line}:{x},100:200,60,0\n",
-                "{leaf}",
-                ")\n",
-                "k1,{line}:{x},100:-200\n",
-                ")\n)\n)\n)\n",
-            ),
-            line = line,
-            x = x,
-            leaf = leaf,
+            "(1,{line}:{x},100:30,30,0\n\
+             (1,{line}:{x},100:30,30,0\n\
+             (1,{line}:{x},100:0,30,0\n\
+             (1,{line}:{x},100:0,60,0\n\
+             (1,{line}:{x},100:200,60,0\n\
+             {leaf}\
+             )\n\
+             k1,{line}:{x},100:-200\n\
+             )\n)\n)\n)\n"
         )
     };
     let document = |forms: &[&[u32]; 2]| {
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
-                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                "{{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n",
-                "{left}{right})\n",
-                "(1,5:10,150:300,10,0\ng1,5:10,150\nx1,5:200,150\n)\n",
-                "]\n}}1\nPostamble:\nCount:40\n",
-            ),
+            "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n\
+             Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,6:0,0:400,792,0\n(1,6:10,100:300,60,0\n\
+             {left}{right})\n\
+             (1,5:10,150:300,10,0\ng1,5:10,150\nx1,5:200,150\n)\n\
+             ]\n}}1\nPostamble:\nCount:40\n",
             left = host(3, 50, forms[0]),
-            right = host(4, 100, forms[1]),
+            right = host(4, 100, forms[1])
         )
     };
     let unclipped = document(&[&[], &[]]);
@@ -171,14 +622,9 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
     ] {
         for fix_cross_file_tags in [false, true] {
             for (x, y, line) in [(60.0, 85.0, 3), (115.0, 85.0, 4), (40.0, 145.0, 5)] {
-                let candidates = inverse_candidates_from_reader_with_options(
+                let candidates = inverse_candidates_from_reader(
                     synctex.as_bytes(),
-                    InversePoint {
-                        page: 1,
-                        x,
-                        y_from_top: y,
-                        page_height_pt: 792.0,
-                    },
+                    ipt(1, x, y, 792.0),
                     fix_cross_file_tags,
                 )
                 .unwrap();
@@ -194,7 +640,6 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
             synctex.as_bytes(),
             Path::new("/tmp/doc.pdf"),
             Path::new("/tmp/doc.tex"),
-            None,
             line,
         )
         .unwrap()
@@ -210,40 +655,28 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
 
     // A defined form still owns its recorded content.
     let defined = format!(
-        concat!(
-            "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
-            "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-            "<7\n(1,9:0,60:200,60,0\nx1,9:200,60\n)\n>\n",
-            "{{1\n[1,6:0,0:400,792,0\n{host}]\n}}1\nPostamble:\nCount:40\n",
-        ),
-        host = host(3, 50, &[7]),
+        "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n\
+         Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+         <7\n(1,9:0,60:200,60,0\nx1,9:200,60\n)\n>\n\
+         {{1\n[1,6:0,0:400,792,0\n{host}]\n}}1\nPostamble:\nCount:40\n",
+        host = host(3, 50, &[7])
     );
-    let candidates = inverse_candidates_from_reader(
-        defined.as_bytes(),
-        InversePoint {
-            page: 1,
-            x: 60.0,
-            y_from_top: 85.0,
-            page_height_pt: 792.0,
-        },
-    )
-    .unwrap();
+    let candidates =
+        inverse_candidates_from_reader(defined.as_bytes(), ipt(1, 60.0, 85.0, 792.0), false)
+            .unwrap();
     assert_eq!(candidates.len(), 1, "{candidates:?}");
     assert_eq!(candidates[0].line, 9);
 
     // The clipped image dispatches to its own filename, ignoring embedded vector text.
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    let source = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "\\includegraphics[clip,width=30pt]{figs/left.pdf}\n",
-        "\\includegraphics[clip,width=30pt]{figs/right.pdf}\n",
-        "Trailing prose.\n",
-        "\\end{document}\n",
-    );
+    let source = "\\documentclass{article}\n\
+                  \\begin{document}\n\
+                  \\includegraphics[clip,width=30pt]{figs/left.pdf}\n\
+                  \\includegraphics[clip,width=30pt]{figs/right.pdf}\n\
+                  Trailing prose.\n\
+                  \\end{document}\n";
     fs::write(&pdf, b"pdf-v1").unwrap();
     fs::write(&tex, source).unwrap();
     fs::write(
@@ -252,32 +685,20 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
     )
     .unwrap();
     for (x, line, filename) in [(60.0, 3, "figs/left.pdf"), (115.0, 4, "figs/right.pdf")] {
-        let hit = resolve_inverse(
-            &pdf,
-            InversePoint {
-                page: 1,
-                x,
-                y_from_top: 85.0,
-                page_height_pt: 792.0,
-            },
-            Some(("Blorf", 0)),
-            2,
-            &Operation::default(),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(hit.location.line, line);
+        let hit = inverse_at(&pdf, ipt(1, x, 85.0, 792.0), Some(("Blorf", 0)), 2, false).unwrap();
         assert_eq!(
-            hit.location.byte_column,
-            source
-                .lines()
-                .nth(line as usize - 1)
-                .unwrap()
-                .find(filename)
-                .unwrap()
+            spot(&hit),
+            (
+                line,
+                source
+                    .lines()
+                    .nth(line as usize - 1)
+                    .unwrap()
+                    .find(filename)
+                    .unwrap(),
+                true
+            )
         );
-        assert!(hit.location.precise);
     }
 }
 
@@ -285,15 +706,10 @@ fn undefined_form_reference_keeps_clipped_graphics_host_identity() {
 fn only_undefined_form_references_leave_their_host_identity_intact() {
     let document = |before: &str, leaf: &str, after: &str| {
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
-                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                "{before}{{1\n[1,1:0,0:400,792,0\n(1,7:100,100:200,60,0\n{leaf})\n]\n}}1\n",
-                "{after}Postamble:\nCount:10\n",
-            ),
-            before = before,
-            leaf = leaf,
-            after = after,
+            "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n\
+             Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+             {before}{{1\n[1,1:0,0:400,792,0\n(1,7:100,100:200,60,0\n{leaf})\n]\n}}1\n\
+             {after}Postamble:\nCount:10\n"
         )
     };
     let forward = |synctex: &str, line: u32, fix_readahead: bool| {
@@ -344,13 +760,9 @@ fn only_undefined_form_references_leave_their_host_identity_intact() {
 fn undefined_form_references_parse_as_if_never_recorded() {
     let document = |content: &str, after: &str| {
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n",
-                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                "{{1\n[1,1:0,0:400,792,0\n{content}]\n}}1\n{after}Postamble:\nCount:20\n",
-            ),
-            content = content,
-            after = after,
+            "SyncTeX Version:1\nInput:1:/tmp/doc.tex\nOutput:pdf\n\
+             Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,1:0,0:400,792,0\n{content}]\n}}1\n{after}Postamble:\nCount:20\n"
         )
     };
     let forward = |synctex: &str, line: u32, fix_readahead: bool| {
@@ -371,23 +783,16 @@ fn undefined_form_references_parse_as_if_never_recorded() {
         .map_err(|error| error.to_string())
     };
     let inverse = |synctex: &str, x: f32, y_from_top: f32, fix_cross_file_tags: bool| {
-        inverse_candidates_from_reader_with_options(
+        inverse_candidates_from_reader(
             synctex.as_bytes(),
-            InversePoint {
-                page: 1,
-                x,
-                y_from_top,
-                page_height_pt: 792.0,
-            },
+            ipt(1, x, y_from_top, 792.0),
             fix_cross_file_tags,
         )
         .map_err(|error| error.to_string())
     };
     let hbox = |body: &str| format!("(1,7:100,100:200,60,0\n{body})\n");
-    let ancestor = concat!(
-        "(1,50:10,100:300,60,0\n(1,7:100,100:30,10,0\nf9:100,100\nx1,7:130,100\n)\n",
-        "k1,100:140,100:10\ng1,100:150,100\n)\n",
-    );
+    let ancestor = "(1,50:10,100:300,60,0\n(1,7:100,100:30,10,0\nf9:100,100\nx1,7:130,100\n)\n\
+                    k1,100:140,100:10\ng1,100:150,100\n)\n";
     let definition = "<1\n(1,5:0,60:200,60,0\nx1,5:200,60\n)\n>\n";
     let reference = "f9:100,100\n";
     for (with_reference, after) in [
@@ -449,15 +854,10 @@ fn same_line_text_over_graphics_keeps_its_word() {
     // Natural inner boxes overlap the next image, as in a scaled `\includegraphics`.
     let graphic = |line: u32, x: u32, leaf: String| {
         format!(
-            concat!(
-                "(1,{line}:{x},100:30,30,0\n(1,{line}:{x},100:30,30,0\n",
-                "(1,{line}:{x},100:0,30,0\n(1,{line}:{x},100:0,60,0\n",
-                "(1,{line}:{x},100:200,60,0\n{leaf})\n",
-                "k1,{line}:{x},100:-200\n)\n)\n)\n)\n",
-            ),
-            line = line,
-            x = x,
-            leaf = leaf,
+            "(1,{line}:{x},100:30,30,0\n(1,{line}:{x},100:30,30,0\n\
+             (1,{line}:{x},100:0,30,0\n(1,{line}:{x},100:0,60,0\n\
+             (1,{line}:{x},100:200,60,0\n{leaf})\n\
+             k1,{line}:{x},100:-200\n)\n)\n)\n)\n"
         )
     };
     let plain = |line: u32, x: u32| graphic(line, x, format!("k1,{line}:{},100:0\n", x + 200));
@@ -468,19 +868,15 @@ fn same_line_text_over_graphics_keeps_its_word() {
             x + 30
         )
     };
-    let separate = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "\\includegraphics[width=30pt]{figs/left.pdf}\n",
-        "\\includegraphics[width=30pt]{figs/right.pdf}\\llap{Overlay text}\n",
-        "\\end{document}\n",
-    );
-    let same_line = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "\\includegraphics[width=30pt]{figs/a.pdf}\\includegraphics[width=30pt]{figs/b.pdf}\\llap{Overlay text}\n",
-        "\\end{document}\n",
-    );
+    let separate = "\\documentclass{article}\n\
+                    \\begin{document}\n\
+                    \\includegraphics[width=30pt]{figs/left.pdf}\n\
+                    \\includegraphics[width=30pt]{figs/right.pdf}\\llap{Overlay text}\n\
+                    \\end{document}\n";
+    let same_line = "\\documentclass{article}\n\
+                     \\begin{document}\n\
+                     \\includegraphics[width=30pt]{figs/a.pdf}\\includegraphics[width=30pt]{figs/b.pdf}\\llap{Overlay text}\n\
+                     \\end{document}\n";
     let word = Some("Overlay text");
     let vector = Some("Blorf");
     for (source, body, clicks) in [
@@ -512,39 +908,26 @@ fn same_line_text_over_graphics_keeps_its_word() {
             ],
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let (_dir, root) = temp_project(&[("doc.pdf", "pdf-v1"), ("doc.tex", source)]);
         let pdf = root.join("doc.pdf");
         let tex = root.join("doc.tex");
-        fs::write(&pdf, b"pdf-v1").unwrap();
-        fs::write(&tex, source).unwrap();
         fs::write(
             pdf.with_extension("synctex"),
             format!(
-                concat!(
-                    "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
-                    "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                    "{{1\n[1,2:0,0:400,792,0\n(1,2:10,100:300,60,0\n{body})\n]\n}}1\n",
-                    "Postamble:\nCount:40\n",
-                ),
-                tex = tex.display(),
-                body = body,
+                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n\
+                 Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+                 {{1\n[1,2:0,0:400,792,0\n(1,2:10,100:300,60,0\n{body})\n]\n}}1\n\
+                 Postamble:\nCount:40\n",
+                tex = tex.display()
             ),
         )
         .unwrap();
         for (x, y, context, line, needle) in clicks {
-            let hit = resolve_inverse(
+            let hit = inverse_at(
                 &pdf,
-                InversePoint {
-                    page: 1,
-                    x,
-                    y_from_top: y,
-                    page_height_pt: 792.0,
-                },
+                ipt(1, x, y, 792.0),
                 context.map(|context| (context, 0)),
                 2,
-                &Operation::default(),
-                None,
                 false,
             )
             .unwrap();
@@ -593,17 +976,9 @@ fn printing_overrides_of_reference_wrappers_do_not_own_their_text() {
                 Some((4, label)),
                 "{body} {word}"
             );
-            let guess = source_word_guess_with_sources(
-                &source,
-                4,
-                context,
-                offset,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            );
+            let guess = guess(&source, 4, context, offset, 2);
             assert!(
-                !matches!(guess, Ok(Some(location)) if location.line == 4 && location.byte == label),
+                !matches!(guess, WordOutcome::Located(4, b) if b == label),
                 "{body} {word}"
             );
         }
@@ -710,39 +1085,26 @@ fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
         let source = format!(
             "\\documentclass{{beamer}}\n\\begin{{document}}\n{header}\n\\end{{frame}}\n\\end{{document}}\n"
         );
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let (_dir, root) = temp_project(&[("doc.pdf", "pdf-v1"), ("doc.tex", &source)]);
         let pdf = root.join("doc.pdf");
         let tex = root.join("doc.tex");
-        fs::write(&pdf, b"pdf-v1").unwrap();
-        fs::write(&tex, &source).unwrap();
         fs::write(
             pdf.with_extension("synctex"),
             format!(
-                concat!(
-                    "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
-                    "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                    "{{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,100:300,10,0\n",
-                    "g1,{anchor}:10,100\nx1,{anchor}:310,100\n)\n]\n}}1\n",
-                    "Postamble:\nCount:10\n",
-                ),
-                tex = tex.display(),
-                anchor = anchor,
+                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n\
+                 Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+                 {{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,100:300,10,0\n\
+                 g1,{anchor}:10,100\nx1,{anchor}:310,100\n)\n]\n}}1\n\
+                 Postamble:\nCount:10\n",
+                tex = tex.display()
             ),
         )
         .unwrap();
-        let hit = resolve_inverse(
+        let hit = inverse_at(
             &pdf,
-            InversePoint {
-                page: 1,
-                x: 50.0,
-                y_from_top: 95.0,
-                page_height_pt: 792.0,
-            },
+            ipt(1, 50.0, 95.0, 792.0),
             Some((context, 0)),
             2,
-            &Operation::default(),
-            None,
             false,
         )
         .unwrap();
@@ -765,49 +1127,12 @@ fn frame_options_do_not_own_printed_words_but_titles_keep_theirs() {
                 "{header}: {:?}",
                 hit.location
             );
-            let guess = source_word_guess_with_sources(
-                &source,
-                anchor,
-                context,
-                0,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            );
+            let guess = guess(&source, anchor, context, 0, 2);
             assert!(
-                !matches!(guess, Ok(Some(location)) if location.line == line && span.contains(&location.byte)),
+                !matches!(guess, WordOutcome::Located(l, byte) if l == line && span.contains(&byte)),
                 "{header}"
             );
         }
-    }
-}
-
-#[test]
-fn compatible_columns_do_not_require_macro_execution_classification() {
-    let directory = tempfile::tempdir().unwrap();
-    let pdf = directory.path().join("gnimble.pdf");
-    let file = directory.path().join("gnimble.tex");
-    for newline in ["\n", "\r\n"] {
-        let source = [
-            r"\documentclass{beamer}",
-            r"\newcommand{\zoggle}[1]{\ifnum#1>0 \expandafter\def\csname bimble#1\endcsname{}\expandafter\zoggle\expandafter{\number\numexpr#1-1\relax}\fi}",
-            r"\zoggle{2}",
-            r"\begin{document}",
-            r"\begin{frame}{Zibble}",
-            "Frumple snazzling zoggle.",
-            r"\end{frame}",
-            r"\end{document}",
-        ].join(newline);
-        fs::write(&file, source).unwrap();
-        let result = inverse_output(
-            &pdf,
-            "Input: gnimble.tex\nLine: 7\n",
-            Some(("Frumple snazzling zoggle.", 8)),
-        )
-        .unwrap();
-        assert_eq!(result.location.line, 6);
-        assert_eq!(result.location.byte_column, 8);
-        assert!(result.location.precise);
     }
 }
 
@@ -820,24 +1145,15 @@ fn incompatible_neighboring_word_keeps_the_native_line() {
         "Frumple snazzling zoggle.\nBrindle wuzzling troggle.\n",
     )
     .unwrap();
-    let result = resolve_inverse_output(
+    let result = inverse_output_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 72.0,
-            y_from_top: 120.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 72.0, 120.0, 792.0),
         Some(("Frumple snazzling zoggle.", 8)),
         3,
-        &Operation::default(),
         "Input: gnimble.tex\nLine: 2\n",
-        QuerySources::default(),
     )
     .unwrap();
-    assert_eq!(result.location.line, 2);
-    assert_eq!(result.location.byte_column, 0);
-    assert!(!result.location.precise);
+    assert_eq!(spot(&result), (2, 0, false));
 }
 
 #[test]
@@ -891,12 +1207,7 @@ fn inverse_title_refinement_stays_native_supported() {
         for y_from_top in [10.0, 228.0] {
             let result = resolve_inverse_output(
                 &pdf,
-                InversePoint {
-                    page: 1,
-                    x: 72.0,
-                    y_from_top,
-                    page_height_pt: 272.0,
-                },
+                ipt(1, 72.0, y_from_top, 272.0),
                 Some((context, context.find("Fluid").unwrap())),
                 4,
                 &Operation::default(),
@@ -905,11 +1216,7 @@ fn inverse_title_refinement_stays_native_supported() {
             )
             .unwrap();
             assert_eq!(
-                (
-                    result.location.line,
-                    result.location.byte_column,
-                    result.location.precise,
-                ),
+                spot(&result),
                 expected,
                 "body={body}, y_from_top={y_from_top}",
             );
@@ -939,11 +1246,11 @@ fn caption_review_unbraced_short_brackets_do_not_own_adjacent_prose() {
     let source = "\\caption[short[inner]]{first\nsecond}";
     let column = source.find("first").unwrap() as u32 + 1;
     assert_eq!(collected_text_closing_line(source, 1, column), None);
-    assert_eq!(math::collected_text_lines(source, 2), None);
+    assert_eq!(collected_text_lines(source, 2), None);
     let source = "\\caption[{short[inner]}]{first\nsecond}";
     let column = source.find("first").unwrap() as u32 + 1;
     assert_eq!(collected_text_closing_line(source, 1, column), Some(2));
-    assert_eq!(math::collected_text_lines(source, 2), Some(0..2));
+    assert_eq!(collected_text_lines(source, 2), Some(0..2));
 }
 
 #[test]
@@ -975,18 +1282,18 @@ fn inverse_line_leading_word_retains_native_readahead_anchor() {
                   turnip barrow with inline $V$ beside damp gravel nudges an\n\
                   brambling porridges teakettle:";
     assert_eq!(
-        tex::source_word_location(source, 2, "brambling", 0, 12),
+        source_word_location(source, 2, "brambling", 0, 12),
         Some((3, 0)),
     );
     assert_eq!(source_word_compiler_line(source, 3, 1), 2);
     assert_eq!(source_word_compiler_line(source, 2, 1), 1);
     assert_eq!(source_word_compiler_line(source, 3, 11), 3);
     assert_eq!(
-        tex::line_start_word_compiler_line("Prior prose\n  Café next", 2, 3),
+        line_start_word_compiler_line("Prior prose\n  Café next", 2, 3),
         Some(1)
     );
     assert_eq!(
-        tex::line_start_word_compiler_line("Pewter $R_\\star$ nudges an\nbrambling teapot", 2, 1),
+        line_start_word_compiler_line("Pewter $R_\\star$ nudges an\nbrambling teapot", 2, 1),
         Some(1)
     );
     for (source, line, column) in [
@@ -1017,10 +1324,7 @@ fn inverse_line_leading_word_retains_native_readahead_anchor() {
         ("Prior prose\nbrambling porridges", 2, 11),
         ("Prior prose\n\\command brambling", 2, 10),
     ] {
-        assert_eq!(
-            tex::line_start_word_compiler_line(source, line, column),
-            None
-        );
+        assert_eq!(line_start_word_compiler_line(source, line, column), None);
     }
 }
 
@@ -1043,7 +1347,7 @@ fn multiline_formatting_uses_collected_scope_without_losing_outer_boundaries() {
         let column = source[..byte].chars().count() as u32 + 1;
         assert_eq!(source_word_compiler_line(&source, 1, column), 2);
         assert_eq!(
-            tex::source_word_location(&source, 2, "Snazzles", 0, 0),
+            source_word_location(&source, 2, "Snazzles", 0, 0),
             Some((1, byte)),
         );
     }
@@ -1078,28 +1382,19 @@ fn multiline_formatting_uses_collected_scope_without_losing_outer_boundaries() {
     }
     let source = "\\begin{frame}\nSnazzles only.\n\\textbf{Copper\nNickel}\\end{frame}";
     assert_eq!(
-        tex::source_word_location(source, 4, "Snazzles", 0, 0),
+        source_word_location(source, 4, "Snazzles", 0, 0),
         Some((2, 0)),
     );
     let adjoining = "\\textbf{Snazzles frobnitz\nquux}\\begin{tabularx}{\\linewidth}{X}\nCopper\\\\\n\\end{tabularx}";
     assert_eq!(
-        tex::source_word_location(adjoining, 2, "frobnitz", 0, 0),
+        source_word_location(adjoining, 2, "frobnitz", 0, 0),
         Some((1, adjoining.find("frobnitz").unwrap())),
     );
     assert_eq!(
-        tex::source_word_location("\\textbf{Snazzles\nSnazzles}", 1, "Snazzles", 0, 4),
+        source_word_location("\\textbf{Snazzles\nSnazzles}", 1, "Snazzles", 0, 4),
         Some((1, 8)),
     );
-    let quoted = "\\csname string\\endcsname Zephyr";
-    assert_eq!(
-        tex::source_word_location(quoted, 1, "Zephyr", 0, 0),
-        Some((1, quoted.find("Zephyr").unwrap())),
-    );
     for source in [
-        "\\string\\textbf{Snazzles\nWazzit}",
-        "\\noexpand\\textbf{Snazzles\nWazzit}",
-        "\\csname string\\endcsname\\textbf{Snazzles\nWazzit}",
-        "\\csname noexpand\\endcsname\\textbf{Snazzles\nWazzit}",
         "\\mathord{Snazzles\nWazzit}",
         "\\mathrel{Snazzles\nWazzit}",
         "\\mathop{Snazzles\nWazzit}",
@@ -1109,14 +1404,10 @@ fn multiline_formatting_uses_collected_scope_without_losing_outer_boundaries() {
         "\\textbf{Snazzles",
     ] {
         let byte = source.find("Snazzles").unwrap();
-        assert_eq!(
-            math::collected_text_argument_at(source, byte),
-            None,
-            "{source}"
-        );
-        assert_eq!(math::collected_text_lines(source, 1), None, "{source}");
+        assert_eq!(collected_text_argument_at(source, byte), None, "{source}");
+        assert_eq!(collected_text_lines(source, 1), None, "{source}");
     }
-    assert_eq!(math::collected_text_lines("\\textbf{Snazzles}", 1), None);
+    assert_eq!(collected_text_lines("\\textbf{Snazzles}", 1), None);
 }
 
 #[test]
@@ -1128,20 +1419,7 @@ fn environment_identifiers_are_not_literal_output_but_titles_remain_visible() {
         ("snazzling", Some((1, source.find("snazzling").unwrap()))),
         ("wazzit", Some((2, 8))),
     ] {
-        assert_eq!(
-            tex::source_word_location_with_sources(
-                source,
-                1,
-                word,
-                0,
-                4,
-                &[],
-                &Operation::default(),
-            )
-            .map(WordOutcome::location),
-            Ok(expected),
-            "{word}",
-        );
+        assert_eq!(strict(source, 1, word, 0, 4).location(), expected, "{word}",);
     }
 }
 
@@ -1156,13 +1434,13 @@ fn run_in_heading_aliases_skip_labels_but_not_literal_commands() {
         let source = format!("\\subparagraph*{{Café Snazzles}}{prefix}\nBody text.");
         let column = source[..source.find("Snazzles").unwrap()].chars().count() as u32 + 1;
         assert_eq!(
-            tex::run_in_heading_compiler_line(&source, 1, column),
+            run_in_heading_compiler_line(&source, 1, column),
             Some(source.lines().count() as u32),
             "{source}",
         );
     }
     assert_eq!(
-        tex::run_in_heading_compiler_line(
+        run_in_heading_compiler_line(
             "\\paragraph X\nFirst body.\n\n\\paragraph{Snazzles}\nSecond body.",
             4,
             12,
@@ -1171,7 +1449,6 @@ fn run_in_heading_aliases_skip_labels_but_not_literal_commands() {
     );
     for source in [
         "\\verb|\\subparagraph*{Snazzles}|\nBody text.",
-        "\\string\\subparagraph*{Snazzles}\nBody text.",
         "\\begin{verbatim}\n\\subparagraph*{Snazzles}\nBody text.\n\\end{verbatim}",
         "% \\subparagraph*{Snazzles}\nBody text.",
         "\\subparagraph*{Snazzles}\n\\end{document}",
@@ -1181,7 +1458,7 @@ fn run_in_heading_aliases_skip_labels_but_not_literal_commands() {
         let row_start = source[..at].rfind('\n').map_or(0, |at| at + 1);
         let column = source[row_start..at].chars().count() as u32 + 1;
         assert_eq!(
-            tex::run_in_heading_compiler_line(source, line, column),
+            run_in_heading_compiler_line(source, line, column),
             None,
             "{source}"
         );
@@ -1288,17 +1565,11 @@ fn forward_caption_anchor_excludes_nonprinting_and_opaque_source() {
 
 #[test]
 fn explicit_inverse_guess_preserves_compiled_coordinates_and_warns_on_ambiguity() {
-    let root = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(root.path()).unwrap();
+    let (_root_dir, root) = temp_project(&[]);
     let source = root.join("edited.tex");
     fs::write(&source, "only one current line\n").unwrap();
     let pdf = root.join("paper.pdf");
-    let point = InversePoint {
-        page: 1,
-        x: 10.0,
-        y_from_top: 20.0,
-        page_height_pt: 100.0,
-    };
+    let point = ipt(1, 10.0, 20.0, 100.0);
     let output = format!(
         "Input:{}\nLine:9\nInput:{}\nLine:12\n",
         source.display(),
@@ -1328,33 +1599,14 @@ fn explicit_inverse_guess_preserves_compiled_coordinates_and_warns_on_ambiguity(
     );
     assert!(!guessed.location.precise);
     assert!(guessed.warning.unwrap().contains("multiple coarse"));
-    assert!(
-        resolve_inverse_output(
-            &pdf,
-            point,
-            None,
-            4,
-            &Operation::default(),
-            &output,
-            QuerySources::default(),
-        )
-        .is_err()
-    );
+    assert!(inverse_output_at(&pdf, point, None, 4, &output).is_err());
     fs::write(&source, "current source line\n".repeat(12)).unwrap();
     assert!(
-        resolve_inverse_output(
-            &pdf,
-            point,
-            None,
-            4,
-            &Operation::default(),
-            &output,
-            QuerySources::default(),
-        )
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("multiple coarse")
+        inverse_output_at(&pdf, point, None, 4, &output)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("multiple coarse")
     );
     let operation = Operation::default();
     operation.cancel();
@@ -1395,31 +1647,22 @@ fn inverse_word_matching_resolves_context_and_utf8_byte_columns() {
     let source = "A repeated word far away.\nÉmile uses \\emph{repeated} words near fields.\nRepeated noise.\n";
     let context = "Émile uses repeated words near ﬁelds.";
     assert_eq!(
-        super::source_word_location(source, 2, context, context.find("repeated").unwrap(), 4),
+        word_at(source, 2, context, "repeated", 4),
         Some((2, source.lines().nth(1).unwrap().find("repeated").unwrap()))
     );
     assert_eq!(
-        super::source_word_location(source, 3, context, context.find("ﬁelds").unwrap(), 4),
+        word_at(source, 3, context, "ﬁelds", 4),
         Some((2, source.lines().nth(1).unwrap().find("fields").unwrap()))
     );
-    assert_eq!(
-        super::source_word_location("word word", 1, "word", 1, 4),
-        None
-    );
-    assert_eq!(
-        super::source_word_location("\\word % word", 1, "word", 1, 4),
-        None
-    );
-    assert_eq!(
-        super::source_word_location("word", 1, "missing", 1, 4),
-        None
-    );
+    assert_eq!(source_word_location("word word", 1, "word", 1, 4), None);
+    assert_eq!(source_word_location("\\word % word", 1, "word", 1, 4), None);
+    assert_eq!(source_word_location("word", 1, "missing", 1, 4), None);
     let boundary = "one\ntwo\nthree\nfour\nfive\nsix";
     assert_eq!(
-        super::source_word_location(boundary, 1, "five", 1, 4),
+        source_word_location(boundary, 1, "five", 1, 4),
         Some((5, 0))
     );
-    assert_eq!(super::source_word_location(boundary, 1, "six", 1, 4), None);
+    assert_eq!(source_word_location(boundary, 1, "six", 1, 4), None);
 }
 
 #[test]
@@ -1488,7 +1731,7 @@ fn inverse_title_words_prefer_the_frame_header_when_body_repeats_them() {
                   \\end{frame}";
     let context = "Primary Topic\r\nA small example\r\nTheorem";
     assert_eq!(
-        source_word_location(source, 4, context, context.find("A small").unwrap(), 4),
+        word_at(source, 4, context, "A small", 4),
         Some((
             1,
             source.lines().next().unwrap().find("{A small").unwrap() + 1
@@ -1503,7 +1746,7 @@ fn inverse_heading_matches_tex_accent_and_pdf_unicode() {
                   \\end{frame}";
     let context = "A note on Žora’s method";
     assert_eq!(
-        source_word_location(source, 3, context, context.find('Ž').unwrap(), 4),
+        word_at(source, 3, context, "Ž", 4),
         Some((1, source.lines().next().unwrap().find("Zora").unwrap()))
     );
 }
@@ -1516,7 +1759,7 @@ fn inverse_literal_words_inside_boxed_math_keep_their_source_spans() {
                   \\end{frame}";
     let context = "Example\r\nVisible sentence inside the box.";
     assert_eq!(
-        source_word_location(source, 4, context, context.find("Visible").unwrap(), 4),
+        word_at(source, 4, context, "Visible", 4),
         Some((2, source.lines().nth(1).unwrap().find("Visible").unwrap()))
     );
 }
@@ -1528,10 +1771,7 @@ fn inverse_prose_word_does_not_match_inside_longer_math_word() {
                   $\\mathrm{constant}(x)$ $\\custom{q}$\n\
                   \\end{frame}";
     let context = "Pick an option here. constant(x)";
-    assert_eq!(
-        source_word_location(source, 4, context, context.find("an option").unwrap(), 4),
-        Some((2, 5))
-    );
+    assert_eq!(word_at(source, 4, context, "an option", 4), Some((2, 5)));
 }
 
 #[test]
@@ -1542,7 +1782,7 @@ fn inverse_caption_word_ignores_image_filename() {
                   \\end{frame}";
     let context = "Figure 1: Sample red blue boxes.";
     assert_eq!(
-        source_word_location(source, 4, context, context.find("red").unwrap(), 4),
+        word_at(source, 4, context, "red", 4),
         Some((3, source.lines().nth(2).unwrap().find("red").unwrap()))
     );
     assert_eq!(source_word_location(source, 4, "assets", 0, 4), None);
@@ -1609,19 +1849,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             "strict failed for {needle}"
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                source,
-                2,
-                context,
-                offset,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 2,
-                byte: target_byte,
-            })),
+            guess(source, 2, context, offset, 2),
+            WordOutcome::Located(2, target_byte),
             "guess failed for {needle}"
         );
     }
@@ -1638,19 +1867,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             "multiline token {token}"
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                multiline,
-                3,
-                multi_ctx,
-                offset,
-                3,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 2,
-                byte: first_byte,
-            })),
+            guess(multiline, 3, multi_ctx, offset, 3),
+            WordOutcome::Located(2, first_byte),
             "multiline guess token {token}"
         );
     }
@@ -1659,7 +1877,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         .count() as u32
         + 1;
     assert_eq!(
-        tex::reference_argument_closing_line(multiline, 2, col_char),
+        reference_argument_closing_line(multiline, 2, col_char),
         Some(3)
     );
 
@@ -1679,19 +1897,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             "custom format token {token}"
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                custom_format,
-                2,
-                custom_ctx,
-                offset,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 2,
-                byte: custom_byte,
-            })),
+            guess(custom_format, 2, custom_ctx, offset, 1),
+            WordOutcome::Located(2, custom_byte),
             "custom format guess token {token}"
         );
     }
@@ -1701,11 +1908,11 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let cite_ctx = "Note [7] before section 1 done.";
     let cite_ref_byte = cite_src.find("sec:alpha").unwrap();
     assert_ne!(
-        source_word_location(cite_src, 1, cite_ctx, cite_ctx.find('7').unwrap(), 1),
+        word_at(cite_src, 1, cite_ctx, "7", 1),
         Some((1, cite_ref_byte))
     );
     assert_eq!(
-        source_word_location(cite_src, 1, cite_ctx, cite_ctx.find("section").unwrap(), 1),
+        word_at(cite_src, 1, cite_ctx, "section", 1),
         Some((1, cite_ref_byte))
     );
 
@@ -1725,15 +1932,15 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let cap_ctx = "Figure 1: Caption before section 1 done.";
     let cap_ref_byte = cap_src.find("sec:alpha").unwrap();
     assert_ne!(
-        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("Figure").unwrap(), 1),
+        word_at(cap_src, 1, cap_ctx, "Figure", 1),
         Some((1, cap_ref_byte))
     );
     assert_ne!(
-        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("1:").unwrap(), 1),
+        word_at(cap_src, 1, cap_ctx, "1:", 1),
         Some((1, cap_ref_byte))
     );
     assert_eq!(
-        source_word_location(cap_src, 1, cap_ctx, cap_ctx.find("section").unwrap(), 1),
+        word_at(cap_src, 1, cap_ctx, "section", 1),
         Some((1, cap_ref_byte))
     );
 
@@ -1742,15 +1949,15 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let thm_ctx = "Theorem 1. Claim before section 1 done.";
     let thm_ref_byte = thm_src.lines().nth(1).unwrap().find("sec:alpha").unwrap();
     assert_ne!(
-        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("Theorem").unwrap(), 1),
+        word_at(thm_src, 2, thm_ctx, "Theorem", 1),
         Some((2, thm_ref_byte))
     );
     assert_ne!(
-        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("1.").unwrap(), 1),
+        word_at(thm_src, 2, thm_ctx, "1.", 1),
         Some((2, thm_ref_byte))
     );
     assert_eq!(
-        source_word_location(thm_src, 2, thm_ctx, thm_ctx.find("section").unwrap(), 1),
+        word_at(thm_src, 2, thm_ctx, "section", 1),
         Some((2, thm_ref_byte))
     );
 
@@ -1760,7 +1967,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let lit_word_byte = lit_src.find("section").unwrap();
     let lit_ref_byte = lit_src.find("sec:alpha").unwrap();
     assert_eq!(
-        source_word_location(lit_src, 1, lit_ctx, lit_ctx.find("section").unwrap(), 1),
+        word_at(lit_src, 1, lit_ctx, "section", 1),
         Some((1, lit_word_byte))
     );
     assert_eq!(
@@ -1768,7 +1975,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((1, lit_ref_byte))
     );
     assert_eq!(
-        source_word_location(lit_src, 1, lit_ctx, lit_ctx.find('1').unwrap(), 1),
+        word_at(lit_src, 1, lit_ctx, "1", 1),
         Some((1, lit_ref_byte))
     );
 
@@ -1777,11 +1984,11 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let para_ctx = "Paragraph ends at section 1. Next paragraph starts here.";
     let para_ref_byte = para_src.lines().next().unwrap().find("sec:alpha").unwrap();
     assert_eq!(
-        source_word_location(para_src, 1, para_ctx, para_ctx.find("section").unwrap(), 1),
+        word_at(para_src, 1, para_ctx, "section", 1),
         Some((1, para_ref_byte))
     );
     assert_eq!(
-        source_word_location(para_src, 1, para_ctx, para_ctx.find('1').unwrap(), 1),
+        word_at(para_src, 1, para_ctx, "1", 1),
         Some((1, para_ref_byte))
     );
 
@@ -1806,13 +2013,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((3, second_ref_byte))
     );
     assert_eq!(
-        source_word_location(
-            twoline_src,
-            3,
-            twoline_ctx,
-            twoline_ctx.find('2').unwrap(),
-            1
-        ),
+        word_at(twoline_src, 3, twoline_ctx, "2", 1),
         Some((3, second_ref_byte))
     );
 
@@ -1821,35 +2022,15 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let ref_before_cite_ctx = "Note section 1 before [7] done.";
     let ref_before_cite_byte = ref_before_cite.find("sec:alpha").unwrap();
     assert_eq!(
-        source_word_location(
-            ref_before_cite,
-            1,
-            ref_before_cite_ctx,
-            ref_before_cite_ctx.find('7').unwrap(),
-            1
-        ),
+        word_at(ref_before_cite, 1, ref_before_cite_ctx, "7", 1),
         None
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            ref_before_cite,
-            1,
-            ref_before_cite_ctx,
-            ref_before_cite_ctx.find('7').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
+        guess_at(ref_before_cite, 1, ref_before_cite_ctx, "7", 1),
+        WordOutcome::Absent
     );
     assert_eq!(
-        source_word_location(
-            ref_before_cite,
-            1,
-            ref_before_cite_ctx,
-            ref_before_cite_ctx.find("section").unwrap(),
-            1
-        ),
+        word_at(ref_before_cite, 1, ref_before_cite_ctx, "section", 1),
         Some((1, ref_before_cite_byte))
     );
 
@@ -1865,26 +2046,12 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
     let invalid_then_valid_ctx = "Lead section 1 middle section 2 tail.";
     let valid_second_byte = invalid_then_valid.find("sec:second").unwrap();
     assert_eq!(
-        source_word_location(
-            invalid_then_valid,
-            1,
-            invalid_then_valid_ctx,
-            invalid_then_valid_ctx.find("section").unwrap(),
-            1
-        ),
+        word_at(invalid_then_valid, 1, invalid_then_valid_ctx, "section", 1),
         None
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            invalid_then_valid,
-            1,
-            invalid_then_valid_ctx,
-            invalid_then_valid_ctx.find("section").unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
+        guess_at(invalid_then_valid, 1, invalid_then_valid_ctx, "section", 1),
+        WordOutcome::Absent
     );
     assert_eq!(
         source_word_location(
@@ -1912,13 +2079,7 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         .find("sec:two")
         .unwrap();
     assert_eq!(
-        source_word_location(
-            adj_lines_src,
-            1,
-            adj_lines_ctx,
-            adj_lines_ctx.find("section").unwrap(),
-            1
-        ),
+        word_at(adj_lines_src, 1, adj_lines_ctx, "section", 1),
         Some((1, adj_one_byte))
     );
     assert_eq!(
@@ -1932,348 +2093,25 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((2, adj_two_byte))
     );
 
-    // Repeated-neighbor occurrence alignment: citations, filtered references, math, and two-reference segments
-    // with identical surrounding flanks must not be stolen by a reference.
-    let rep_cite_src = "By \\cref{sec:a} then \\\\ By \\cite{key} then.\n";
-    let rep_cite_ctx = "By section 1 then By [7] then.";
-    let rep_cite_offset = rep_cite_ctx.find('7').unwrap();
-    assert_eq!(
-        source_word_location(rep_cite_src, 1, rep_cite_ctx, rep_cite_offset, 1),
-        None
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            rep_cite_src,
-            1,
-            rep_cite_ctx,
-            rep_cite_offset,
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
-    );
-    assert_eq!(
-        source_word_location(rep_cite_src, 1, "By [7] then.", 4, 1),
-        None
-    );
-
-    let frame_cite_src =
-        "\\begin{frame}\nBy \\cref{sec:a} then.\n\nBy \\cite{key} then.\n\\end{frame}\n";
-    let frame_cite_ctx = "By section 1 then. By [7] then.";
-    assert_eq!(
-        source_word_location(
-            frame_cite_src,
-            5,
-            frame_cite_ctx,
-            frame_cite_ctx.find('7').unwrap(),
-            4
-        ),
-        None
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            frame_cite_src,
-            5,
-            frame_cite_ctx,
-            frame_cite_ctx.find('7').unwrap(),
-            4,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
-    );
-
-    let tabx_src = "\\begin{tabularx}{\\linewidth}{lll}\nYes & \\cref{sec:a} & ok \\\\\nYes & \\cite{key} & ok \\\\\n\\end{tabularx}\n";
-    let tabx_ctx = "Yes section 1 ok Yes [7] ok";
-    assert_eq!(
-        source_word_location(tabx_src, 4, tabx_ctx, tabx_ctx.find('7').unwrap(), 4),
-        None
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            tabx_src,
-            4,
-            tabx_ctx,
-            tabx_ctx.find('7').unwrap(),
-            4,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
-    );
-
-    let rep_filtered_src = "By \\cref{sec:a} then \\\\ By \\cref{\\keymacro} then.\n";
-    let rep_filtered_ctx = "By section 1 then By section 2 then.";
-    assert_eq!(
-        source_word_location(
-            rep_filtered_src,
-            1,
-            rep_filtered_ctx,
-            rep_filtered_ctx.rfind("section").unwrap(),
-            1
-        ),
-        None
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            rep_filtered_src,
-            1,
-            rep_filtered_ctx,
-            rep_filtered_ctx.rfind("section").unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None)
-    );
-
-    let rep_math_src = "By \\cref{sec:a} then \\\\ By $\\alpha$ then.\n";
-    let rep_math_ctx = "By section 1 then By α then.";
-    let rep_math_byte = rep_math_src.find("\\alpha").unwrap();
-    assert_eq!(
-        source_word_location(
-            rep_math_src,
-            1,
-            rep_math_ctx,
-            rep_math_ctx.find('α').unwrap(),
-            1
-        ),
-        Some((1, rep_math_byte))
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            rep_math_src,
-            1,
-            rep_math_ctx,
-            rep_math_ctx.find('α').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 1,
-            byte: rep_math_byte,
-        }))
-    );
-
-    let frame_and_src = "\\begin{frame}\nBy \\cref{sec:a} then\n\nBy \\cref{sec:b} and \\cref{sec:c} then\n\\end{frame}\n";
-    let frame_and_ctx = "By section 1 then By section 2 and section 3 then";
-    let frame_and_byte = frame_and_src.lines().nth(3).unwrap().find("and").unwrap();
-    assert_eq!(
-        source_word_location(
-            frame_and_src,
-            5,
-            frame_and_ctx,
-            frame_and_ctx.find("and").unwrap(),
-            4
-        ),
-        Some((4, frame_and_byte))
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            frame_and_src,
-            5,
-            frame_and_ctx,
-            frame_and_ctx.find("and").unwrap(),
-            4,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 4,
-            byte: frame_and_byte,
-        }))
-    );
-
-    let para_start_rep_src =
-        "Use the \\cref{sec:a} as the base. Use the \\cite{key} as the base.\n";
-    let para_start_rep_ctx = "Use the section 1 as the base. Use the [7] as the base.";
-    assert_eq!(
-        source_word_location(
-            para_start_rep_src,
-            1,
-            para_start_rep_ctx,
-            para_start_rep_ctx.find('7').unwrap(),
-            1
-        ),
-        None
-    );
-    assert!(matches!(
-        source_word_guess_with_sources(
-            para_start_rep_src,
-            1,
-            para_start_rep_ctx,
-            para_start_rep_ctx.find('7').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
-    ));
-
-    // Zero-word source slots paired with mixed generated+literal segments must not shift ordinals or steal literals.
-    let ord_shift_src =
-        "By \\rule{1em}{1pt} then \\\\ By \\cref{sec:a} then \\\\ By \\cite{key} too then.\n";
-    let ord_shift_ctx = "By [7] too then.";
-    let ord_too_byte = ord_shift_src.find("too").unwrap();
-    assert_eq!(
-        source_word_location(
-            ord_shift_src,
-            1,
-            ord_shift_ctx,
-            ord_shift_ctx.find('7').unwrap(),
-            1
-        ),
-        None
-    );
-    assert!(matches!(
-        source_word_guess_with_sources(
-            ord_shift_src,
-            1,
-            ord_shift_ctx,
-            ord_shift_ctx.find('7').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
-    ));
-    assert_eq!(
-        source_word_location(
-            ord_shift_src,
-            1,
-            ord_shift_ctx,
-            ord_shift_ctx.find("too").unwrap(),
-            1
-        ),
-        Some((1, ord_too_byte))
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            ord_shift_src,
-            1,
-            ord_shift_ctx,
-            ord_shift_ctx.find("too").unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 1,
-            byte: ord_too_byte,
-        }))
-    );
-
-    let tabx_shift_src = "\\begin{tabularx}{\\linewidth}{lll}\nYes & $-$ & ok \\\\\nYes & \\cref{sec:a} & ok \\\\\nYes & \\cite{key} table & ok \\\\\n\\end{tabularx}\n";
-    let tabx_shift_ctx = "Yes − ok Yes section 1 ok Yes [7] table ok";
-    let tabx_table_byte = tabx_shift_src
-        .lines()
-        .nth(3)
-        .unwrap()
-        .find("table")
-        .unwrap();
-    assert_eq!(
-        source_word_location(
-            tabx_shift_src,
-            5,
-            tabx_shift_ctx,
-            tabx_shift_ctx.find('7').unwrap(),
-            5
-        ),
-        None
-    );
-    assert!(matches!(
-        source_word_guess_with_sources(
-            tabx_shift_src,
-            5,
-            tabx_shift_ctx,
-            tabx_shift_ctx.find('7').unwrap(),
-            5,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
-    ));
-    assert_eq!(
-        source_word_location(
-            tabx_shift_src,
-            5,
-            tabx_shift_ctx,
-            tabx_shift_ctx.find("table").unwrap(),
-            5
-        ),
-        Some((4, tabx_table_byte))
-    );
-    assert_eq!(
-        source_word_guess_with_sources(
-            tabx_shift_src,
-            5,
-            tabx_shift_ctx,
-            tabx_shift_ctx.find("table").unwrap(),
-            5,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 4,
-            byte: tabx_table_byte,
-        }))
-    );
-
     // Main-stream and footnote-stream slots with identical surrounding flanks must compete.
     let fn_cite_src = "See \\cite{key} for details.\\footnote{See \\cref{sec:a} for details.}\n";
     let fn_cite_ctx = "See [7] for details.1";
-    assert_eq!(
-        source_word_location(
-            fn_cite_src,
-            1,
-            fn_cite_ctx,
-            fn_cite_ctx.find('7').unwrap(),
-            1
-        ),
-        None
-    );
+    assert_eq!(word_at(fn_cite_src, 1, fn_cite_ctx, "7", 1), None);
     assert!(matches!(
-        source_word_guess_with_sources(
-            fn_cite_src,
-            1,
-            fn_cite_ctx,
-            fn_cite_ctx.find('7').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
+        guess_at(fn_cite_src, 1, fn_cite_ctx, "7", 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 
     let fn_math_src = "See $\\alpha$ for details.\\footnote{See \\cref{sec:a} for details.}\n";
     let fn_math_ctx = "See α for details.1";
     let fn_alpha_byte = fn_math_src.find("\\alpha").unwrap();
     assert_eq!(
-        source_word_location(
-            fn_math_src,
-            1,
-            fn_math_ctx,
-            fn_math_ctx.find('α').unwrap(),
-            1
-        ),
+        word_at(fn_math_src, 1, fn_math_ctx, "α", 1),
         Some((1, fn_alpha_byte))
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            fn_math_src,
-            1,
-            fn_math_ctx,
-            fn_math_ctx.find('α').unwrap(),
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 1,
-            byte: fn_alpha_byte,
-        }))
+        guess_at(fn_math_src, 1, fn_math_ctx, "α", 1),
+        WordOutcome::Located(1, fn_alpha_byte)
     );
 
     // Non-printing spacing/index arguments consume their mandatory group without inserting words.
@@ -2287,19 +2125,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             Some((1, hspace_byte))
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                hspace_src,
-                1,
-                hspace_ctx,
-                offset,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 1,
-                byte: hspace_byte,
-            }))
+            guess(hspace_src, 1, hspace_ctx, offset, 1),
+            WordOutcome::Located(1, hspace_byte)
         );
     }
 
@@ -2319,16 +2146,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             None
         );
         assert!(matches!(
-            source_word_guess_with_sources(
-                footer_src,
-                1,
-                footer_ctx,
-                off,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(None) | Err(())
+            guess(footer_src, 1, footer_ctx, off, 1),
+            WordOutcome::Absent | WordOutcome::Opaque
         ));
     }
     let nextline_pb_src = "Gamma \\cref{sec:a}\n\\clearpage\n";
@@ -2355,19 +2174,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             Some((1, fn_pos_byte))
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                fn_pos_src,
-                1,
-                fn_pos_ctx,
-                off,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 1,
-                byte: fn_pos_byte,
-            }))
+            guess(fn_pos_src, 1, fn_pos_ctx, off, 1),
+            WordOutcome::Located(1, fn_pos_byte)
         );
     }
     let fn_body_math_src =
@@ -2382,19 +2190,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((1, fn_body_math_byte))
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            fn_body_math_src,
-            1,
-            fn_body_math_ctx,
-            fn_body_math_off,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 1,
-            byte: fn_body_math_byte,
-        }))
+        guess(fn_body_math_src, 1, fn_body_math_ctx, fn_body_math_off, 2),
+        WordOutcome::Located(1, fn_body_math_byte)
     );
 
     // Shorter-left main-body competitors (paragraph-start and \item-start citations/math) must count against footnote-head references.
@@ -2421,16 +2218,14 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             None
         );
         assert!(matches!(
-            source_word_guess_with_sources(
+            guess(
                 short_cite_src,
                 short_cite_line,
                 short_cite_ctx,
                 short_cite_off,
-                3,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
+                3
             ),
-            Ok(None) | Err(())
+            WordOutcome::Absent | WordOutcome::Opaque
         ));
     }
     let short_math_src =
@@ -2443,19 +2238,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((3, short_math_byte))
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            short_math_src,
-            3,
-            short_math_ctx,
-            short_math_off,
-            3,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 3,
-            byte: short_math_byte,
-        }))
+        guess(short_math_src, 3, short_math_ctx, short_math_off, 3),
+        WordOutcome::Located(3, short_math_byte)
     );
     let short_alpha_src =
         "Alpha.\n\nSee $\\alpha$ for details.\\footnote{Note see \\cref{sec:a} for details.}\n";
@@ -2472,19 +2256,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((3, short_alpha_byte))
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            short_alpha_src,
-            3,
-            short_alpha_ctx,
-            short_alpha_off,
-            3,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 3,
-            byte: short_alpha_byte,
-        }))
+        guess(short_alpha_src, 3, short_alpha_ctx, short_alpha_off, 3),
+        WordOutcome::Located(3, short_alpha_byte)
     );
 
     // Same-line \clearpage in main_stream prevents an ending footnote reference from absorbing trailing page footer numbers,
@@ -2497,16 +2270,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         None
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            fn_pb_src,
-            1,
-            fn_pb_footer_ctx,
-            fn_pb_footer_off,
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
+        guess(fn_pb_src, 1, fn_pb_footer_ctx, fn_pb_footer_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
     for fn_eof_src in [
         "Alpha.\\footnote{One two three see \\cref{sec:a}.}\n",
@@ -2521,19 +2286,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
                 Some((1, fn_eof_byte))
             );
             assert_eq!(
-                source_word_guess_with_sources(
-                    fn_eof_src,
-                    1,
-                    fn_eof_ctx,
-                    off,
-                    2,
-                    &[],
-                    &Operation::new(Duration::from_secs(10)),
-                ),
-                Ok(Some(UnverifiedWordLocation {
-                    line: 1,
-                    byte: fn_eof_byte,
-                }))
+                guess(fn_eof_src, 1, fn_eof_ctx, off, 2),
+                WordOutcome::Located(1, fn_eof_byte)
             );
         }
     }
@@ -2546,16 +2300,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         Some((1, 0))
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            fn_glued_src,
-            1,
-            fn_glued_ctx,
-            beta_off,
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation { line: 1, byte: 0 }))
+        guess(fn_glued_src, 1, fn_glued_ctx, beta_off, 1),
+        WordOutcome::Located(1, 0)
     );
     for needle in ["section", "1"] {
         let off = fn_glued_ctx.rfind(needle).unwrap();
@@ -2564,16 +2310,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
             None
         );
         assert!(matches!(
-            source_word_guess_with_sources(
-                fn_glued_src,
-                1,
-                fn_glued_ctx,
-                off,
-                1,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(None) | Err(())
+            guess(fn_glued_src, 1, fn_glued_ctx, off, 1),
+            WordOutcome::Absent | WordOutcome::Opaque
         ));
     }
 
@@ -2588,16 +2326,8 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         let off = opt_ctx.find('7').unwrap();
         assert_eq!(source_word_location(opt_comp_src, 1, opt_ctx, off, 4), None);
         assert!(matches!(
-            source_word_guess_with_sources(
-                opt_comp_src,
-                1,
-                opt_ctx,
-                off,
-                4,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(None) | Err(())
+            guess(opt_comp_src, 1, opt_ctx, off, 4),
+            WordOutcome::Absent | WordOutcome::Opaque
         ));
     }
 
@@ -2638,857 +2368,30 @@ fn inverse_reference_commands_select_first_label_byte_inside_braces() {
         None
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            ambiguous_frame,
-            4,
-            "See section 1 done.",
-            4,
-            4,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Err(())
+        guess(ambiguous_frame, 4, "See section 1 done.", 4, 4),
+        WordOutcome::Opaque
     );
     let tied_frame_with_literal = "\\begin{frame}\nSee \\cref{sec:alpha} done.\nSee \\cref{sec:beta} done.\nLiteral token here.\n\\end{frame}\n";
     let tied_frame_ctx = "See section 1 done. Literal token here.";
     assert_eq!(
-        source_word_guess_with_sources(
-            tied_frame_with_literal,
-            5,
-            tied_frame_ctx,
-            tied_frame_ctx.find("Literal").unwrap(),
-            4,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation { line: 4, byte: 0 }))
+        guess_at(tied_frame_with_literal, 5, tied_frame_ctx, "Literal", 4),
+        WordOutcome::Located(4, 0)
     );
 }
 
 #[test]
 fn inverse_note_arguments_do_not_claim_slide_words() {
-    for source in [
-        "\\begin{frame}\nAmber\n\\note[item]<2>{Zephyr}\n\\end{frame}",
-        "\\newcommand{\\cue}[2]{\\note{\\textbf{#1 min.} #2}}\n\
-         \\begin{frame}\nAmber\n\\cue{1}{Zephyr}\n\\end{frame}",
-        "\\newcommand{\\inner}[1]{\\note{#1}}\n\
-         \\newcommand{\\outer}[2]{#1\\inner{#2}}\n\
-         \\begin{frame}\n\\outer{Amber}{Zephyr}\n\\end{frame}",
-        "\\newcommand{\\inner}[1]{\\note{#1#1}}\n\
-         \\newcommand{\\outer}[2]{#1\\inner{#2}\\inner{#2}}\n\
-         \\begin{frame}\n\\outer{Amber}{Zephyr}\n\\end{frame}",
-    ] {
-        let anchor = source.lines().count() as u32;
-        assert_eq!(
-            source_word_location(source, anchor, "Zephyr", 0, 10),
-            None,
-            "{source}"
-        );
-        let (row, byte) = source
-            .lines()
-            .enumerate()
-            .find_map(|(row, text)| text.find("Amber").map(|byte| (row as u32 + 1, byte)))
-            .unwrap();
-        assert_eq!(
-            source_word_location(source, anchor, "Amber", 0, 10),
-            Some((row, byte)),
-            "{source}"
-        );
-    }
-    let source = "\\newcommand{\\both}[1]{#1\\note{#1}}\n\
-                  \\begin{frame}\n\\both{Amber}\n\\end{frame}";
+    let source = "\\begin{frame}\nAmber\n\\note[item]<2>{Zephyr}\n\\end{frame}";
+    let anchor = source.lines().count() as u32;
+    assert_eq!(source_word_location(source, anchor, "Zephyr", 0, 10), None);
     assert_eq!(
-        source_word_location(source, 4, "Amber", 0, 10),
-        Some((3, "\\both{".len()))
+        source_word_location(source, anchor, "Amber", 0, 10),
+        Some((2, 0))
     );
-    for source in [
-        "\\newcommand{\\dropone}[1]{}\n\
-         \\newcommand{\\quiet}[1]{\\note{#1}}\n\
-         \\newcommand{\\wrap}[1]{\\dropone\\quiet{#1}}\n\
-         \\begin{frame}\n\\wrap{Amber}\\\\\nAmber\n\\end{frame}",
-        "\\newcommand{\\wrap}[1]{\\def\\saved{#1}\\saved}\n\
-         \\begin{frame}\n\\wrap{Amber}\\\\\nAmber\n\\end{frame}",
-        "\\renewcommand{\\note}[1]{\\textbf{#1}}\n\
-         \\begin{frame}\n\\note{Amber}\\\\\nAmber\n\\end{frame}",
-    ] {
-        assert_eq!(
-            source_word_location(source, source.lines().count() as u32, "Amber", 0, 10),
-            None,
-            "{source}"
-        );
-    }
-    let source = "\\begin{frame}{Visible context}\nAmber note text.\n\
-                  \\note{Amber note text.}\n\\note{Amber note text.}\n\\end{frame}";
-    let context = "Visible context Amber note text.";
-    for word in ["Amber", "note", "text"] {
-        assert_eq!(
-            source_word_location(source, 5, context, context.rfind(word).unwrap(), 10),
-            None,
-            "{word}"
-        );
-    }
     let source = "\\newcommand{\\id}[1]{#1}\n$\\id x + y$\n";
     assert_eq!(
         source_word_location(source, 2, "x + y", 0, 4),
         Some((2, "$\\id ".len()))
-    );
-}
-
-#[test]
-fn inverse_opaque_note_keeps_compiler_anchor_instead_of_metadata() {
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("paper.tex");
-    let pdf = directory.path().join("paper.pdf");
-    for notes in [
-        "",
-        "\\drop{later}",
-        "\\drop{\\drop{later}}",
-        "\\drop{\\note{Amber note text.}}",
-        "\\drop{\\note{\\drop{Amber note text.}}}",
-        "\\dropwrap{Amber note text.}",
-        "\\dropnote{Amber note text.}",
-        "\\note{Amber note text.}",
-        "\\note{\\drop{later} Amber note text.}",
-        "\\note{Amber note text.}\n\\note{Amber note text.}",
-        "\\note{Amber note text. Amber note text.}",
-    ] {
-        let text = format!(
-            "\\documentclass{{beamer}}\n\\newcommand{{\\drop}}[1]{{}}\n\
-             \\newcommand{{\\dropwrap}}[1]{{\\drop{{#1}}}}\n\
-             \\newcommand{{\\dropnote}}[1]{{\\drop{{\\note{{#1}}}}}}\n\
-             \\title{{Amber note text}}\n\\begin{{document}}\n\
-             \\begin{{frame}}{{Other title}}\n{notes}\n\\end{{frame}}\n\\end{{document}}\n"
-        );
-        let anchor = text
-            .lines()
-            .position(|line| line == "\\end{frame}")
-            .unwrap() as u32
-            + 1;
-        fs::write(&source, &text).unwrap();
-        fs::write(
-            pdf.with_extension("synctex"),
-            format!(
-                "SyncTeX Version:1\nInput:1:{}\n\
-                 Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
-                 {{1\n[1,{anchor}:0,0:100,100,0\n(1,{anchor}:0,0:100,100,0\n)\n]\n}}1\n\
-                 Postamble:\nCount:4\n",
-                source.display()
-            ),
-        )
-        .unwrap();
-        let resolved = inverse_output(
-            &pdf,
-            &format!("Input: paper.tex\nLine: {anchor}\n"),
-            Some(("Amber note text.", 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            (
-                resolved.location.line,
-                resolved.location.byte_column,
-                resolved.location.precise
-            ),
-            (anchor, 0, false),
-            "{notes}"
-        );
-    }
-}
-
-#[test]
-fn inverse_quoted_paragraph_tokens_preserve_following_declarations() {
-    for quote in [
-        "\\string",
-        "\\meaning",
-        "\\noexpand",
-        "\\csname string\\endcsname",
-        "\\csname meaning\\endcsname",
-        "\\csname noexpand\\endcsname",
-    ] {
-        for gap in [
-            "\n\n",
-            "\n \t\n",
-            "\n%comment\n\n",
-            "%comment\n\n",
-            "%comment\n%comment\n\n",
-        ] {
-            for newline in ["\n", "\r\n"] {
-                let source = format!(
-                    "\\begin{{frame}}\nNimbus\n{quote}{gap}\
-                     \\newcommand{{\\cue}}[1]{{\\note{{#1}}}}\n\
-                     \\char90 ephyr \\cue{{Zephyr}} Copper\n\\end{{frame}}\n"
-                )
-                .replace('\n', newline);
-                let line = source
-                    .lines()
-                    .position(|text| text.starts_with("\\char90"))
-                    .unwrap() as u32
-                    + 1;
-                assert_eq!(
-                    source_word_location(&source, line, "Zephyr Copper", 0, 10),
-                    None,
-                    "{source}",
-                );
-                assert_eq!(
-                    source_word_location(&source, line, "Nimbus", 0, 10),
-                    Some((2, 0)),
-                    "{source}",
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn inverse_control_tokens_keep_csname_name_whitespace() {
-    for leading in ["", " \t", "\n", "\u{a0}"] {
-        for trailing in [" ", "\n", "\r\n"] {
-            let source = format!(
-                "\\documentclass{{article}}\n\
-                 \\expandafter\\def\\csname {leading}hbox{trailing}\\endcsname#1{{}}\n\
-                 \\begin{{document}}\nAmber Zephyr \\hbox{{Zephyr}} Copper\n\
-                 \\end{{document}}\n"
-            );
-            let line = source
-                .lines()
-                .position(|text| text.starts_with("Amber"))
-                .unwrap() as u32
-                + 1;
-            let location = source_word_location(&source, line, "Amber Zephyr Zephyr Copper", 13, 2);
-            assert!(
-                location.is_none() || location == Some((line, 19)),
-                "{source}: {location:?}",
-            );
-        }
-    }
-}
-
-#[test]
-fn inverse_reviewed_conditionals_do_not_execute_stored_definitions() {
-    for definition in [
-        "\\newcommand{\\ReviewStart}{\\iffalse}\n",
-        "\\def\\ReviewStart{\\iffalse}\n",
-    ] {
-        let source = format!(
-            "\\documentclass{{beamer}}\n\
-             \\newcommand{{\\ReviewDiscard}}[1]{{}}\n{definition}\
-             \\renewcommand{{\\ReviewDiscard}}[1]{{#1}}\n\
-             \\newcommand{{\\ReviewEnd}}{{\\fi}}\n\
-             \\begin{{document}}\n\\begin{{frame}}\n\
-             \\ReviewDiscard{{Amber}}\n\\par\nNimbus\n\\par\nAmber\n\
-             \\end{{frame}}\n\\end{{document}}\n"
-        );
-        let line = source
-            .lines()
-            .position(|text| text.starts_with("\\ReviewDiscard{Amber}"))
-            .unwrap() as u32
-            + 1;
-        let byte = source
-            .lines()
-            .nth(line as usize - 1)
-            .unwrap()
-            .find("Amber")
-            .unwrap();
-        let location = source_word_location(&source, line, "Amber", 0, 10);
-        assert!(
-            location.is_none() || location == Some((line, byte)),
-            "{source}: {location:?}",
-        );
-    }
-}
-
-#[test]
-fn inverse_reviewed_conditionals_do_not_mask_resumed_host_tokens() {
-    let host = Path::new("/synthetic/chapter.tex");
-    let generated = Path::new("/synthetic/paper.bbl");
-    for terminal in ["\\fi", "\\else"] {
-        for newline in ["\n", "\r\n"] {
-            let source = format!(
-                "\\newif\\ifReviewHidden\n{{\n\\iffalse\n\
-                 \\def\\ReviewUnused{{{terminal}\\ifReviewHidden}}\n\
-                 \\input{{paper.bbl}}\n\\fi\n{closing}}}\n",
-                closing = if terminal == "\\else" { "\\fi\n" } else { "" },
-            )
-            .replace('\n', newline);
-            assert!(
-                !crate::tex::host_owns_generated_sidecar(&source, host, generated, None),
-                "{source}",
-            );
-        }
-    }
-}
-
-#[test]
-fn inverse_reviewed_conditionals_reject_newly_stored_host_inputs() {
-    for source in [
-        concat!(
-            "{\n\\iffalse\n\\def\\ReviewUnused{\\fi\n",
-            "\\def\\ReviewStored{\\input{paper.bbl}}\n}\n",
-        ),
-        concat!(
-            "\\newif\\ifReviewNested\n\\iffalse\n",
-            "\\label[\\fi\\let\\ReviewUnused]{\\iffalse}\n\\newif\\ifReviewNested\n",
-            "\\fi\n\\input{paper.bbl}\n\\fi\n}\n",
-        ),
-    ] {
-        assert!(
-            !crate::tex::host_owns_generated_sidecar(
-                source,
-                Path::new("/synthetic/chapter.tex"),
-                Path::new("/synthetic/paper.bbl"),
-                None,
-            ),
-            "{source}"
-        );
-    }
-}
-
-#[test]
-fn inverse_reviewed_conditionals_reject_deferred_caption_masks() {
-    for source in [
-        concat!(
-            "\\newif\\ifReviewHidden\n",
-            "{\\iffalse\\captionbox{\\fi}[\\ifReviewHidden]{Unused}\n",
-            "\\input{paper.bbl}\\fi\n",
-        ),
-        concat!(
-            "\\newif\\ifReviewHidden\n",
-            "{\\iffalse\\captionbox{\\fi\\let\\ReviewEat}[\\ifReviewHidden]{Unused}\n",
-            "\\input{paper.bbl}\\fi}\n",
-        ),
-    ] {
-        assert!(
-            !crate::tex::host_owns_generated_sidecar(
-                source,
-                Path::new("/synthetic/chapter.tex"),
-                Path::new("/synthetic/paper.bbl"),
-                None,
-            ),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_reviewed_conditionals_do_not_infer_control_sequence_meaning() {
-    for preamble in [
-        concat!(
-            "\\newcommand{\\ifReviewWord}{}\n",
-            "\\iffalse\n\\ifReviewWord\n\\fi\n",
-            "\\renewcommand{\\ReviewPaint}[1]{#1}\n\\let\\ReviewEat\\fi\n",
-        ),
-        concat!(
-            "\\let\\ReviewSavedFalse\\iffalse\n\\def\\iffalse{}\n\\iffalse\n",
-            "\\renewcommand{\\ReviewPaint}[1]{#1}\n\\let\\ReviewEat\\fi\n",
-            "\\let\\iffalse\\ReviewSavedFalse\n",
-        ),
-    ] {
-        let source = format!(
-            "\\documentclass{{article}}\n\\newcommand{{\\ReviewPaint}}[1]{{}}\n\
-             {preamble}\\begin{{document}}\n\
-             Amber Zephyr \\ReviewPaint{{Zephyr}} Copper\n\\end{{document}}\n",
-        );
-        let line = source
-            .lines()
-            .position(|row| row.starts_with("Amber"))
-            .unwrap() as u32
-            + 1;
-        let byte = source
-            .lines()
-            .nth(line as usize - 1)
-            .unwrap()
-            .rfind("Zephyr")
-            .unwrap();
-        let location = source_word_location(&source, line, "Amber Zephyr Zephyr Copper", 13, 10);
-        assert!(
-            location.is_none() || location == Some((line, byte)),
-            "{source}: {location:?}",
-        );
-    }
-}
-
-#[test]
-fn inverse_raw_control_tokens_preserve_imported_note_ownership() {
-    let directory = tempfile::tempdir().unwrap();
-    let main_path = directory.path().join("main.tex");
-    fs::write(
-        directory.path().join("notemacros.tex"),
-        "\\newcommand{\\cue}[1]{\\note{#1}}\n",
-    )
-    .unwrap();
-    for body in [
-        "\\csname",
-        "\\csname\\string",
-        "\\csname\\meaning",
-        "\\csname\\noexpand",
-    ] {
-        for suffix in ["", "\\newcommand{\\storedend}{\\endcsname}\n"] {
-            let source = format!(
-                "\\let\\ecs\\endcsname\n\\newcommand{{\\bcs}}{{{body}}}\n\
-                 \\input{{notemacros}}\n\\begin{{frame}}\nNimbus\n\
-                 \\char90 ephyr \\cue{{Zephyr}}\n\\end{{frame}}\n{suffix}"
-            );
-            fs::write(&main_path, &source).unwrap();
-            let spliced = macro_preamble_source(
-                &main_path,
-                None,
-                None,
-                &mut QuerySources::default(),
-                &Operation::default(),
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                crate::tex::source_word_location_with_sources(
-                    &source,
-                    7,
-                    "Zephyr",
-                    0,
-                    10,
-                    &[spliced.source.as_str()],
-                    &Operation::default()
-                )
-                .map(WordOutcome::location),
-                Err(()),
-                "{source}",
-            );
-            assert_eq!(
-                crate::tex::source_word_location_with_sources(
-                    &source,
-                    7,
-                    "Nimbus",
-                    0,
-                    10,
-                    &[spliced.source.as_str()],
-                    &Operation::default()
-                )
-                .map(WordOutcome::location),
-                Ok(Some((5, 0))),
-                "{source}",
-            );
-        }
-    }
-}
-
-#[test]
-fn inverse_raw_control_tokens_preserve_unexpandable_primitives() {
-    for definition in [
-        "\\noexpand\\def\\cue#1{\\note{#1}}",
-        "\\noexpand\\gdef\\cue#1{\\note{#1}}",
-        "\\noexpand\\let\\cue\\note",
-        "\\let\\cue\\note\\noexpand\\begingroup\\renewcommand{\\note}[1]{#1}\\noexpand\\endgroup",
-        "\\let\\cue\\note\\noexpand\\bgroup\\renewcommand{\\note}[1]{#1}\\noexpand\\egroup",
-    ] {
-        let source =
-            format!("{definition}\n\\begin{{frame}}\nNimbus\n\\cue{{Zephyr}}\n\\end{{frame}}");
-        assert_eq!(
-            crate::tex::source_word_location_with_sources(
-                &source,
-                5,
-                "Zephyr",
-                0,
-                10,
-                &[],
-                &Operation::default()
-            )
-            .map(WordOutcome::location),
-            Err(()),
-            "{source}",
-        );
-        assert_eq!(
-            source_word_location(&source, 5, "Nimbus", 0, 10),
-            Some((3, 0)),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_raw_control_tokens_in_unused_bodies_preserve_printing_scope() {
-    let directory = tempfile::tempdir().unwrap();
-    let main_path = directory.path().join("main.tex");
-    fs::write(
-        directory.path().join("printing.tex"),
-        "\\renewcommand{\\note}[1]{#1}\n",
-    )
-    .unwrap();
-    for declaration in [
-        "\\newcommand{\\unused}{\\string}",
-        "\\def\\unused{\\meaning}",
-        "\\NewDocumentCommand{\\unused}{}{\\string}",
-    ] {
-        let source = format!(
-            "{declaration}\n\\input{{printing}}\n\\begin{{frame}}\n\
-             \\note{{Copper}}\n\\end{{frame}}\n"
-        );
-        fs::write(&main_path, &source).unwrap();
-        let spliced = macro_preamble_source(
-            &main_path,
-            None,
-            None,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            crate::tex::source_word_location_with_sources(
-                &source,
-                5,
-                "Copper",
-                0,
-                10,
-                &[spliced.source.as_str()],
-                &Operation::default()
-            )
-            .map(WordOutcome::location),
-            Ok(Some((4, 6))),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_opaque_math_vetoes_better_context_without_hiding_other_atoms() {
-    let source = "\\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
-                  \\note{$\\alpha+\\beta$}\n$\\delta+1$\n\\end{frame}";
-    for offset in [0, "α+".len()] {
-        assert_eq!(source_word_location(source, 5, "α+β=γ", offset, 10), None);
-    }
-    assert_eq!(source_word_location(source, 5, "δ+1", 0, 10), Some((4, 1)));
-    let source = "\\renewcommand{\\note}[1]{#1}\n\
-                  \\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
-                  \\note{$\\alpha+\\beta$}\n\\end{frame}";
-    assert_eq!(
-        source_word_location(source, 5, "α+β=γ", 0, 10),
-        Some((3, 1))
-    );
-}
-
-#[test]
-fn inverse_warned_guess_never_masks_body_or_unscoped_import_output() {
-    use crate::tex::source_word_guess_with_sources;
-    let package = "\\csname\\string x\\endcsname";
-    for name in ["documentclass", "usepackage", "RequirePackage"] {
-        for begin in ["\\begin{document}", "\\begin % comment\n{document}"] {
-            let source = format!(
-                "\\documentclass{{article}}\n\\usepackage{{algorithmicx}}\n{begin}\n\
-                 \\{name}{{amber}}\nQuartz amber zephyr.\n\\end{{document}}"
-            );
-            let anchor = source.lines().count() as u32 - 2;
-            assert_eq!(
-                source_word_guess_with_sources(
-                    &source,
-                    anchor,
-                    "amber",
-                    0,
-                    10,
-                    &[package],
-                    &Operation::default()
-                ),
-                Err(()),
-                "{source}",
-            );
-        }
-        for stored in ["", "\\newcommand{\\unused}{\\begin{document}}\n"] {
-            let source = format!("{stored}\\{name}{{mystery}}\ncafé Amber");
-            let anchor = source.lines().count() as u32;
-            assert_eq!(
-                source_word_guess_with_sources(
-                    &source,
-                    anchor,
-                    "Amber",
-                    0,
-                    10,
-                    &[package],
-                    &Operation::default()
-                ),
-                Err(()),
-                "{source}",
-            );
-        }
-    }
-    for (source, anchor) in [
-        ("\\usepackage[\\begin{document}]{mystery}\ncafé Amber", 2),
-        (
-            "\\documentclass{article}\n{\\begin{document}}\n\\usepackage{Amber}\n\
-             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
-            3,
-        ),
-        (
-            "\\documentclass{article}\n\
-             \\def\\pgfmathsetmacro#1#2{\\begin{document}}\n\
-             \\pgfmathsetmacro{\\relax}{x}\n\\usepackage{Amber}\n\
-             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
-            4,
-        ),
-        (
-            "\\documentclass{article}\n\
-             \\newenvironment{pgfmathsetmacro}{\\begin{document}}{}\n\
-             \\pgfmathsetmacro{\\relax}{x}\n\\usepackage{Amber}\n\
-             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
-            4,
-        ),
-        (
-            "\\documentclass{article}\nUnexpected literal text.\n\\usepackage{Amber}\n\
-             \\begin{document}\nQuartz Amber zephyr.\n\\end{document}",
-            3,
-        ),
-    ] {
-        assert_eq!(
-            source_word_guess_with_sources(
-                source,
-                anchor,
-                "Amber",
-                0,
-                4,
-                &[package],
-                &Operation::default()
-            ),
-            Err(()),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_warned_guess_keeps_unresolved_local_import_targets_opaque() {
-    use crate::tex::source_word_guess_with_sources;
-    let package = "\\csname\\string x\\endcsname";
-    for definition in [
-        "\\expandafter\\def\\csname use\\pk\\endcsname#1{\\AtBeginDocument{Quartz }}",
-        "\\expandafter\\let\\csname use\\pk\\endcsname\\relax",
-    ] {
-        let source = format!(
-            "\\documentclass{{article}}\n\\usepackage{{algorithmicx}}\n\
-             \\def\\pk{{package}}\n{definition}\n\\usepackage{{foo}}\n\
-             \\begin{{document}}\nQuartz amber zephyr.\n\\end{{document}}"
-        );
-        assert_eq!(
-            source_word_guess_with_sources(
-                &source,
-                7,
-                "Quartz amber zephyr.",
-                0,
-                4,
-                &[package],
-                &Operation::default()
-            ),
-            Err(()),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_warned_guess_preserves_literal_argument_owners() {
-    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
-    let package = "\\csname\\string x\\endcsname";
-    for definition in [
-        "\\newcommand{\\styled}[1]{\\textbf{#1}}",
-        "\\newcommand{\\styled}[1]{{\\large\\textbf{#1}.}}",
-        "\\newcommand{\\w}[1]{#1}\\newcommand{\\styled}[1]{\\w{\\textit{#1}}}",
-    ] {
-        let source = format!(
-            "{definition}\n\\begin{{frame}}\nQuartz \\styled{{Amber}} zephyr.\n\\end{{frame}}"
-        );
-        assert_eq!(
-            source_word_guess_with_sources(
-                &source,
-                4,
-                "Quartz Amber zephyr.",
-                7,
-                10,
-                &[package],
-                &Operation::default()
-            ),
-            Ok(Some(UnverifiedWordLocation { line: 3, byte: 15 })),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_warned_guess_bounds_repeated_nonmutating_helper_graphs() {
-    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
-    let mut source = "\\def\\unused{\\let}\n\\newcommand{\\marker}{\\downarrow}\n\
-                      \\newcommand{\\helperA}{Silver}\n"
-        .to_owned();
-    for level in b'B'..=b'O' {
-        let previous = format!("\\helper{} ", char::from(level - 1)).repeat(10);
-        source.push_str(&format!(
-            "\\newcommand{{\\helper{}}}{{{previous}}}\n",
-            char::from(level)
-        ));
-    }
-    source.push_str(
-        "\\iffalse\\helperO\\fi\n\\begin{frame}\n$\\marker$\n\
-                     Quartz Amber zephyr.\n\\end{frame}",
-    );
-    let closing = source.lines().count() as u32;
-    assert_eq!(
-        source_word_guess_with_sources(
-            &source,
-            closing,
-            "Quartz Amber zephyr.",
-            7,
-            10,
-            &["\\csname\\string x\\endcsname"],
-            &Operation::default()
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: closing - 1,
-            byte: 7
-        })),
-    );
-}
-
-#[test]
-fn inverse_warned_guess_uses_context_for_repeated_prose_and_math() {
-    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
-    let package = "\\csname\\string x\\endcsname";
-    let source = "A repeated word far away.\n\
-                  Émile uses \\emph{repeated} words near fields.\nRepeated noise.\n";
-    let context = "Émile uses repeated words near ﬁelds.";
-    assert_eq!(
-        source_word_guess_with_sources(
-            source,
-            3,
-            context,
-            context.find("repeated").unwrap(),
-            4,
-            &[package],
-            &Operation::default()
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 2,
-            byte: "Émile uses \\emph{".len(),
-        })),
-    );
-    let source = "\\begin{frame}\n$\\alpha+1$\n$\\alpha+2$\n\\end{frame}";
-    for package in [
-        package,
-        "\\expandafter\\let\\csname external\\the\\count0\\endcsname\\relax",
-    ] {
-        assert_eq!(
-            source_word_guess_with_sources(
-                source,
-                4,
-                "α+1",
-                0,
-                10,
-                &[package],
-                &Operation::default()
-            ),
-            Ok(Some(UnverifiedWordLocation { line: 2, byte: 1 })),
-        );
-    }
-}
-
-#[test]
-fn inverse_warned_guess_does_not_break_context_ties_by_compiler_distance() {
-    use crate::tex::source_word_guess_with_sources;
-    let package = "\\csname\\string x\\endcsname";
-    for (source, line, context, offset) in [
-        ("Amber\nAmber", 1, "Amber", 0),
-        (
-            "same Amber value.\nsame Amber value.",
-            1,
-            "same Amber value.",
-            5,
-        ),
-        (
-            "\\begin{frame}{Amber}\nAmber\n\\end{frame}",
-            3,
-            "Else Amber nearby",
-            5,
-        ),
-        ("\\begin{frame}\n$x$\nx\n\\end{frame}", 4, "x", 0),
-        (
-            "\\begin{frame}\n$\\alpha$\n$\\alpha$\n\\end{frame}",
-            2,
-            "α",
-            0,
-        ),
-    ] {
-        assert!(
-            matches!(
-                source_word_guess_with_sources(
-                    source,
-                    line,
-                    context,
-                    offset,
-                    10,
-                    &[package],
-                    &Operation::default()
-                ),
-                Ok(None) | Err(()),
-            ),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn inverse_warned_guess_preserves_comment_quote_and_nonprinting_masks() {
-    use crate::tex::{UnverifiedWordLocation, source_word_guess_with_sources};
-    let package = "\\csname\\string x\\endcsname";
-    for hidden in ["% Amber", "\\label{Amber}", "\\newcommand{\\unused}{Amber}"] {
-        let source = format!("\\begin{{frame}}\n{hidden}\ncafé Amber\n\\end{{frame}}");
-        assert_eq!(
-            source_word_guess_with_sources(
-                &source,
-                4,
-                "Amber",
-                0,
-                10,
-                &[package],
-                &Operation::default()
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 3,
-                byte: "café ".len()
-            })),
-            "{source}",
-        );
-    }
-    for printed in [
-        "\\detokenize{Amber}",
-        "\\verb|Amber|",
-        "\\lstinline|Amber|",
-        "\\begin{verbatim}\nAmber\n\\end{verbatim}",
-        "\\begin{Verbatim}\nAmber\n\\end{Verbatim}",
-        "\\begin{lstlisting}\nAmber\n\\end{lstlisting}",
-        "\\begin{minted}{tex}\nAmber\n\\end{minted}",
-    ] {
-        let source = format!(
-            "\\newcommand{{\\quoted}}{{Amber}}\n\\begin{{frame}}\n{printed}\ncafé Amber\n\\end{{frame}}",
-        );
-        assert_eq!(
-            source_word_guess_with_sources(
-                &source,
-                source.lines().count() as u32,
-                "Amber",
-                0,
-                10,
-                &[package],
-                &Operation::default()
-            ),
-            Err(()),
-            "{source}",
-        );
-    }
-    let source = "\\title{Amber}\n\\begin{frame}\nCopper\n\\end{frame}";
-    assert_eq!(
-        source_word_guess_with_sources(
-            source,
-            4,
-            "Amber",
-            0,
-            10,
-            &[package],
-            &Operation::default()
-        ),
-        Ok(None),
     );
 }
 
@@ -3526,7 +2429,7 @@ fn inverse_prose_context_beats_unrelated_math_word() {
                   \\end{frame}";
     let context = "The list defines a value (a1, a2) on a set.";
     assert_eq!(
-        source_word_location(source, 4, context, context.find("value").unwrap(), 4),
+        word_at(source, 4, context, "value", 4),
         Some((2, source.lines().nth(1).unwrap().find("value").unwrap()))
     );
 }
@@ -3548,12 +2451,16 @@ fn inverse_repeated_word_uses_short_context_across_math() {
 #[test]
 fn inverse_ordinary_word_rejects_a_different_source_word() {
     let source = "The item is valid and has a simple label.";
+    let op = Operation::default();
+    let analysis = SourceAnalysis::new(source, &[], &op);
     let byte = source.find("valid").unwrap();
     assert_eq!(
         ordinary_word_source_start(
-            source,
-            "The item is active and has a simple label.",
-            "The item is ".len(),
+            &analysis,
+            (
+                "The item is active and has a simple label.",
+                "The item is ".len()
+            ),
             1,
             byte,
         ),
@@ -3561,9 +2468,11 @@ fn inverse_ordinary_word_rejects_a_different_source_word() {
     );
     assert_eq!(
         ordinary_word_source_start(
-            source,
-            "The item is valid and has a simple label.",
-            "The item is ".len(),
+            &analysis,
+            (
+                "The item is valid and has a simple label.",
+                "The item is ".len()
+            ),
             1,
             byte + 2,
         ),
@@ -3594,24 +2503,11 @@ fn inverse_generated_verbatim_uses_clicked_sheet_original_frame() {
         let map = source_map_from_reader(
             contents.as_bytes(),
             &pdf,
-            InversePoint {
-                page,
-                x: 0.0,
-                y_from_top: 0.0,
-                page_height_pt: 1.0,
-            },
+            ipt(page, 0.0, 0.0, 1.0),
             &generated,
-            false,
-            &Operation::default(),
-            None,
         )
         .unwrap();
-        let remapped = original_source_from_verbatim(
-            &map,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap();
+        let remapped = original_source_from_verbatim(&map).unwrap();
         assert_eq!(
             remapped.0,
             fs::canonicalize(&source_path).unwrap().to_str().unwrap()
@@ -3622,26 +2518,11 @@ fn inverse_generated_verbatim_uses_clicked_sheet_original_frame() {
     let missing = source_map_from_reader(
         contents.as_bytes(),
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 0.0,
-            y_from_top: 0.0,
-            page_height_pt: 1.0,
-        },
+        ipt(1, 0.0, 0.0, 1.0),
         Path::new("/unrelated.vrb"),
-        false,
-        &Operation::default(),
-        None,
     )
     .unwrap();
-    assert!(
-        original_source_from_verbatim(
-            &missing,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .is_err()
-    );
+    assert!(original_source_from_verbatim(&missing).is_err());
 }
 
 #[test]
@@ -3692,16 +2573,13 @@ fn inverse_body_ownership_uses_specific_boxes_and_effective_transform() {
             let map = source_map_from_reader(
                 contents.as_bytes(),
                 Path::new("/deck.pdf"),
-                InversePoint {
-                    page: 2,
-                    x: (x * 65536.0 / 65781.76 * magnification + x_offset) as f32,
-                    y_from_top: (y * 65536.0 / 65781.76 * magnification + y_offset) as f32,
-                    page_height_pt: 200.0,
-                },
+                ipt(
+                    2,
+                    (x * 65536.0 / 65781.76 * magnification + x_offset) as f32,
+                    (y * 65536.0 / 65781.76 * magnification + y_offset) as f32,
+                    200.0,
+                ),
                 Path::new("/deck.vrb"),
-                true,
-                &Operation::default(),
-                None,
             )
             .unwrap();
             assert_eq!(
@@ -3711,10 +2589,8 @@ fn inverse_body_ownership_uses_specific_boxes_and_effective_transform() {
         }
     }
     for contents in [
-        sheet.replace("Unit:65536\n", ""),
         sheet.replace("(1,18:10,20:30,10,0", "(1,18:invalid"),
         sheet.replace("Count:12\n", ""),
-        sheet.replace("x2,2:20,20", "finvalid:20,20"),
         format!(
             "{}<2\n(2,2:0,20:30,10,0\n)\n>\n",
             sheet.replace("x2,2:20,20", "f2:20,20")
@@ -3724,36 +2600,30 @@ fn inverse_body_ownership_uses_specific_boxes_and_effective_transform() {
             source_map_from_reader(
                 contents.as_bytes(),
                 Path::new("/deck.pdf"),
-                InversePoint {
-                    page: 2,
-                    x: 20.0,
-                    y_from_top: 15.0,
-                    page_height_pt: 200.0
-                },
-                Path::new("/deck.vrb"),
-                true,
-                &Operation::default(),
-                None,
+                ipt(2, 20.0, 15.0, 200.0),
+                Path::new("/deck.vrb")
             )
             .is_err()
         );
     }
-    let operation = Operation::default();
     let generated = SourceBox {
         bounds: [0.0, 0.0, 20.0, 20.0],
         generated: true,
     };
     for other in [
         SourceBox {
-            bounds: generated.bounds,
             generated: false,
+            ..generated
         },
         SourceBox {
             bounds: [10.0, 0.0, 30.0, 20.0],
             generated: false,
         },
     ] {
-        assert!(!generated_box_at_point(&[generated, other], 15.0, 15.0, &operation).unwrap());
+        assert!(
+            !generated_box_at_point(&[generated, other], 15.0, 15.0, &Operation::default())
+                .unwrap()
+        );
     }
 }
 
@@ -3774,39 +2644,18 @@ fn inverse_document_metadata_resolves_title_and_direct_input() {
         "\\institute{North Research Center\\\\\nExample School for Mathematics}\n",
     )
     .unwrap();
-    let found = document_metadata_word_location(
-        &main_path,
-        "Example Report and Results",
-        "Example ".len(),
-        &mut QuerySources::default(),
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap();
+    let found = metadata_at(&main_path, "Example Report and Results", "Example ".len()).unwrap();
     assert_eq!((found.2, found.3), (2, 43));
     assert!(found.4 >= 6);
-    let found = document_metadata_word_location(
+    let found = metadata_at(
         &main_path,
         "North Research Center\r\nExample School for Mathematics",
         "North Research Center\r\nExample School for ".len(),
-        &mut QuerySources::default(),
-        &Operation::default(),
     )
-    .unwrap()
     .unwrap();
     assert!(found.0.ends_with("preamble.tex"));
     assert_eq!((found.2, found.3), (2, 19));
-    assert!(
-        document_metadata_word_location(
-            &main_path,
-            "Report",
-            0,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(metadata_at(&main_path, "Report", 0).is_none());
 }
 
 #[test]
@@ -3821,15 +2670,7 @@ fn inverse_metadata_preserves_crlf_and_unicode_byte_offsets() {
         }
         source.push_str(declaration);
         fs::write(&main_path, &source).unwrap();
-        let found = document_metadata_word_location(
-            &main_path,
-            "Example Report",
-            8,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let found = metadata_at(&main_path, "Example Report", 8).unwrap();
         assert_eq!((found.2, found.3), (9, declaration.find("Report").unwrap()));
     }
 }
@@ -3847,51 +2688,31 @@ fn inverse_frame_title_beats_same_words_in_document_title() {
     let title = "Computational Fluid Dynamics\nGrid refinement application\n\
                  Numerical Analysis and Applications in Computational Fluid Dynamics";
     let title_offset = title.find("Fluid").unwrap();
-    let metadata_score = document_metadata_word_location(
-        &main_path,
-        title,
-        title_offset,
-        &mut QuerySources::default(),
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap()
-    .4;
+    let metadata_score = metadata_at(&main_path, title, title_offset).unwrap().4;
     assert!(metadata_score >= 6);
     assert_eq!(
         source_word_location(source, 5, title, title_offset, 4),
         Some((3, source.lines().nth(2).unwrap().find("Fluid").unwrap()))
     );
     assert!(!metadata_beats_frame(
-        source,
+        &tex::SourceAnalysis::new(source, &[], &Operation::default()),
         5,
         (title, title_offset),
         10.0,
         272.0,
         metadata_score,
-        &Operation::default()
     ));
     let footer = "Computational Fluid Dynamics\nGrid refinement application\n\
                   Numerical Analysis and Applications in Computational Fluid Dynamics";
     let footer_offset = footer.rfind("Fluid").unwrap();
-    let footer_score = document_metadata_word_location(
-        &main_path,
-        footer,
-        footer_offset,
-        &mut QuerySources::default(),
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap()
-    .4;
+    let footer_score = metadata_at(&main_path, footer, footer_offset).unwrap().4;
     assert!(metadata_beats_frame(
-        source,
+        &tex::SourceAnalysis::new(source, &[], &Operation::default()),
         5,
         (footer, footer_offset),
         228.0,
         272.0,
         footer_score,
-        &Operation::default()
     ));
 }
 
@@ -3905,49 +2726,37 @@ fn inverse_identical_running_title_uses_click_height_for_tie() {
     fs::write(&main_path, source).unwrap();
     let context = "Computational Fluid Dynamics";
     let offset = context.find("Fluid").unwrap();
-    let metadata_score = document_metadata_word_location(
-        &main_path,
-        context,
-        offset,
-        &mut QuerySources::default(),
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap()
-    .4;
+    let op = Operation::default();
+    let metadata_score = metadata_at(&main_path, context, offset).unwrap().4;
+    let analysis = tex::SourceAnalysis::new(source, &[], &op);
     assert_eq!(
         metadata_score,
-        source_prose_scored_location(
-            source,
+        tex::source_prose_scored_location_with_analysis(
+            &analysis,
             3,
-            context,
-            offset,
+            (context, offset),
             1..3,
             true,
-            &nonprinting_source_ranges(source),
             None,
-            &Operation::default()
         )
         .unwrap()
         .2
     );
     assert!(!metadata_beats_frame(
-        source,
+        &analysis,
         3,
         (context, offset),
         10.0,
         272.0,
         metadata_score,
-        &Operation::default()
     ));
     assert!(metadata_beats_frame(
-        source,
+        &analysis,
         3,
         (context, offset),
         228.0,
         272.0,
         metadata_score,
-        &Operation::default()
     ));
 }
 
@@ -3978,7 +2787,7 @@ fn inverse_caption_math_uses_literal_context_not_closing_line_proximity() {
         ("axis is in units of 𝛼𝑘, hence rescaled.", 8),
     ] {
         assert_eq!(
-            source_word_location(source, line, context, context.find('𝛼').unwrap(), 4),
+            word_at(source, line, context, "𝛼", 4),
             Some((
                 row,
                 source
@@ -4009,20 +2818,7 @@ fn inverse_output(
     stdout: &str,
     word: Option<(&str, usize)>,
 ) -> io::Result<InverseResolution> {
-    resolve_inverse_output(
-        pdf,
-        InversePoint {
-            page: 1,
-            x: 72.0,
-            y_from_top: 120.0,
-            page_height_pt: 792.0,
-        },
-        word,
-        0,
-        &Operation::default(),
-        stdout,
-        QuerySources::default(),
-    )
+    inverse_output_at(pdf, ipt(1, 72.0, 120.0, 792.0), word, 0, stdout)
 }
 
 #[test]
@@ -4055,29 +2851,6 @@ fn inverse_no_match_and_competing_anchors_have_distinct_typed_failures() {
 }
 
 #[test]
-fn inverse_raw_hits_preserve_distinct_records_without_trailing_duplicates() {
-    let stdout = "Output: paper.pdf\nInput: preamble.tex\nLine: 9\nColumn: -1\n\
-                  Offset: 0\nContext: ignored\nInput: paper.tex\nLine: 3\n\
-                  Column: -1\nInput: preamble.tex\nLine: 9\nColumn: -1\n";
-    let targets = parse_synctex_edit(stdout);
-    assert_eq!(
-        targets
-            .iter()
-            .map(|target| (target.file.as_str(), target.line))
-            .collect::<Vec<_>>(),
-        vec![("preamble.tex", 9), ("paper.tex", 3)]
-    );
-    for incomplete in [
-        "Output: paper.pdf\nLine: 3\n",
-        "Output: paper.pdf\nInput: paper.tex\n",
-        "Input: paper.tex\nLine: 0\n",
-        "",
-    ] {
-        assert!(parse_synctex_edit(incomplete).is_empty());
-    }
-}
-
-#[test]
 fn inverse_unique_supported_position_beats_unrelated_coarse_hits_in_any_order() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("paper.tex");
@@ -4101,12 +2874,10 @@ fn inverse_unique_supported_position_beats_unrelated_coarse_hits_in_any_order() 
             result.location.file,
             source.canonicalize().unwrap().to_str().unwrap()
         );
-        assert_eq!(result.location.line, 1);
         assert_eq!(
-            result.location.byte_column,
-            caption.find("Mechanical").unwrap()
+            spot(&result),
+            (1, caption.find("Mechanical").unwrap(), true)
         );
-        assert!(result.location.precise);
     }
 }
 
@@ -4135,19 +2906,12 @@ fn inverse_closing_layout_anchor_does_not_guess_a_neighboring_prose_row() {
     let complete = format!("{source}{}Unrelated coarse heading.\n", "\n".repeat(8));
     let coarse_line = complete.lines().count();
     fs::write(directory.path().join("paper.tex"), complete).unwrap();
-    let error = resolve_inverse_output(
+    let error = inverse_output_at(
         &directory.path().join("paper.pdf"),
-        InversePoint {
-            page: 1,
-            x: 10.0,
-            y_from_top: 10.0,
-            page_height_pt: 600.0,
-        },
+        ipt(1, 10.0, 10.0, 600.0),
         Some((first_context, 0)),
         4,
-        &Operation::default(),
         &format!("Input: paper.tex\nLine: 9\nInput: paper.tex\nLine: {coarse_line}\n"),
-        QuerySources::default(),
     )
     .expect_err("unqualified layout rows must remain competing coarse anchors");
     assert!(error.to_string().contains("ambiguous inverse search"));
@@ -4200,8 +2964,7 @@ fn inverse_duplicate_hits_deduplicate_final_canonical_coarse_positions() {
         result.location.file,
         source.canonicalize().unwrap().to_str().unwrap()
     );
-    assert_eq!((result.location.line, result.location.byte_column), (2, 0));
-    assert!(!result.location.precise);
+    assert_eq!(spot(&result), (2, 0, false));
     assert!(result.warning.is_none());
 }
 
@@ -4283,7 +3046,7 @@ fn inverse_generated_hit_remaps_before_bounds_without_reading_reused_verbatim() 
         directory.path().join("deck.synctex"),
         "Input:1:original.tex\nInput:2:deck.vrb\nInput:3:build/deck.toc\nContent:\n\
          {1\n[1,4:0,0:1,1,0\nx2,490:0,0\n]\n}1\n\
-         {2\n[1,7:0,0:1,1,0\nx3,12:0,0\n]\n}2\n",
+         {2\n[1,7:0,0:1,1,0\nx3,12:0,0\n]\n}2\nPostamble:\nCount:6\n",
     )
     .unwrap();
     let result = inverse_output(
@@ -4300,19 +3063,12 @@ fn inverse_generated_hit_remaps_before_bounds_without_reading_reused_verbatim() 
     assert!(!result.location.precise);
     assert!(result.warning.is_none());
 
-    let toc_result = resolve_inverse_output(
+    let toc_result = inverse_output_at(
         &directory.path().join("deck.pdf"),
-        InversePoint {
-            page: 2,
-            x: 72.0,
-            y_from_top: 120.0,
-            page_height_pt: 792.0,
-        },
+        ipt(2, 72.0, 120.0, 792.0),
         Some(("Shared Section Words", 0)),
         0,
-        &Operation::default(),
         "Input: build/deck.toc\nLine: 12\n",
-        QuerySources::default(),
     )
     .unwrap();
     assert_eq!(
@@ -4363,15 +3119,13 @@ f10:50,400
 ";
     let pdf = Path::new("/tmp/main.pdf");
     let file = Path::new("/tmp/main.tex");
-    let candidates =
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, file, None, 5).unwrap();
+    let candidates = forward_candidates_from_reader(synctex.as_bytes(), pdf, file, 5).unwrap();
     assert_eq!(candidates.len(), 2);
     assert!(
         forward_candidates_from_reader(
             b"Input:1:/tmp/other.tex\nContent:\n" as &[u8],
             pdf,
             file,
-            None,
             1
         )
         .is_err()
@@ -4479,7 +3233,7 @@ fn forward_geometry_preserves_top_down_coordinates_and_rejects_overflow() {
             "\"h\":72",
             &format!(
                 "\"h\":72,\"warning\":\"{}\"",
-                "x".repeat(crate::source_snapshot::MAX_WARNING_BYTES + 1)
+                "x".repeat(crate::MAX_WARNING_BYTES + 1)
             ),
         ),
         payload.replace("\"h\":72", r#""h":72,"word":{"words":[],"selected":0}"#),
@@ -4514,24 +3268,48 @@ Slide text
 \\end{verbatim}
 More slide text
 \\end{frame}";
-    assert_eq!(frame_bounds(frame_source, 7), Some((0, 7)));
+    assert_eq!(
+        environment_bounds_with_ignored(frame_source, 7, "frame", &default_ignored(frame_source)),
+        Some(0..8)
+    );
     assert_eq!(normalized_word("oﬃce"), "office");
     assert_eq!(normalized_word(" Café "), " cafe ");
+    // A spacing diacritic stays inside its word and normalizes away.
+    assert_eq!(
+        words("alpha caf\u{00b4}e omega"),
+        vec![(0, "alpha"), (6, "caf\u{00b4}e"), (13, "omega")]
+    );
+    assert_eq!(normalized_word("caf\u{00b4}e"), "cafe");
 
     let article = "\\title{Sample Document Title for Testing}\n\
                    \\maketitle\n\
                    Keywords. Sample-document testing, synthetic examples.\n";
+    let op = Operation::default();
+    let article_analysis = tex::SourceAnalysis::new(article, &[], &op);
     assert!(!metadata_beats_frame(
-        article,
+        &article_analysis,
         3,
         ("Sample-document testing,", 9),
         386.5,
         792.0,
         6,
-        &Operation::default()
     ));
-    assert!(!allows_metadata_fallback(article, 3, 0, 386.5, 792.0));
-    assert!(allows_metadata_fallback(article, 2, 1, 115.0, 792.0));
+    assert!(!allows_metadata_fallback_outside_frame(
+        article,
+        &article_analysis.line_starts,
+        3,
+        0,
+        386.5,
+        792.0,
+    ));
+    assert!(allows_metadata_fallback_outside_frame(
+        article,
+        &article_analysis.line_starts,
+        2,
+        1,
+        115.0,
+        792.0,
+    ));
     assert_eq!(
         source_word_location(article, 3, "Keywords. Sample-document testing", 13, 1),
         Some((3, 10)),
@@ -4576,15 +3354,15 @@ x2,48:0,200
     let pdf = Path::new("/tmp/main.pdf");
     let section = Path::new("/tmp/section.tex");
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 29).unwrap()[0].page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, 29).unwrap()[0].page,
         1
     );
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 44).unwrap()[0].page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, 44).unwrap()[0].page,
         2
     );
     assert_eq!(
-        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, None, 45).unwrap()[0].page,
+        forward_candidates_from_reader(synctex.as_bytes(), pdf, section, 45).unwrap()[0].page,
         2
     );
 }
@@ -4600,60 +3378,39 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
         x
     }
     fn parse_cli_synctex_view(output: &str) -> Vec<ForwardCandidate> {
-        let mut out = Vec::new();
-        let mut page = None::<u32>;
-        let mut h = None::<f32>;
-        let mut v = None::<f32>;
-        let mut w = None::<f32>;
-        let mut height_opt = None::<f32>;
-        let flush = |out: &mut Vec<ForwardCandidate>,
-                     page: &mut Option<u32>,
-                     h: &mut Option<f32>,
-                     v: &mut Option<f32>,
-                     w: &mut Option<f32>,
-                     height_opt: &mut Option<f32>| {
-            if let (Some(p), Some(x), Some(y), Some(width), Some(height)) =
-                (page.take(), h.take(), v.take(), w.take(), height_opt.take())
-                && forward_geometry_valid(p, x, y, width, height)
-            {
-                let cand = ForwardCandidate {
-                    page: p,
-                    source_line: 0,
-                    rect: SearchRect {
-                        left: x,
-                        top: y - height,
-                        right: x + width,
-                        bottom: y,
-                    },
-                };
-                if !out
-                    .iter()
-                    .any(|old| old.page == cand.page && old.rect == cand.rect)
-                {
-                    out.push(cand);
-                }
-            }
-            *page = None;
-            *h = None;
-            *v = None;
-            *w = None;
-            *height_opt = None;
-        };
+        // A `Page:` row starts a record that its `h:`, `v:`, `W:`, and `H:` rows complete.
+        let mut records: Vec<(Option<u32>, [Option<f32>; 4])> = Vec::new();
         for line in output.lines() {
             if let Some(val) = line.strip_prefix("Page:") {
-                flush(&mut out, &mut page, &mut h, &mut v, &mut w, &mut height_opt);
-                page = val.trim().parse().ok();
-            } else if let Some(val) = line.strip_prefix("h:") {
-                h = val.trim().parse().ok();
-            } else if let Some(val) = line.strip_prefix("v:") {
-                v = val.trim().parse().ok();
-            } else if let Some(val) = line.strip_prefix("W:") {
-                w = val.trim().parse().ok();
-            } else if let Some(val) = line.strip_prefix("H:") {
-                height_opt = val.trim().parse().ok();
+                records.push((val.trim().parse().ok(), [None; 4]));
+            } else if let Some((_, fields)) = records.last_mut()
+                && let Some(i) = ["h:", "v:", "W:", "H:"]
+                    .iter()
+                    .position(|k| line.starts_with(k))
+            {
+                fields[i] = line[2..].trim().parse().ok();
             }
         }
-        flush(&mut out, &mut page, &mut h, &mut v, &mut w, &mut height_opt);
+        let mut out: Vec<ForwardCandidate> = Vec::new();
+        for record in records {
+            if let (Some(page), [Some(x), Some(y), Some(width), Some(height)]) = record
+                && forward_geometry_valid(page, x, y, width, height)
+            {
+                let rect = SearchRect {
+                    left: x,
+                    top: y - height,
+                    right: x + width,
+                    bottom: y,
+                };
+                if !out.iter().any(|old| old.page == page && old.rect == rect) {
+                    out.push(ForwardCandidate {
+                        page,
+                        source_line: 0,
+                        rect,
+                    });
+                }
+            }
+        }
         out
     }
     fn gen_box_body(
@@ -4666,11 +3423,7 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
     ) {
         let count = (next_u64(rng) % 6) + 1;
         for idx in 0..count {
-            let tag = if next_u64(rng).is_multiple_of(4) {
-                2
-            } else {
-                1
-            };
+            let tag = 1 + u32::from(next_u64(rng).is_multiple_of(4));
             let line = base_line + (next_u64(rng) % 8) as i64;
             let x = ((next_u64(rng) % 400_000) as i64) + 10_000;
             let y = ((next_u64(rng) % 600_000) as i64) + 20_000;
@@ -4803,13 +3556,8 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
                 false,
             )
             .unwrap_or_default();
-            let _ = forward_candidates_from_reader(
-                synctex.as_bytes(),
-                &pdf,
-                target_tex,
-                None,
-                query_line,
-            );
+            let _ =
+                forward_candidates_from_reader(synctex.as_bytes(), &pdf, target_tex, query_line);
             assert_eq!(
                 actual.len(),
                 expected.len(),
@@ -4846,16 +3594,15 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
                 ])
                 .output()
                 .unwrap();
-            let expected = parse_synctex_edit(&String::from_utf8_lossy(&cli_out.stdout));
+            let expected = compiler_anchors(parse_cli_synctex_edit_candidates(
+                &String::from_utf8_lossy(&cli_out.stdout),
+            ));
             let actual = inverse_candidates_from_reader(
                 synctex.as_bytes(),
-                InversePoint {
-                    page: qpage,
-                    x: qx,
-                    y_from_top: qy,
-                    page_height_pt: 792.0,
-                },
+                ipt(qpage, qx, qy, 792.0),
+                false,
             )
+            .map(compiler_anchors)
             .unwrap_or_default();
             assert_eq!(
                 actual,
@@ -4891,16 +3638,8 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
                 }
             }
             let qline = ((next_u64(&mut rng) % 80) + 1) as u32;
-            let _ = forward_candidates_from_reader(&mutated[..], &pdf, &main_tex, None, qline);
-            let _ = inverse_candidates_from_reader(
-                &mutated[..],
-                InversePoint {
-                    page: 1,
-                    x: 50.0,
-                    y_from_top: 100.0,
-                    page_height_pt: 792.0,
-                },
-            );
+            let _ = forward_candidates_from_reader(&mutated[..], &pdf, &main_tex, qline);
+            let _ = inverse_candidates_from_reader(&mutated[..], ipt(1, 50.0, 100.0, 792.0), false);
         }
     }
 
@@ -4920,33 +3659,23 @@ fn fuzz_forward_candidates_matches_synctex_view_and_survives_malformed_inputs() 
         ),
     ];
     for bad in &adversarial {
-        let _ = forward_candidates_from_reader(bad.as_bytes(), &pdf, &main_tex, None, 1);
-        let _ = inverse_candidates_from_reader(
-            bad.as_bytes(),
-            InversePoint {
-                page: 1,
-                x: 10.0,
-                y_from_top: 10.0,
-                page_height_pt: 792.0,
-            },
-        );
+        let _ = forward_candidates_from_reader(bad.as_bytes(), &pdf, &main_tex, 1);
+        let _ = inverse_candidates_from_reader(bad.as_bytes(), ipt(1, 10.0, 10.0, 792.0), false);
     }
 }
 
 #[test]
 fn tabularx_closing_line_and_inverse_word_refinement() {
-    let source = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "\\begin{table}[t]\n",
-        "\\begin{tabularx}{\\textwidth}{>{\\raggedright\\arraybackslash}p{2.3cm}p{2.2cm}X}\n",
-        "Lorem & Ipsum & Dolor \\\\\n",
-        "consectetur & $\\alpha_k + \\beta_m = \\gamma_n$ & adipiscing elit \\\\\n",
-        "sed do & eiusmod tempor & $\\sum_{j=1}^{q} \\xi_j \\eta_j$ \\\\\n",
-        "\\end{tabularx}\n",
-        "\\end{table}\n",
-        "\\end{document}\n",
-    );
+    let source = "\\documentclass{article}\n\
+                  \\begin{document}\n\
+                  \\begin{table}[t]\n\
+                  \\begin{tabularx}{\\textwidth}{>{\\raggedright\\arraybackslash}p{2.3cm}p{2.2cm}X}\n\
+                  Lorem & Ipsum & Dolor \\\\\n\
+                  consectetur & $\\alpha_k + \\beta_m = \\gamma_n$ & adipiscing elit \\\\\n\
+                  sed do & eiusmod tempor & $\\sum_{j=1}^{q} \\xi_j \\eta_j$ \\\\\n\
+                  \\end{tabularx}\n\
+                  \\end{table}\n\
+                  \\end{document}\n";
     assert_eq!(tabularx_closing_line(source, 3), None);
     for line in 4..=8 {
         assert_eq!(tabularx_closing_line(source, line), Some(8));
@@ -4986,17 +3715,15 @@ fn real_pdflatex_tabularx_forward_and_inverse() {
     let dir = tempfile::tempdir().unwrap();
     let tex = dir.path().join("doc.tex");
     let pdf = dir.path().join("doc.pdf");
-    let source = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{tabularx}\n",
-        "\\begin{document}\n",
-        "\\noindent\n",
-        "\\begin{tabularx}{\\textwidth}{l c X}\n",
-        "Lorem ipsum & dolor sit & amet consectetur \\\\\n",
-        "adipiscing elit & $\\alpha_k + \\beta_m = \\gamma_n$ & sed eiusmod tempor \\\\\n",
-        "\\end{tabularx}\n",
-        "\\end{document}\n",
-    );
+    let source = "\\documentclass{article}\n\
+                  \\usepackage{tabularx}\n\
+                  \\begin{document}\n\
+                  \\noindent\n\
+                  \\begin{tabularx}{\\textwidth}{l c X}\n\
+                  Lorem ipsum & dolor sit & amet consectetur \\\\\n\
+                  adipiscing elit & $\\alpha_k + \\beta_m = \\gamma_n$ & sed eiusmod tempor \\\\\n\
+                  \\end{tabularx}\n\
+                  \\end{document}\n";
     fs::write(&tex, source).unwrap();
     let status = Command::new("pdflatex")
         .args([
@@ -5015,24 +3742,15 @@ fn real_pdflatex_tabularx_forward_and_inverse() {
     assert_eq!(forward.page, 1);
     assert!(forward.width > 0.0 || forward.height > 0.0);
 
-    let point = InversePoint {
-        page: 1,
-        x: forward.h + forward.width * 0.5,
-        y_from_top: forward.v - forward.height * 0.5,
-        page_height_pt: 792.0,
-    };
+    let point = ipt(
+        1,
+        forward.h + forward.width * 0.5,
+        forward.v - forward.height * 0.5,
+        792.0,
+    );
     let context = "adipiscing elit αk + βm = γn sed eiusmod tempor";
     let offset = context.find("eiusmod").unwrap();
-    let inverse = resolve_inverse(
-        &pdf,
-        point,
-        Some((context, offset)),
-        2,
-        &Operation::default(),
-        None,
-        true,
-    )
-    .unwrap();
+    let inverse = inverse_at(&pdf, point, Some((context, offset)), 2, true).unwrap();
     assert!(inverse.location.precise);
     assert_eq!(inverse.location.line, 7);
 }
@@ -5049,7 +3767,8 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
     for _ in 0..=MAX_BOX_DEPTH + 2 {
         deep.push_str("(1,1:0,0:10,10,0\n");
     }
-    let Err(err) = parse_synctex_document(deep.as_bytes()) else {
+    let Err(err) = parser::parse_synctex_document_with_options(deep.as_bytes(), false, None, None)
+    else {
         panic!("expected depth limit error");
     };
     assert!(err.to_string().contains("nesting depth exceeds limit"));
@@ -5060,16 +3779,9 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
         main_tex.display(),
         sub_tex.display(),
     );
-    let candidates = inverse_candidates_from_reader(
-        synctex.as_bytes(),
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 98.0,
-            page_height_pt: 792.0,
-        },
-    )
-    .unwrap();
+    let candidates =
+        inverse_candidates_from_reader(synctex.as_bytes(), ipt(1, 20.0, 98.0, 792.0), false)
+            .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].file, sub_tex.to_string_lossy());
     assert_eq!(candidates[0].line, 42);
@@ -5082,17 +3794,9 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
         main_tex.display(),
         vrb_tex.display(),
     );
-    let fragile_candidates = inverse_candidates_from_reader_with_options(
-        fragile_synctex.as_bytes(),
-        InversePoint {
-            page: 2,
-            x: 20.0,
-            y_from_top: 98.0,
-            page_height_pt: 792.0,
-        },
-        true,
-    )
-    .unwrap();
+    let fragile_candidates =
+        inverse_candidates_from_reader(fragile_synctex.as_bytes(), ipt(2, 20.0, 98.0, 792.0), true)
+            .unwrap();
     assert_eq!(fragile_candidates.len(), 1);
     assert_eq!(fragile_candidates[0].file, vrb_tex.to_string_lossy());
     assert_eq!(fragile_candidates[0].line, 6);
@@ -5104,17 +3808,9 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
         main_tex.display(),
         sub_tex.display(),
     );
-    let strut_candidates = inverse_candidates_from_reader_with_options(
-        strut_synctex.as_bytes(),
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 98.0,
-            page_height_pt: 792.0,
-        },
-        true,
-    )
-    .unwrap();
+    let strut_candidates =
+        inverse_candidates_from_reader(strut_synctex.as_bytes(), ipt(1, 20.0, 98.0, 792.0), true)
+            .unwrap();
     assert_eq!(strut_candidates.len(), 1);
     assert_eq!(strut_candidates[0].file, sub_tex.to_string_lossy());
     assert_eq!(strut_candidates[0].line, 12);
@@ -5122,16 +3818,15 @@ fn parser_enforces_box_depth_and_selected_input_tag() {
 
 #[test]
 fn synctex_cache_reuses_parsed_pages_and_invalidates_on_companion_change() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("doc.pdf", "pdf-v1"),
+        (
+            "doc.tex",
+            "\\documentclass{article}\n\\begin{document}\nfirst word\nsecond word\nthird word\n\\end{document}\n",
+        ),
+    ]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &tex,
-        "\\documentclass{article}\n\\begin{document}\nfirst word\nsecond word\nthird word\n\\end{document}\n",
-    )
-    .unwrap();
     let write_synctex = |line_p1: u32, line_p2: u32| {
         let content = format!(
             "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,{line_p1}:0,0:30000000,40000000,0\n(1,{line_p1}:655360,6553600:6553600,655360,0\nx1,{line_p1}:1310720,6553600\n)\n]\n}}1\n{{2\n[1,{line_p2}:0,0:30000000,40000000,0\n(1,{line_p2}:655360,6553600:6553600,655360,0\nx1,{line_p2}:1310720,6553600\n)\n]\n}}2\nPostamble:\nCount:8\n",
@@ -5142,71 +3837,27 @@ fn synctex_cache_reuses_parsed_pages_and_invalidates_on_companion_change() {
     write_synctex(3, 4);
     let mut cache = SyncTeXCache::default();
     let op = Operation::default();
-    let pt1 = InversePoint {
-        page: 1,
-        x: 20.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
+    let pt1 = ipt(1, 20.0, 98.0, 792.0);
     let pt2 = InversePoint { page: 2, ..pt1 };
-    let r1 = resolve_inverse_with_cache(
-        &pdf,
-        pt1,
-        Some(("first word", 0)),
-        2,
-        &op,
-        None,
-        false,
-        Some(&mut cache),
-    )
-    .unwrap();
-    assert_eq!(r1.location.line, 3);
-    assert!(r1.location.precise);
+    let mut resolve = |point, word| {
+        resolve_inverse_with_cache(&pdf, point, Some(word), 2, &op, false, Some(&mut cache))
+            .unwrap()
+            .location
+    };
+    let r1 = resolve(pt1, ("first word", 0));
+    assert_eq!((r1.line, r1.precise), (3, true));
 
     // Warm hit on page 1 and lazy parse of page 2 from cached raw bytes
-    let r1_again = resolve_inverse_with_cache(
-        &pdf,
-        pt1,
-        Some(("first word", 6)),
-        2,
-        &op,
-        None,
-        false,
-        Some(&mut cache),
-    )
-    .unwrap();
-    assert_eq!(r1_again.location.line, 3);
-    assert_eq!(r1_again.location.column_char, 7);
+    let r1_again = resolve(pt1, ("first word", 6));
+    assert_eq!((r1_again.line, r1_again.column_char), (3, 7));
 
-    let r2 = resolve_inverse_with_cache(
-        &pdf,
-        pt2,
-        Some(("second word", 0)),
-        2,
-        &op,
-        None,
-        false,
-        Some(&mut cache),
-    )
-    .unwrap();
-    assert_eq!(r2.location.line, 4);
-    assert!(r2.location.precise);
+    let r2 = resolve(pt2, ("second word", 0));
+    assert_eq!((r2.line, r2.precise), (4, true));
 
     // Updating the companion file invalidates the cache automatically
     write_synctex(5, 4);
-    let r1_updated = resolve_inverse_with_cache(
-        &pdf,
-        pt1,
-        Some(("third word", 0)),
-        2,
-        &op,
-        None,
-        false,
-        Some(&mut cache),
-    )
-    .unwrap();
-    assert_eq!(r1_updated.location.line, 5);
-    assert!(r1_updated.location.precise);
+    let r1_updated = resolve(pt1, ("third word", 0));
+    assert_eq!((r1_updated.line, r1_updated.precise), (5, true));
 }
 
 #[test]
@@ -5214,16 +3865,15 @@ fn gzip_magic_columns_and_forward_page_hint_work_across_apis() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("doc.pdf", "pdf-v1"),
+        (
+            "doc.tex",
+            "\\documentclass{article}\n\\begin{document}\nalpha beta gamma\n\\end{document}\n",
+        ),
+    ]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &tex,
-        "\\documentclass{article}\n\\begin{document}\nalpha beta gamma\n\\end{document}\n",
-    )
-    .unwrap();
 
     let synctex = format!(
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3,7:0,0:30000000,40000000,0\n(1,3,7:655360,6553600:6553600,655360,0\nx1,3,7:1310720,6553600\n)\n]\n}}1\n{{2\n[1,3,12:0,0:30000000,40000000,0\n(1,3,12:655360,13107200:6553600,655360,0\nx1,3,12:1310720,13107200\n)\n]\n}}2\nPostamble:\nCount:8\n",
@@ -5236,79 +3886,40 @@ fn gzip_magic_columns_and_forward_page_hint_work_across_apis() {
     let gz_bytes = encoder.finish().unwrap();
     fs::write(pdf.with_extension("synctex"), &gz_bytes).unwrap();
 
-    let info = crate::source_snapshot::SourceInfo::read(&pdf).unwrap();
-    assert_eq!(info.main.as_deref(), Some(tex.as_path()));
-
     // 2. Compiler-recorded columns preserved in raw candidates, `parse_synctex_edit`, and `resolve_inverse`
-    let pt1 = InversePoint {
-        page: 1,
-        x: 20.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
+    let pt1 = ipt(1, 20.0, 98.0, 792.0);
     let raw = inverse_candidates(&pdf, pt1).unwrap();
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0].line, 3);
-    assert_eq!(raw[0].byte_column, 6);
-    assert_eq!(raw[0].column, 7);
-    assert_eq!(raw[0].column_char, 7);
-    assert!(!raw[0].precise);
+    assert_eq!(raw[0].compiler_column, Some(7));
+    assert_eq!(compiler_columns("alpha beta gamma", 7), (6, 7, 7));
 
-    let coarse = resolve_inverse(&pdf, pt1, None, 2, &Operation::default(), None, false).unwrap();
-    assert_eq!(coarse.location.line, 3);
-    assert_eq!(coarse.location.byte_column, 6);
-    assert_eq!(coarse.location.column, 7);
-    assert_eq!(coarse.location.column_char, 7);
-    assert!(!coarse.location.precise);
-
-    let parsed_edit = parse_synctex_edit(&format!(
-        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:7\nSyncTeX result end\n",
-        tex.display()
-    ));
-    assert_eq!(parsed_edit.len(), 1);
-    assert_eq!(parsed_edit[0].column, 7);
-    assert_eq!(parsed_edit[0].byte_column, 6);
+    let coarse = inverse_at(&pdf, pt1, None, 2, false).unwrap().location;
+    let columns = (coarse.byte_column, coarse.column, coarse.column_char);
+    assert_eq!(
+        (coarse.line, columns, coarse.precise),
+        (3, (6, 7, 7), false)
+    );
 
     // 3. Forward `page_hint` selects page 2 when hinted, and page 1 by default
     let default_forward = resolve_forward(&pdf, &tex, 3, 1).unwrap();
     assert_eq!(default_forward.page, 1);
 
-    let hinted_forward = resolve_forward_with_selector(
-        &pdf,
-        &tex,
-        3,
-        1,
-        ForwardSource {
-            page_hint: Some(2),
-            ..ForwardSource::default()
-        },
-        |_, _, _, anchor| Ok(anchor),
-    )
-    .unwrap();
-    assert_eq!(hinted_forward.page, 2);
+    let hinted = ForwardSource {
+        page_hint: Some(2),
+        ..ForwardSource::default()
+    };
+    assert_eq!(forward_with(&pdf, &tex, (3, 1), hinted).unwrap().page, 2);
 
     // Plain-text content stored in `.synctex.gz` also decodes cleanly
     fs::remove_file(pdf.with_extension("synctex")).unwrap();
     fs::write(pdf.with_extension("synctex.gz"), synctex.as_bytes()).unwrap();
-    let plain_gz_forward = resolve_forward_with_selector(
-        &pdf,
-        &tex,
-        3,
-        1,
-        ForwardSource {
-            page_hint: Some(2),
-            ..ForwardSource::default()
-        },
-        |_, _, _, anchor| Ok(anchor),
-    )
-    .unwrap();
-    assert_eq!(plain_gz_forward.page, 2);
+    assert_eq!(forward_with(&pdf, &tex, (3, 1), hinted).unwrap().page, 2);
 }
 
 #[test]
 fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let out_dir = root.join("out");
     let build_dir = root.join("build");
     fs::create_dir_all(&out_dir).unwrap();
@@ -5328,67 +3939,60 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
     let sidecar = build_dir.join("separate_build_dir_doc.synctex");
     fs::write(&sidecar, synctex).unwrap();
 
-    assert_eq!(locate_synctex(&pdf), None);
-    assert_eq!(
-        locate_synctex_in(&pdf, Some(&build_dir)).as_deref(),
-        Some(sidecar.as_path())
-    );
+    let locate = |build_directory: Option<&Path>| {
+        companion_revision_and_path_in(&pdf, build_directory)
+            .unwrap()
+            .map(|(_, path)| path)
+    };
+    assert_eq!(locate(None), None);
+    assert_eq!(locate(Some(&build_dir)).as_deref(), Some(sidecar.as_path()));
     // Relative build_directory resolved against pdf.parent()
     assert_eq!(
-        locate_synctex_in(&pdf, Some(Path::new("../build")))
+        locate(Some(Path::new("../build")))
             .and_then(|p| fs::canonicalize(p).ok())
             .as_deref(),
         Some(sidecar.as_path())
     );
 
-    let info = crate::source_snapshot::SourceInfo::read_in(&pdf, Some(&build_dir)).unwrap();
-    assert_eq!(info.main.as_deref(), Some(tex.as_path()));
-    assert_eq!(info.inputs, vec![tex.clone()]);
-
-    let forward = resolve_forward_with_selector(
+    let forward = forward_with(
         &pdf,
         &tex,
-        3,
-        1,
+        (3, 1),
         ForwardSource {
             build_directory: Some(&build_dir),
             ..ForwardSource::default()
         },
-        |_, _, _, anchor| Ok(anchor),
     )
     .unwrap();
     assert_eq!(forward.page, 1);
 
-    let pt = InversePoint {
-        page: 1,
-        x: 19.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
+    let pt = ipt(1, 19.0, 98.0, 792.0);
     let mut cache = SyncTeXCache::default();
-    let inverse = resolve_inverse_with_cache_in(
-        &pdf,
-        pt,
-        Some(("separate build word", 9)),
-        2,
-        &Operation::default(),
-        None,
-        false,
+    let inverse = resolve_inverse_resolved(
+        InverseRequest {
+            pdf: &pdf,
+            point: pt,
+            word: Some(("separate build word", 9)),
+            radius: 2,
+            operation: &Operation::default(),
+            best_guess: false,
+            build_directory: Some(&build_dir),
+        },
         Some(&mut cache),
-        Some(&build_dir),
     )
     .unwrap();
     assert_eq!(Path::new(&inverse.location.file), tex.as_path());
-    assert_eq!(inverse.location.line, 3);
-    assert_eq!(inverse.location.column_char, 10);
-    assert!(inverse.location.precise);
+    let location = &inverse.location;
+    assert_eq!(
+        (location.line, location.column_char, location.precise),
+        (3, 10, true)
+    );
 
     // Configured default build directory via set_build_directory
     set_build_directory(Some(build_dir.clone()));
     let forward_global = resolve_forward(&pdf, &tex, 3, 1).unwrap();
     assert_eq!(forward_global.page, 1);
-    let inverse_global =
-        resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap();
+    let inverse_global = inverse_at(&pdf, pt, None, 2, false).unwrap();
     set_build_directory(None);
     assert_eq!(Path::new(&inverse_global.location.file), tex.as_path());
     assert_eq!(inverse_global.location.line, 3);
@@ -5396,111 +4000,8 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
 }
 
 #[test]
-fn snapshot_preserves_fallback_source_identity_and_required_cache_validation() {
-    use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::fmt::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let client_dir = root.join("client");
-    let build_dir = root.join("build");
-    let cache_dir = root.join("cache");
-    fs::create_dir_all(&client_dir).unwrap();
-    fs::create_dir_all(&build_dir).unwrap();
-    fs::create_dir_all(&cache_dir).unwrap();
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let pdf = build_dir.join("main.pdf");
-    let tex = build_dir.join("main.tex");
-    let source_text =
-        "\\documentclass{article}\n\\begin{document}\nsnapshot fallback line\n\\end{document}\n";
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&tex, source_text).unwrap();
-
-    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3,10:0,0:30000000,40000000,0\n(1,3,10:655360,6553600:6553600,655360,0\nx1,3,10:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
-    fs::write(build_dir.join("main.synctex"), synctex).unwrap();
-
-    fs::write(cache_dir.join("1.txt"), source_text).unwrap();
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(source_text.as_bytes()).iter() {
-        write!(digest, "{byte:02x}").unwrap();
-    }
-    let manifest_path = cache_dir.join("manifest.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec(&serde_json::json!({
-            "pdf": pdf,
-            "revision": DocumentRevision::read(&pdf).unwrap(),
-            "cwd": client_dir,
-            "main": tex,
-            "files": BTreeMap::from([(tex.clone(), "1.txt")]),
-            "digests": BTreeMap::from([(tex.clone(), digest)]),
-            "warnings": {},
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    // Forward navigation with snapshot resolves ./main.tex to captured build/main.tex
-    let forward = resolve_forward_with_selector(
-        &pdf,
-        &tex,
-        3,
-        1,
-        ForwardSource {
-            snapshot: Some(&manifest_path),
-            ..ForwardSource::default()
-        },
-        |_, _, _, anchor| Ok(anchor),
-    )
-    .unwrap();
-    assert_eq!(forward.page, 1);
-
-    // Inverse navigation with snapshot returns captured build/main.tex (not client/main.tex)
-    let pt = InversePoint {
-        page: 1,
-        x: 19.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
-    let inverse = resolve_inverse(
-        &pdf,
-        pt,
-        Some(("snapshot fallback line", 9)),
-        2,
-        &Operation::default(),
-        Some(&manifest_path),
-        false,
-    )
-    .unwrap();
-    assert_eq!(Path::new(&inverse.location.file), tex.as_path());
-    assert_eq!(inverse.location.line, 3);
-    assert!(inverse.location.precise);
-
-    // Deleting the required cached source file must fail with a required-cache error
-    fs::remove_file(cache_dir.join("1.txt")).unwrap();
-    let err = resolve_inverse(
-        &pdf,
-        pt,
-        None,
-        2,
-        &Operation::default(),
-        Some(&manifest_path),
-        false,
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("required compiled source cache"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
     fs::write(&pdf, b"pdf-v1").unwrap();
@@ -5520,36 +4021,11 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
     );
     fs::write(pdf.with_extension("synctex"), &unicode_synctex).unwrap();
 
-    let pt = InversePoint {
-        page: 1,
-        x: 19.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
+    let pt = ipt(1, 19.0, 98.0, 792.0);
     let raw_unicode = inverse_candidates(&pdf, pt).unwrap();
     assert_eq!(raw_unicode.len(), 1);
-    assert_eq!(
-        (
-            raw_unicode[0].byte_column,
-            raw_unicode[0].column,
-            raw_unicode[0].column_char
-        ),
-        (2, 2, 2)
-    );
-
-    let edit_unicode = parse_synctex_edit(&format!(
-        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:3\nSyncTeX result end\n",
-        tex.display()
-    ));
-    assert_eq!(edit_unicode.len(), 1);
-    assert_eq!(
-        (
-            edit_unicode[0].byte_column,
-            edit_unicode[0].column,
-            edit_unicode[0].column_char
-        ),
-        (2, 2, 2)
-    );
+    assert_eq!(raw_unicode[0].compiler_column, Some(3));
+    assert_eq!(compiler_columns("éé alpha omega", 3), (2, 2, 2));
 
     // 2. Two distinct compiler columns (12 and 7) on the same line straddling the click point:
     // Both raw APIs must retain both candidates, and strict resolve_inverse must report ambiguity.
@@ -5562,54 +4038,20 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
     let raw_two = inverse_candidates(&pdf, pt).unwrap();
     assert_eq!(raw_two.len(), 2);
     assert_eq!(
-        (
-            raw_two[0].byte_column,
-            raw_two[0].column,
-            raw_two[0].column_char
-        ),
-        (11, 10, 10)
+        (raw_two[0].compiler_column, raw_two[1].compiler_column),
+        (Some(12), Some(7))
     );
-    assert_eq!(
-        (
-            raw_two[1].byte_column,
-            raw_two[1].column,
-            raw_two[1].column_char
-        ),
-        (6, 5, 5)
-    );
+    assert_eq!(compiler_columns("éé alpha omega", 12), (11, 10, 10));
+    assert_eq!(compiler_columns("éé alpha omega", 7), (6, 5, 5));
 
-    let edit_two = parse_synctex_edit(&format!(
-        "SyncTeX result begin\nInput:{}\nLine:3\nColumn:12\nInput:{}\nLine:3\nColumn:7\nSyncTeX result end\n",
-        tex.display(),
-        tex.display()
-    ));
-    assert_eq!(edit_two.len(), 2);
-    assert_eq!(
-        (
-            edit_two[0].byte_column,
-            edit_two[0].column,
-            edit_two[0].column_char
-        ),
-        (11, 10, 10)
-    );
-    assert_eq!(
-        (
-            edit_two[1].byte_column,
-            edit_two[1].column,
-            edit_two[1].column_char
-        ),
-        (6, 5, 5)
-    );
-
-    let strict_err =
-        resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, false).unwrap_err();
+    let strict_err = inverse_at(&pdf, pt, None, 2, false).unwrap_err();
     assert!(
         strict_err
             .to_string()
             .contains("multiple coarse source anchors"),
         "expected ambiguity error, got: {strict_err}"
     );
-    let guessed = resolve_inverse(&pdf, pt, None, 2, &Operation::default(), None, true).unwrap();
+    let guessed = inverse_at(&pdf, pt, None, 2, true).unwrap();
     assert_eq!(
         (
             guessed.location.byte_column,
@@ -5627,104 +4069,16 @@ fn same_line_distinct_columns_and_unicode_column_units_are_consistent() {
 }
 
 #[test]
-fn snapshot_normalize_does_not_substitute_unrelated_absolute_file_in_cwd() {
-    use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::fmt::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let build_dir = root.join("build");
-    let client_dir = root.join("client");
-    let cache_dir = root.join("cache");
-    fs::create_dir_all(&build_dir).unwrap();
-    fs::create_dir_all(&client_dir).unwrap();
-    fs::create_dir_all(&cache_dir).unwrap();
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let pdf = build_dir.join("doc.pdf");
-    let build_tex = build_dir.join("main.tex");
-    let client_tex = client_dir.join("main.tex");
-    let source_text = "\\documentclass{article}\n\\begin{document}\nalpha beta\n\\end{document}\n";
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&build_tex, source_text).unwrap();
-
-    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
-    fs::write(pdf.with_extension("synctex"), synctex).unwrap();
-
-    fs::write(cache_dir.join("1.txt"), source_text).unwrap();
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(source_text.as_bytes()).iter() {
-        write!(digest, "{byte:02x}").unwrap();
-    }
-    let manifest_path = cache_dir.join("manifest.json");
-    let manifest = serde_json::json!({
-        "pdf": pdf,
-        "revision": DocumentRevision::read(&pdf).unwrap(),
-        "cwd": client_dir,
-        "main": build_tex,
-        "files": BTreeMap::from([(build_tex.clone(), "1.txt")]),
-        "digests": BTreeMap::from([(build_tex.clone(), digest)]),
-        "warnings": {},
-    });
-    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-    // Now create an unrelated file at client/main.tex and attempt forward search for it.
-    fs::write(
-        &client_tex,
-        "\\documentclass{article}\n\\begin{document}\ngamma delta\n\\end{document}\n",
-    )
-    .unwrap();
-
-    let strict_err = resolve_forward_with_selector(
-        &pdf,
-        &client_tex,
-        3,
-        1,
-        ForwardSource {
-            snapshot: Some(&manifest_path),
-            ..ForwardSource::default()
-        },
-        |_, _, _, anchor| Ok(anchor),
-    )
-    .unwrap_err();
-    assert!(
-        strict_err.to_string().contains("not captured in snapshot"),
-        "expected uncaptured-input error for unrelated client/main.tex, got: {strict_err}"
-    );
-
-    let guess_err = resolve_forward_with_selector(
-        &pdf,
-        &client_tex,
-        3,
-        1,
-        ForwardSource {
-            snapshot: Some(&manifest_path),
-            best_guess: true,
-            ..ForwardSource::default()
-        },
-        |_, _, _, anchor| Ok(anchor),
-    )
-    .unwrap_err();
-    assert!(
-        is_forward_unavailable(&guess_err),
-        "expected forward unavailable for unrelated client/main.tex, got: {guess_err}"
-    );
-}
-
-#[test]
 fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("doc.pdf", "pdf-v1"),
+        (
+            "doc.tex",
+            "\\documentclass{article}\n\\begin{document}\nhello\n\\end{document}\n",
+        ),
+    ]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &tex,
-        "\\documentclass{article}\n\\begin{document}\nhello\n\\end{document}\n",
-    )
-    .unwrap();
 
     // Item 4: multibyte UTF-8 and trailing garbage in postscript offset unit suffix (e.g. "1pα", "1ptα") must return Err,
     // while scientific notation ("0e0sp", "1e0sp", "0E0sp") is accepted.
@@ -5734,12 +4088,7 @@ fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
             tex.display()
         );
         fs::write(pdf.with_extension("synctex"), &bad_offset).unwrap();
-        let pt = InversePoint {
-            page: 1,
-            x: 10.0,
-            y_from_top: 10.0,
-            page_height_pt: 792.0,
-        };
+        let pt = ipt(1, 10.0, 10.0, 792.0);
         assert!(
             inverse_candidates(&pdf, pt).is_err(),
             "expected error for {bad}"
@@ -5762,12 +4111,7 @@ fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
     }
 
     // Item 5: i64::MIN width in hbox geometry must be rejected with InvalidInput.
-    let pt = InversePoint {
-        page: 1,
-        x: 10.0,
-        y_from_top: 10.0,
-        page_height_pt: 792.0,
-    };
+    let pt = ipt(1, 10.0, 10.0, 792.0);
     let min_width = format!(
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:{},655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
         tex.display(),
@@ -5778,130 +4122,20 @@ fn malformed_postscript_offset_and_min_integer_geometry_do_not_panic() {
     assert_eq!(min_err.kind(), io::ErrorKind::InvalidInput);
 }
 
-#[test]
-fn warm_synctex_cache_respects_snapshot_authority_and_spacing_diacritics() {
-    use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::fmt::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-
-    // 1. Spacing diacritics (e.g. OT1 acute '\u{00b4}') stay attached to words and match TeX accents.
-    let tokenized = words("alpha caf\u{00b4}e omega");
-    assert_eq!(
-        tokenized,
-        vec![(0, "alpha"), (6, "caf\u{00b4}e"), (13, "omega")]
-    );
-    assert_eq!(normalized_word("caf\u{00b4}e"), "cafe");
-
-    // 2. Warm SyncTeXCache must not reuse a non-snapshot structural map when a snapshot is supplied.
-    let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let build = root.join("build");
-    let storage = root.join("snapshot");
-    for d in [&build, &storage] {
-        fs::create_dir_all(d).unwrap();
-    }
-    fs::set_permissions(&storage, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let pdf = build.join("deck.pdf");
-    let tex = build.join("main.tex");
-    let compiled = "\\documentclass{beamer}\n\\begin{document}\n\\begin{frame}[fragile]\nSynthetic body words.\n\\end{frame}\n\\end{document}\n";
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    let map = "SyncTeX Version:1\nInput:1:./main.tex\nInput:2:./deck.vrb\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
-    fs::write(pdf.with_extension("synctex"), map).unwrap();
-
-    let cached = storage.join("1.txt");
-    fs::write(&cached, compiled).unwrap();
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(compiled.as_bytes()).iter() {
-        write!(digest, "{byte:02x}").unwrap();
-    }
-    let manifest_path = storage.join("manifest.json");
-    let manifest = serde_json::json!({
-        "pdf": pdf,
-        "revision": DocumentRevision::read(&pdf).unwrap(),
-        "cwd": cwd,
-        "main": tex,
-        "files": BTreeMap::from([(tex.clone(), "1.txt")]),
-        "digests": BTreeMap::from([(tex.clone(), digest)]),
-        "warnings": {},
-    });
-    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let snapshot = SourceSnapshot::load(&manifest_path, &pdf).unwrap();
-
-    let pt = InversePoint {
-        page: 1,
-        x: 19.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
-    let mut cache = SyncTeXCache::default();
-    let _ = resolve_inverse_with_cache(
-        &pdf,
-        pt,
-        None,
-        2,
-        &Operation::default(),
-        None,
-        true,
-        Some(&mut cache),
-    )
-    .unwrap();
-    let warm = resolve_inverse_with_cache(
-        &pdf,
-        pt,
-        None,
-        2,
-        &Operation::default(),
-        Some(&snapshot),
-        true,
-        Some(&mut cache),
-    )
-    .unwrap();
-    assert_eq!(Path::new(&warm.location.file), tex.as_path());
-    assert_eq!(warm.location.line, 5);
-
-    fs::remove_file(&cached).unwrap();
-    let missing_err = resolve_inverse_with_cache(
-        &pdf,
-        pt,
-        None,
-        2,
-        &Operation::default(),
-        Some(&snapshot),
-        true,
-        Some(&mut cache),
-    )
-    .unwrap_err();
-    assert!(
-        missing_err
-            .to_string()
-            .contains("required compiled source cache"),
-        "expected required cache error, got: {missing_err}"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn fifo_synctex_sidecar_is_rejected_without_blocking() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     fs::write(&pdf, b"pdf-v1").unwrap();
     let fifo = pdf.with_extension("synctex");
     let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
 
-    let pt = InversePoint {
-        page: 1,
-        x: 10.0,
-        y_from_top: 10.0,
-        page_height_pt: 792.0,
-    };
+    let pt = ipt(1, 10.0, 10.0, 792.0);
     let err = inverse_candidates(&pdf, pt).unwrap_err();
     assert!(
         err.to_string().contains("regular file"),
@@ -5911,19 +4145,16 @@ fn fifo_synctex_sidecar_is_rejected_without_blocking() {
 
 #[test]
 fn macro_printed_text_does_not_jump_to_adjacent_literal_line_with_precise_true() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
     fs::write(&pdf, b"pdf-v1").unwrap();
-    let source = concat!(
-        "\\documentclass{article}\n",
-        "\\newcommand{\\Other}{Copper needle Nickel}\n",
-        "\\begin{document}\n",
-        "\\Other\\par\n",
-        "Copper needle Nickel\\par\n",
-        "\\end{document}\n",
-    );
+    let source = "\\documentclass{article}\n\
+                  \\newcommand{\\Other}{Copper needle Nickel}\n\
+                  \\begin{document}\n\
+                  \\Other\\par\n\
+                  Copper needle Nickel\\par\n\
+                  \\end{document}\n";
     fs::write(&tex, source).unwrap();
 
     // Anchor on line 4 (`\Other\par`) must not jump to literal `Copper needle Nickel` on line 5.
@@ -5932,28 +4163,11 @@ fn macro_printed_text_does_not_jump_to_adjacent_literal_line_with_precise_true()
         None
     );
 
-    let synctex = format!(
-        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,4:0,0:30000000,40000000,0\n(1,4:655360,6553600:6553600,655360,0\nx1,4:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
-        tex.display()
-    );
+    let synctex = synctex_doc(&[&tex], &[&text_sheet((1, 4), (1, 4))]);
     fs::write(pdf.with_extension("synctex"), synctex).unwrap();
 
-    let pt = InversePoint {
-        page: 1,
-        x: 19.0,
-        y_from_top: 98.0,
-        page_height_pt: 792.0,
-    };
-    let resolved = resolve_inverse(
-        &pdf,
-        pt,
-        Some(("Copper needle Nickel", 7)),
-        2,
-        &Operation::default(),
-        None,
-        false,
-    )
-    .unwrap();
+    let pt = ipt(1, 19.0, 98.0, 792.0);
+    let resolved = inverse_at(&pdf, pt, Some(("Copper needle Nickel", 7)), 2, false).unwrap();
     assert_eq!(resolved.location.line, 4);
     assert!(!resolved.location.precise);
     assert!(resolved.warning.is_none());
@@ -5961,37 +4175,31 @@ fn macro_printed_text_does_not_jump_to_adjacent_literal_line_with_precise_true()
 
 #[test]
 fn parser_rejects_truncated_postamble_invalid_headers_unresolved_forms_and_bad_points() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("doc.pdf", "pdf-v1"),
+        (
+            "doc.tex",
+            "\\documentclass{article}\n\\begin{document}\nword\n\\end{document}\n",
+        ),
+    ]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &tex,
-        "\\documentclass{article}\n\\begin{document}\nword\n\\end{document}\n",
-    )
-    .unwrap();
 
-    let pt = InversePoint {
-        page: 1,
-        x: 10.0,
-        y_from_top: 10.0,
-        page_height_pt: 792.0,
-    };
+    let pt = ipt(1, 10.0, 10.0, 792.0);
 
     // 1. Truncated postamble (SyncTeX Version:1 without Postamble:/Count:)
     let truncated = format!(
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:100,100,0\n]\n}}1\n",
         tex.display()
     );
-    assert!(inverse_candidates_from_reader(truncated.as_bytes(), pt).is_err());
+    assert!(inverse_candidates_from_reader(truncated.as_bytes(), pt, false).is_err());
 
     // 2. Unclosed box / sheet
     let unclosed = format!(
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:100,100,0\nPostamble:\nCount:2\n",
         tex.display()
     );
-    assert!(inverse_candidates_from_reader(unclosed.as_bytes(), pt).is_err());
+    assert!(inverse_candidates_from_reader(unclosed.as_bytes(), pt, false).is_err());
 
     // 3. Non-positive or malformed Unit / Magnification
     for bad_header in [
@@ -6006,7 +4214,7 @@ fn parser_rejects_truncated_postamble_invalid_headers_unresolved_forms_and_bad_p
             tex.display()
         );
         assert!(
-            inverse_candidates_from_reader(doc.as_bytes(), pt).is_err(),
+            inverse_candidates_from_reader(doc.as_bytes(), pt, false).is_err(),
             "expected error for {bad_header}"
         );
     }
@@ -6016,77 +4224,47 @@ fn parser_rejects_truncated_postamble_invalid_headers_unresolved_forms_and_bad_p
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n<1\n>\n{{1\n[1,3:0,0:100,100,0\nf1:0,0\n]\n}}1\nPostamble:\nCount:4\n",
         tex.display()
     );
-    assert!(inverse_candidates_from_reader(empty_form.as_bytes(), pt).is_err());
+    assert!(inverse_candidates_from_reader(empty_form.as_bytes(), pt, false).is_err());
 
     let cyclic_form = format!(
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n<1\n(1,3:0,0:100,100,0\nf1:0,0\n)\n>\n{{1\n[1,3:0,0:100,100,0\nf1:0,0\n]\n}}1\nPostamble:\nCount:5\n",
         tex.display()
     );
-    assert!(inverse_candidates_from_reader(cyclic_form.as_bytes(), pt).is_err());
+    assert!(inverse_candidates_from_reader(cyclic_form.as_bytes(), pt, false).is_err());
 
     // 5. Invalid InversePoint rejected by raw inverse APIs
-    let valid_doc = format!(
-        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
-        tex.display()
-    );
+    let valid_doc = synctex_doc(&[&tex], &[&text_sheet((1, 3), (1, 3))]);
     for bad_pt in [
-        InversePoint {
-            page: 0,
-            x: 10.0,
-            y_from_top: 10.0,
-            page_height_pt: 792.0,
-        },
-        InversePoint {
-            page: 1,
-            x: f32::NAN,
-            y_from_top: 10.0,
-            page_height_pt: 792.0,
-        },
-        InversePoint {
-            page: 1,
-            x: 10.0,
-            y_from_top: 10.0,
-            page_height_pt: 0.0,
-        },
+        ipt(0, 10.0, 10.0, 792.0),
+        ipt(1, f32::NAN, 10.0, 792.0),
+        ipt(1, 10.0, 10.0, 0.0),
     ] {
-        let err = inverse_candidates_from_reader(valid_doc.as_bytes(), bad_pt).unwrap_err();
+        let err = inverse_candidates_from_reader(valid_doc.as_bytes(), bad_pt, false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     // 6. Public InverseFailure downcasting via inverse_failure()
     fs::write(pdf.with_extension("synctex"), &valid_doc).unwrap();
-    let miss_err = resolve_inverse(
-        &pdf,
-        InversePoint {
-            page: 9,
-            x: 10.0,
-            y_from_top: 10.0,
-            page_height_pt: 792.0,
-        },
-        None,
-        2,
-        &Operation::default(),
-        None,
-        false,
-    )
-    .unwrap_err();
+    let miss_err = inverse_at(&pdf, ipt(9, 10.0, 10.0, 792.0), None, 2, false).unwrap_err();
     assert_eq!(inverse_failure(&miss_err), Some(&InverseFailure::NoMatch));
 
     // 7. `.pdf.synctex` companion discovery and PDF-adjacent precedence over build_directory
     fs::remove_file(pdf.with_extension("synctex")).unwrap();
     let pdf_synctex = root.join("doc.pdf.synctex");
     fs::write(&pdf_synctex, &valid_doc).unwrap();
-    assert_eq!(locate_synctex(&pdf).as_deref(), Some(pdf_synctex.as_path()));
+    assert_eq!(
+        companion_revision_and_path_in(&pdf, None)
+            .unwrap()
+            .map(|(_, path)| path)
+            .as_deref(),
+        Some(pdf_synctex.as_path())
+    );
 }
 
 #[test]
 fn protruding_child_box_expands_both_sides_of_parent_visible_bounds() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let pdf = root.join("doc.pdf");
+    let (_dir, root) = temp_project(&[("doc.pdf", "pdf-v1"), ("doc.tex", "line1\nline2\n")]);
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&tex, "line1\nline2\n").unwrap();
 
     // Parent hbox (line 1) spans x=[655360, 1310720] (~10pt..20pt), y=[6553600-327680, 6553600] (~95pt..100pt).
     // Child hbox (line 1) protrudes on both left and right: x=[327680, 3276800] (~5pt..50pt)
@@ -6096,32 +4274,21 @@ fn protruding_child_box_expands_both_sides_of_parent_visible_bounds() {
         "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,1:0,0:30000000,40000000,0\n(1,1:655360,6553600:655360,327680,0\n(1,1:327680,6553600:2949120,655360,655360\nx1,1:327680,6553600\n)\n)\n(1,2:13107200,6553600:655360,327680,0\nx1,2:13107200,6553600\n)\n]\n}}1\nPostamble:\nCount:7\n",
         tex.display()
     );
-    let hits = inverse_candidates_from_reader_with_options(
-        synctex.as_bytes(),
-        InversePoint {
-            page: 1,
-            x: 45.0,
-            y_from_top: 108.0,
-            page_height_pt: 792.0,
-        },
-        true,
-    )
-    .unwrap();
+    let hits = inverse_candidates_from_reader(synctex.as_bytes(), ipt(1, 45.0, 108.0, 792.0), true)
+        .unwrap();
     assert!(!hits.is_empty());
     assert_eq!(hits[0].line, 1);
 }
 
 #[test]
 fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
-    let source = concat!(
-        "\\DeclareMathOperator{\\SampleOp}{SampleOp}\n",
-        "\\newcommand{\\samplepair}[2]{\\langle #1, #2 \\rangle}\n",
-        "\\newcommand{\\red}[1]{\\textcolor{red}{#1}}\n",
-        "\\begin{frame}{Sample Title}\n",
-        "The \\red{highlighted} color is red.\n",
-        "$\\SampleOp(x) + \\samplepair{alpha}{beta}$\n",
-        "\\end{frame}\n",
-    );
+    let source = "\\DeclareMathOperator{\\SampleOp}{SampleOp}\n\
+                  \\newcommand{\\samplepair}[2]{\\langle #1, #2 \\rangle}\n\
+                  \\newcommand{\\red}[1]{\\textcolor{red}{#1}}\n\
+                  \\begin{frame}{Sample Title}\n\
+                  The \\red{highlighted} color is red.\n\
+                  $\\SampleOp(x) + \\samplepair{alpha}{beta}$\n\
+                  \\end{frame}\n";
     let closing_line = 7;
 
     let color_context = "The highlighted color is red.";
@@ -6143,12 +4310,10 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
         Some((6, "$\\SampleOp(x) + \\samplepair{".len()))
     );
 
-    let coloneqq_source = concat!(
-        "\\begin{frame}{Sample Title}\n",
-        "$a \\Coloneqq b$\n",
-        "$a \\coloneqq b$\n",
-        "\\end{frame}\n",
-    );
+    let coloneqq_source = "\\begin{frame}{Sample Title}\n\
+                           $a \\Coloneqq b$\n\
+                           $a \\coloneqq b$\n\
+                           \\end{frame}\n";
     assert_eq!(
         source_word_location(coloneqq_source, 4, "a ::= b", 0, 2),
         Some((2, 1))
@@ -6158,23 +4323,19 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
         Some((3, 1))
     );
 
-    let nested_source = concat!(
-        "\\newcommand{\\id}[1]{#1}\n",
-        "\\newcommand{\\wrap}[1]{\\id{#1}}\n",
-        "\\begin{frame}{Sample Title}\n",
-        "$\\wrap{alpha} + beta$\n",
-        "\\end{frame}\n",
-    );
+    let nested_source = "\\newcommand{\\id}[1]{#1}\n\
+                         \\newcommand{\\wrap}[1]{\\id{#1}}\n\
+                         \\begin{frame}{Sample Title}\n\
+                         $\\wrap{alpha} + beta$\n\
+                         \\end{frame}\n";
     assert_eq!(
         source_word_location(nested_source, 5, "alpha + beta", 0, 2),
         Some((4, "$\\wrap{".len()))
     );
 
-    let gap_source = concat!(
-        "\\begin{frame}{Sample Title}\n",
-        "$A \\xrightarrow[sub]{sup} B + \\custom{alpha} + \\sum_{i=1}^n x_k$\n",
-        "\\end{frame}\n",
-    );
+    let gap_source = "\\begin{frame}{Sample Title}\n\
+                      $A \\xrightarrow[sub]{sup} B + \\custom{alpha} + \\sum_{i=1}^n x_k$\n\
+                      \\end{frame}\n";
     let gap_context = "A sup sub \u{2192} B + alpha + \u{2211} n i=1 xk";
     for (word, needle) in [
         ("sup", "sup"),
@@ -6194,53 +4355,45 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
     for (bad_source, bad_line, bad_context, bad_word) in [
         // \def overriding \newcommand in preamble must invalidate the macro.
         (
-            concat!(
-                "\\newcommand{\\foo}{alpha}\n",
-                "\\def\\foo{beta}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$\\foo$\n",
-                "\\end{frame}\n",
-            ),
+            "\\newcommand{\\foo}{alpha}\n\
+             \\def\\foo{beta}\n\
+             \\begin{frame}{Sample Title}\n\
+             $\\foo$\n\
+             \\end{frame}\n",
             5,
             "alpha",
             "alpha",
         ),
         // \let overriding \newcommand in preamble must invalidate the macro.
         (
-            concat!(
-                "\\newcommand{\\foo}{alpha}\n",
-                "\\let\\foo\\relax\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$\\foo$\n",
-                "\\end{frame}\n",
-            ),
+            "\\newcommand{\\foo}{alpha}\n\
+             \\let\\foo\\relax\n\
+             \\begin{frame}{Sample Title}\n\
+             $\\foo$\n\
+             \\end{frame}\n",
             5,
             "alpha",
             "alpha",
         ),
         // Body-scoped \renewcommand must invalidate the macro.
         (
-            concat!(
-                "\\newcommand{\\foo}{alpha}\n",
-                "\\begin{document}\n",
-                "\\renewcommand{\\foo}{beta}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$\\foo$\n",
-                "\\end{frame}\n",
-                "\\end{document}\n",
-            ),
+            "\\newcommand{\\foo}{alpha}\n\
+             \\begin{document}\n\
+             \\renewcommand{\\foo}{beta}\n\
+             \\begin{frame}{Sample Title}\n\
+             $\\foo$\n\
+             \\end{frame}\n\
+             \\end{document}\n",
             6,
             "alpha",
             "alpha",
         ),
         // \providecommand must not override unknown prior definition.
         (
-            concat!(
-                "\\providecommand{\\foo}{alpha}\n",
-                "\\begin{frame}{Sample Title}\n",
-                "$\\foo$\n",
-                "\\end{frame}\n",
-            ),
+            "\\providecommand{\\foo}{alpha}\n\
+             \\begin{frame}{Sample Title}\n\
+             $\\foo$\n\
+             \\end{frame}\n",
             4,
             "alpha",
             "alpha",
@@ -6256,12 +4409,10 @@ fn inverse_frame_math_macros_and_color_wrappers_refine_inside_frame() {
 
     // Unmodeled document-defined macro (\def\hide#1{}) consumes its {...} arguments
     // into the '\0' gap so hidden tokens do not steal matches from later visible math.
-    let hide_source = concat!(
-        "\\def\\hide#1{}\n",
-        "\\begin{document}\n",
-        "$\\hide{x a} + x b$\n",
-        "\\end{document}\n",
-    );
+    let hide_source = "\\def\\hide#1{}\n\
+                       \\begin{document}\n\
+                       $\\hide{x a} + x b$\n\
+                       \\end{document}\n";
     let hide_line = hide_source.lines().nth(2).unwrap();
     assert_eq!(
         source_word_location(hide_source, 3, "+ x b", 2, 2),
@@ -6320,12 +4471,10 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
         ))
     );
 
-    let frame_source = concat!(
-        "\\begin{frame}{Sample Title}\n",
-        "\\includegraphics[width=3cm]{figs/left.pdf}\n",
-        "\\includegraphics[width=3cm]{figs/right.pdf}\n",
-        "\\end{frame}\n",
-    );
+    let frame_source = "\\begin{frame}{Sample Title}\n\
+                        \\includegraphics[width=3cm]{figs/left.pdf}\n\
+                        \\includegraphics[width=3cm]{figs/right.pdf}\n\
+                        \\end{frame}\n";
     assert_eq!(
         source_graphics_location(frame_source, 4, 0, 2, true),
         Some((
@@ -6358,12 +4507,10 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     let empty_arg = "\\includegraphics{  % nothing\n}\n";
     assert_eq!(source_graphics_location(empty_arg, 1, 0, 1, false), None);
     // Equal lexical and rendered counts under conditionals/duplicating macros must abstain.
-    let conditional_dup = concat!(
-        "\\newcommand{\\twice}[1]{#1#1}\n",
-        "\\begin{document}\n",
-        "\\iffalse\\includegraphics[width=30pt]{figs/hidden.pdf}\\fi\\twice{\\includegraphics[width=30pt]{figs/dup.pdf}}\n",
-        "\\end{document}\n",
-    );
+    let conditional_dup = "\\newcommand{\\twice}[1]{#1#1}\n\
+                           \\begin{document}\n\
+                           \\iffalse\\includegraphics[width=30pt]{figs/hidden.pdf}\\fi\\twice{\\includegraphics[width=30pt]{figs/dup.pdf}}\n\
+                           \\end{document}\n";
     assert_eq!(
         source_graphics_location(conditional_dup, 3, 0, 2, false),
         None
@@ -6371,18 +4518,15 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
 
     // 2. End-to-end resolve_inverse test with two \includegraphics on line 3, prose on line 3,
     // and a non-graphics \scalebox{2}{ScaledText} on line 4.
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
     fs::write(&pdf, b"pdf-v1").unwrap();
-    let tex_source = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "ProseLabel \\includegraphics[width=20pt]{figs/first.pdf} \\includegraphics[width=20pt]{figs/second.pdf}\n",
-        "\\scalebox{2}{ScaledText} \\includegraphics[width=20pt]{figs/third.pdf}\n",
-        "\\end{document}\n",
-    );
+    let tex_source = "\\documentclass{article}\n\
+                      \\begin{document}\n\
+                      ProseLabel \\includegraphics[width=20pt]{figs/first.pdf} \\includegraphics[width=20pt]{figs/second.pdf}\n\
+                      \\scalebox{2}{ScaledText} \\includegraphics[width=20pt]{figs/third.pdf}\n\
+                      \\end{document}\n";
     fs::write(&tex, tex_source).unwrap();
 
     // Unit = 65536 (1pt = 1 unit in synctex coords when Unit=65536, Magnification=1000).
@@ -6393,298 +4537,82 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     // Line 4 hbox at y=200pt, height=30pt:
     // - Non-graphics \scalebox{2}{ScaledText} at x=10..40 (only 1 wrapper above b_idx, plus g node inside d_idx)
     // - Third \includegraphics outer box at x=50..80, y=170..200
-    let synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{tex}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:65536\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,5:0,0:400,792,0\n",
-            "(1,3:10,100:130,30,0\n",
-            "g1,3:10,100\n",
-            "x1,3:40,100\n",
-            "(1,3:50,100:30,30,0\n",
-            "(1,3:50,100:30,30,0\n",
-            "(1,3:50,100:0,30,0\n",
-            "(1,3:50,100:0,15,0\n",
-            "(1,3:50,100:15,15,0\n",
-            "k1,3:65,100:0\n",
-            ")\n",
-            "k1,3:50,100:-15\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "(1,3:100,100:30,30,0\n",
-            "(1,3:100,100:30,30,0\n",
-            "(1,3:100,100:0,30,0\n",
-            "(1,3:100,100:0,15,0\n",
-            "(1,3:100,100:15,15,0\n",
-            "k1,3:115,100:0\n",
-            ")\n",
-            "k1,3:100,100:-15\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "(1,4:10,200:80,30,0\n",
-            "(1,4:10,200:30,30,0\n",
-            "(1,4:10,200:0,30,0\n",
-            "(1,4:10,200:0,15,0\n",
-            "(1,4:10,200:15,15,0\n",
-            "x1,4:25,200\n",
-            ")\n",
-            "k1,4:10,200:-15\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "(1,4:50,200:30,30,0\n",
-            "(1,4:50,200:30,30,0\n",
-            "(1,4:50,200:0,30,0\n",
-            "(1,4:50,200:0,15,0\n",
-            "(1,4:50,200:15,15,0\n",
-            "k1,4:65,200:0\n",
-            ")\n",
-            "k1,4:50,200:-15\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "Postamble:\n",
-            "Count:37\n",
-        ),
-        tex = tex.display()
+    let synctex = synctex_doc_unit(
+        65536,
+        &[&tex],
+        &[
+            "[1,5:0,0:400,792,0\n(1,3:10,100:130,30,0\ng1,3:10,100\nx1,3:40,100\n\
+         (1,3:50,100:30,30,0\n(1,3:50,100:30,30,0\n(1,3:50,100:0,30,0\n(1,3:50,100:0,15,0\n\
+         (1,3:50,100:15,15,0\nk1,3:65,100:0\n)\nk1,3:50,100:-15\n)\n)\n)\n)\n\
+         (1,3:100,100:30,30,0\n(1,3:100,100:30,30,0\n(1,3:100,100:0,30,0\n(1,3:100,100:0,15,0\n\
+         (1,3:100,100:15,15,0\nk1,3:115,100:0\n)\nk1,3:100,100:-15\n)\n)\n)\n)\n)\n\
+         (1,4:10,200:80,30,0\n(1,4:10,200:30,30,0\n(1,4:10,200:0,30,0\n(1,4:10,200:0,15,0\n\
+         (1,4:10,200:15,15,0\nx1,4:25,200\n)\nk1,4:10,200:-15\n)\n)\n)\n(1,4:50,200:30,30,0\n\
+         (1,4:50,200:30,30,0\n(1,4:50,200:0,30,0\n(1,4:50,200:0,15,0\n(1,4:50,200:15,15,0\n\
+         k1,4:65,200:0\n)\nk1,4:50,200:-15\n)\n)\n)\n)\n)\n]\n",
+        ],
     );
     fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
 
     // Clicking inside first figure (x=60, y=85) resolves to figs/first.pdf even when vector text is passed.
-    let hit_first = resolve_inverse(
+    let hit_first = inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 60.0,
-            y_from_top: 85.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 60.0, 85.0, 792.0),
         Some(("ProseLabel", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
     let line3 = tex_source.lines().nth(2).unwrap();
-    assert_eq!(hit_first.location.line, 3);
     assert_eq!(
-        hit_first.location.byte_column,
-        line3.find("figs/first.pdf").unwrap()
+        spot(&hit_first),
+        (3, line3.find("figs/first.pdf").unwrap(), true)
     );
-    assert!(hit_first.location.precise);
 
     // Clicking inside second figure (x=115, y=85) resolves to figs/second.pdf.
-    let hit_second = resolve_inverse(
-        &pdf,
-        InversePoint {
-            page: 1,
-            x: 115.0,
-            y_from_top: 85.0,
-            page_height_pt: 792.0,
-        },
-        None,
-        2,
-        &Operation::default(),
-        None,
-        false,
-    )
-    .unwrap();
-    assert_eq!(hit_second.location.line, 3);
+    let hit_second = inverse_at(&pdf, ipt(1, 115.0, 85.0, 792.0), None, 2, false).unwrap();
     assert_eq!(
-        hit_second.location.byte_column,
-        line3.find("figs/second.pdf").unwrap()
+        spot(&hit_second),
+        (3, line3.find("figs/second.pdf").unwrap(), true)
     );
-    assert!(hit_second.location.precise);
 
     // Clicking prose outside both figures (x=20, y=95) resolves to ProseLabel.
-    let hit_prose = resolve_inverse(
+    let hit_prose = inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 95.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 20.0, 95.0, 792.0),
         Some(("ProseLabel", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
-    assert_eq!(hit_prose.location.line, 3);
-    assert_eq!(hit_prose.location.byte_column, 0);
-    assert!(hit_prose.location.precise);
+    assert_eq!(spot(&hit_prose), (3, 0, true));
 
     // Clicking inside \scalebox{2}{ScaledText} (x=20, y=185) is NOT treated as graphics,
     // so it refines via word matching to "ScaledText" on line 4.
     let line4 = tex_source.lines().nth(3).unwrap();
-    let hit_scalebox = resolve_inverse(
+    let hit_scalebox = inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 185.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 20.0, 185.0, 792.0),
         Some(("ScaledText", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
-    assert_eq!(hit_scalebox.location.line, 4);
     assert_eq!(
-        hit_scalebox.location.byte_column,
-        line4.find("ScaledText").unwrap()
+        spot(&hit_scalebox),
+        (4, line4.find("ScaledText").unwrap(), true)
     );
-    assert!(hit_scalebox.location.precise);
-
-    fs::write(
-        root.join("wobble.sty"),
-        "\\def\\WobbleName{wobble@state}\n\\expandafter\\def\\csname\\WobbleName\\endcsname{}\n",
-    )
-    .unwrap();
-    fs::write(
-        pdf.with_extension("synctex"),
-        synctex.replace(
-            "Output:pdf",
-            &format!("Input:2:{}\nOutput:pdf", root.join("wobble.sty").display()),
-        ),
-    )
-    .unwrap();
-    for command in ["includegraphics", "includesvg"] {
-        let uncertain = tex_source
-            .replace(
-                "\\documentclass{article}",
-                "\\documentclass{article}\\usepackage{wobble}",
-            )
-            .replace("includegraphics", command);
-        fs::write(&tex, &uncertain).unwrap();
-        for (x, filename, hint) in [
-            (60., "figs/first.pdf", Some(("Blorf", 0))),
-            (115., "figs/second.pdf", None),
-        ] {
-            let result = resolve_inverse(
-                &pdf,
-                InversePoint {
-                    page: 1,
-                    x,
-                    y_from_top: 85.,
-                    page_height_pt: 792.,
-                },
-                hint,
-                2,
-                &Operation::default(),
-                None,
-                true,
-            )
-            .unwrap();
-            assert_eq!(
-                (result.location.line, result.location.byte_column),
-                (3, uncertain.lines().nth(2).unwrap().find(filename).unwrap()),
-                "{command} {filename}"
-            );
-            assert!(result.location.precise);
-            assert!(result.warning.is_some());
-            for setup in [
-                format!("\\renewcommand{{\\{command}}}[2][]{{}}"),
-                format!("\\newcommand{{\\WobblePatch}}{{\\def\\{command}{{}}}}\\WobblePatch"),
-            ] {
-                fs::write(
-                    &tex,
-                    uncertain.replace("\\begin{document}", &format!("{setup}\\begin{{document}}")),
-                )
-                .unwrap();
-                let veto = resolve_inverse(
-                    &pdf,
-                    InversePoint {
-                        page: 1,
-                        x,
-                        y_from_top: 85.,
-                        page_height_pt: 792.,
-                    },
-                    hint,
-                    2,
-                    &Operation::default(),
-                    None,
-                    true,
-                )
-                .unwrap();
-                assert_eq!(
-                    (veto.location.line, veto.location.byte_column),
-                    (3, 0),
-                    "{setup}"
-                );
-            }
-            fs::write(&tex, &uncertain).unwrap();
-        }
-        fs::write(
-            root.join("wobble.sty"),
-            format!(
-                "\\def\\WobbleName{{wobble@state}}\n\
-                     \\expandafter\\def\\csname\\WobbleName\\endcsname{{}}\n\
-                     \\newcommand{{\\WobbleBox}}[1]{{\\{command}{{blorf.pdf}}}}\n"
-            ),
-        )
-        .unwrap();
-        let wrapped = uncertain
-            .replace("ProseLabel ", "\\WobbleBox{ProseLabel ")
-            .replace("figs/second.pdf}\n", "figs/second.pdf}}\n");
-        fs::write(&tex, wrapped).unwrap();
-        let veto = resolve_inverse(
-            &pdf,
-            InversePoint {
-                page: 1,
-                x: 60.,
-                y_from_top: 85.,
-                page_height_pt: 792.,
-            },
-            None,
-            2,
-            &Operation::default(),
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!((veto.location.line, veto.location.byte_column), (3, 0));
-        fs::write(
-            root.join("wobble.sty"),
-            "\\def\\WobbleName{wobble@state}\n\\expandafter\\def\\csname\\WobbleName\\endcsname{}\n",
-        ).unwrap();
-    }
 
     // 3. Real pdflatex integration test with \includegraphics[...]{example-image-a} and {example-image-b}.
-    let real_dir = tempfile::tempdir().unwrap();
-    let real_root = fs::canonicalize(real_dir.path()).unwrap();
+    let (_real_dir, real_root) = temp_project(&[]);
     let real_pdf = real_root.join("real_fig.pdf");
     let real_tex = real_root.join("real_fig.tex");
-    let real_source = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{graphicx}\n",
-        "\\begin{document}\n",
-        "\\noindent\n",
-        "\\includegraphics[width=80pt]{example-image-a}\\hspace{20pt}\\includegraphics{example-image-b}\n",
-        "\\end{document}\n",
-    );
+    let real_source = "\\documentclass{article}\n\
+                       \\usepackage{graphicx}\n\
+                       \\begin{document}\n\
+                       \\noindent\n\
+                       \\includegraphics[width=80pt]{example-image-a}\\hspace{20pt}\\includegraphics{example-image-b}\n\
+                       \\end{document}\n";
     fs::write(&real_tex, real_source).unwrap();
     if let Ok(output) = Command::new("pdflatex")
         .args([
@@ -6699,66 +4627,45 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     {
         let fwd = resolve_forward(&real_pdf, &real_tex, 5, 1).unwrap();
         let real_line5 = real_source.lines().nth(4).unwrap();
-        let inv_a = resolve_inverse(
+        let inv_a = inverse_at(
             &real_pdf,
-            InversePoint {
-                page: 1,
-                x: fwd.h + 40.0,
-                y_from_top: fwd.v - 30.0,
-                page_height_pt: 792.0,
-            },
+            ipt(1, fwd.h + 40.0, fwd.v - 30.0, 792.0),
             Some(("A", 0)),
             2,
-            &Operation::default(),
-            None,
             false,
         )
         .unwrap();
-        assert_eq!(inv_a.location.line, 5);
         assert_eq!(
-            inv_a.location.byte_column,
-            real_line5.find("example-image-a").unwrap()
+            spot(&inv_a),
+            (5, real_line5.find("example-image-a").unwrap(), true)
         );
-        assert!(inv_a.location.precise);
 
-        let inv_b = resolve_inverse(
+        let inv_b = inverse_at(
             &real_pdf,
-            InversePoint {
-                page: 1,
-                x: fwd.h + 140.0,
-                y_from_top: fwd.v - 30.0,
-                page_height_pt: 792.0,
-            },
+            ipt(1, fwd.h + 140.0, fwd.v - 30.0, 792.0),
             Some(("B", 0)),
             2,
-            &Operation::default(),
-            None,
             false,
         )
         .unwrap();
-        assert_eq!(inv_b.location.line, 5);
         assert_eq!(
-            inv_b.location.byte_column,
-            real_line5.find("example-image-b").unwrap()
+            spot(&inv_b),
+            (5, real_line5.find("example-image-b").unwrap(), true)
         );
-        assert!(inv_b.location.precise);
     }
 
     // 4. \includesvg .pdf_tex generated wrapper maps back to the host .tex argument.
-    let svg_dir = tempfile::tempdir().unwrap();
-    let svg_root = fs::canonicalize(svg_dir.path()).unwrap();
+    let (_svg_dir, svg_root) = temp_project(&[]);
     let svg_pdf = svg_root.join("svg_fig.pdf");
     let svg_tex = svg_root.join("svg_fig.tex");
     let svg_sub = svg_root.join("svg-inkscape");
     fs::create_dir_all(&svg_sub).unwrap();
     let svg_pdf_tex = svg_sub.join("sample_svg-tex.pdf_tex");
-    let svg_source = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{svg}\n",
-        "\\begin{document}\n",
-        "\\includesvg[width=40pt]{figures/diagram_svg}\n",
-        "\\end{document}\n",
-    );
+    let svg_source = "\\documentclass{article}\n\
+                      \\usepackage{svg}\n\
+                      \\begin{document}\n\
+                      \\includesvg[width=40pt]{figures/diagram_svg}\n\
+                      \\end{document}\n";
     fs::write(&svg_tex, svg_source).unwrap();
     fs::write(
         &svg_pdf_tex,
@@ -6766,75 +4673,36 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
     )
     .unwrap();
     fs::write(&svg_pdf, b"pdf-v1").unwrap();
-    let svg_synctex = concat!(
-        "SyncTeX Version:1\n",
-        "Input:1:./svg_fig.tex\n",
-        "Input:2:./svg-inkscape/sample_svg-tex.pdf_tex\n",
-        "Output:pdf\n",
-        "Magnification:1000\n",
-        "Unit:65536\n",
-        "X Offset:0\n",
-        "Y Offset:0\n",
-        "Content:\n",
-        "{1\n",
-        "[1,5:0,0:600,700,0\n",
-        "(1,4:20,100:50,40,0\n",
-        "(2,57:20,100:50,40,0\n",
-        "(2,57:20,100:50,40,0\n",
-        "g2,54:20,100\n",
-        "(2,57:20,100:0,40,0\n",
-        "(2,56:20,100:0,40,0\n",
-        "(2,56:20,100:50,40,0\n",
-        "(2,56:20,100:50,40,0\n",
-        "(2,56:20,100:50,40,0\n",
-        "(2,56:20,100:0,40,0\n",
-        "(2,56:20,100:0,30,0\n",
-        "(2,56:20,100:30,30,0\n",
-        ")\n",
-        "k2,56:20,100:-30\n",
-        ")\n",
-        ")\n",
-        "g2,56:70,100\n",
-        ")\n",
-        ")\n",
-        ")\n",
-        "k2,56:20,100:-50\n",
-        ")\n",
-        ")\n",
-        "k2,57:70,100:50\n",
-        ")\n",
-        ")\n",
-        ")\n",
-        "]\n",
-        "}1\n",
-        "Postamble:\n",
-        "Count:32\n",
+    let svg_synctex = synctex_doc_unit(
+        65536,
+        &[
+            Path::new("./svg_fig.tex"),
+            Path::new("./svg-inkscape/sample_svg-tex.pdf_tex"),
+        ],
+        &[
+            "[1,5:0,0:600,700,0\n(1,4:20,100:50,40,0\n(2,57:20,100:50,40,0\n(2,57:20,100:50,40,0\n\
+         g2,54:20,100\n(2,57:20,100:0,40,0\n(2,56:20,100:0,40,0\n(2,56:20,100:50,40,0\n\
+         (2,56:20,100:50,40,0\n(2,56:20,100:50,40,0\n(2,56:20,100:0,40,0\n(2,56:20,100:0,30,0\n\
+         (2,56:20,100:30,30,0\n)\nk2,56:20,100:-30\n)\n)\ng2,56:70,100\n)\n)\n)\n\
+         k2,56:20,100:-50\n)\n)\nk2,57:70,100:50\n)\n)\n)\n]\n",
+        ],
     );
     fs::write(svg_root.join("svg_fig.synctex"), svg_synctex).unwrap();
 
-    let hit_svg = resolve_inverse(
+    let hit_svg = inverse_at(
         &svg_pdf,
-        InversePoint {
-            page: 1,
-            x: 35.0,
-            y_from_top: 80.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 35.0, 80.0, 792.0),
         Some(("label inside svg", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
     let svg_line4 = svg_source.lines().nth(3).unwrap();
     assert_eq!(hit_svg.location.file, svg_tex.to_string_lossy());
-    assert_eq!(hit_svg.location.line, 4);
     assert_eq!(
-        hit_svg.location.byte_column,
-        svg_line4.find("figures/diagram_svg").unwrap()
+        spot(&hit_svg),
+        (4, svg_line4.find("figures/diagram_svg").unwrap(), true)
     );
-    assert!(hit_svg.location.precise);
 
     // Non-ASCII filenames must not panic in generated-wrapper suffix checks.
     assert!(!crate::parser::is_generated_graphics_tex("/tmp/ééé.tex"));
@@ -6847,116 +4715,64 @@ fn inverse_includegraphics_refines_to_graphics_path_and_abstains_safely() {
 
     // A paragraph line box containing prose alongside a raw .pdf_tex input without
     // a dedicated host wrapper must not turn surrounding prose into a graphics hit.
-    let mixed_dir = tempfile::tempdir().unwrap();
-    let mixed_root = fs::canonicalize(mixed_dir.path()).unwrap();
+    let (_mixed_dir, mixed_root) = temp_project(&[]);
     let mixed_pdf = mixed_root.join("mixed.pdf");
     let mixed_tex = mixed_root.join("mixed.tex");
     let mixed_wrapper = mixed_root.join("diagram_svg-tex.pdf_tex");
-    let mixed_source = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{svg}\n",
-        "\\begin{document}\n",
-        "ProseLabel \\includesvg{figures/diagram_svg}\n",
-        "\\end{document}\n",
-    );
+    let mixed_source = "\\documentclass{article}\n\
+                        \\usepackage{svg}\n\
+                        \\begin{document}\n\
+                        ProseLabel \\includesvg{figures/diagram_svg}\n\
+                        \\end{document}\n";
     fs::write(&mixed_pdf, b"%PDF-1.4\n").unwrap();
     fs::write(&mixed_tex, mixed_source).unwrap();
     fs::write(&mixed_wrapper, "% generated by inkscape\n").unwrap();
-    let mixed_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,1:0,51904512:30000000,47362867,0\n",
-            "(1,4:1966080,6553600:19660800,3276800,0\n",
-            "x1,4:1966080,6553600\n",
-            "(2,57:7864320,6553600:6553600,3276800,0\n",
-            "(2,56:7864320,6553600:6553600,3276800,0\n",
-            "(2,56:7864320,6553600:6553600,3276800,0\n",
-            "(2,56:7864320,6553600:0,3276800,0\n",
-            "(2,56:7864320,6553600:0,3276800,0\n",
-            "(2,56:7864320,6553600:6553600,3276800,0\n",
-            ")\n",
-            "g2,56:7864320,6553600\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "(2,57:9830400,6553600:0,3276800,0\n",
-            "x2,57:9830400,6553600\n",
-            ")\n",
-            ")\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "Postamble:\n",
-            "Count:30\n",
-        ),
-        mixed_tex.display(),
-        mixed_wrapper.display(),
+    let mixed_synctex = synctex_doc(
+        &[&mixed_tex, &mixed_wrapper],
+        &[
+            "[1,1:0,51904512:30000000,47362867,0\n(1,4:1966080,6553600:19660800,3276800,0\n\
+         x1,4:1966080,6553600\n(2,57:7864320,6553600:6553600,3276800,0\n\
+         (2,56:7864320,6553600:6553600,3276800,0\n(2,56:7864320,6553600:6553600,3276800,0\n\
+         (2,56:7864320,6553600:0,3276800,0\n(2,56:7864320,6553600:0,3276800,0\n\
+         (2,56:7864320,6553600:6553600,3276800,0\n)\ng2,56:7864320,6553600\n)\n)\n)\n)\n\
+         (2,57:9830400,6553600:0,3276800,0\nx2,57:9830400,6553600\n)\n)\n)\n]\n",
+        ],
     );
     fs::write(mixed_root.join("mixed.synctex"), mixed_synctex).unwrap();
-    let hit_prose = resolve_inverse(
+    let hit_prose = inverse_at(
         &mixed_pdf,
-        InversePoint {
-            page: 1,
-            x: 35.0,
-            y_from_top: 80.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 35.0, 80.0, 792.0),
         Some(("ProseLabel", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
     assert_eq!(hit_prose.location.file, mixed_tex.to_string_lossy());
-    assert_eq!(hit_prose.location.line, 4);
-    assert_eq!(hit_prose.location.byte_column, 0);
-    assert!(hit_prose.location.precise);
+    assert_eq!(spot(&hit_prose), (4, 0, true));
 
-    let hit_mixed_svg = resolve_inverse(
+    let hit_mixed_svg = inverse_at(
         &mixed_pdf,
-        InversePoint {
-            page: 1,
-            x: 150.0,
-            y_from_top: 80.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 150.0, 80.0, 792.0),
         Some(("label inside svg", 0)),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
     let mixed_line4 = mixed_source.lines().nth(3).unwrap();
     assert_eq!(hit_mixed_svg.location.file, mixed_tex.to_string_lossy());
-    assert_eq!(hit_mixed_svg.location.line, 4);
     assert_eq!(
-        hit_mixed_svg.location.byte_column,
-        mixed_line4.find("figures/diagram_svg").unwrap()
+        spot(&hit_mixed_svg),
+        (4, mixed_line4.find("figures/diagram_svg").unwrap(), true)
     );
-    assert!(hit_mixed_svg.location.precise);
 }
 
 #[test]
 fn math_kern_and_depth_and_prose_collision_guards() {
     // 1. Unbraced \mkern / \kern / \mskip must not swallow a following braced group.
-    let source = concat!(
-        "\\documentclass{article}\n",
-        "\\begin{document}\n",
-        "$x\\mkern-3mu{y} + \\kern 2pt{z} + \\mskip 4mu plus 2mu minus 1mu{w}$\n",
-        "\\end{document}\n",
-    );
+    let source = "\\documentclass{article}\n\
+                  \\begin{document}\n\
+                  $x\\mkern-3mu{y} + \\kern 2pt{z} + \\mskip 4mu plus 2mu minus 1mu{w}$\n\
+                  \\end{document}\n";
     let line3 = source.lines().nth(2).unwrap();
     assert_eq!(
         source_word_location(source, 3, "xy+z+w", 1, 0),
@@ -6972,15 +4788,13 @@ fn math_kern_and_depth_and_prose_collision_guards() {
     );
 
     // 1b. Non-literal \kern\dimexpr must abstain rather than leak tokens and bias a duplicate formula.
-    let dimexpr_source = concat!(
-        "\\documentclass{beamer}\n",
-        "\\begin{document}\n",
-        "\\begin{frame}\n",
-        "$x\\kern\\dimexpr1pt+2pt\\relax+y$\n",
-        "$x+y$\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let dimexpr_source = "\\documentclass{beamer}\n\
+                          \\begin{document}\n\
+                          \\begin{frame}\n\
+                          $x\\kern\\dimexpr1pt+2pt\\relax+y$\n\
+                          $x+y$\n\
+                          \\end{frame}\n\
+                          \\end{document}\n";
     assert_eq!(source_word_location(dimexpr_source, 4, "x+y", 2, 2), None);
 
     // 2. Deeply nested paired scripts terminate cleanly via the recursion depth cap.
@@ -7005,16 +4819,14 @@ fn math_kern_and_depth_and_prose_collision_guards() {
     assert_eq!(source_word_location(&nested_kern, 3, "x+y", 2, 0), None);
 
     // 3. Shared token between prose (score 0) and math must abstain rather than pick math.
-    let collision_source = concat!(
-        "\\documentclass{beamer}\n",
-        "\\newcommand{\\samplex}{x}\n",
-        "\\begin{document}\n",
-        "\\begin{frame}\n",
-        "+x\\\\\n",
-        "$a+\\samplex$\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let collision_source = "\\documentclass{beamer}\n\
+                            \\newcommand{\\samplex}{x}\n\
+                            \\begin{document}\n\
+                            \\begin{frame}\n\
+                            +x\\\\\n\
+                            $a+\\samplex$\n\
+                            \\end{frame}\n\
+                            \\end{document}\n";
     assert_eq!(source_word_location(collision_source, 7, "+x", 1, 2), None);
 }
 
@@ -7078,13 +4890,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     );
     let align_ctx2 = "\u{03b4}2 + \u{03b5}2 = \u{03b6}2";
     assert_eq!(
-        source_word_location(
-            math_source,
-            7,
-            align_ctx2,
-            align_ctx2.find("\u{03b6}2").unwrap(),
-            0
-        ),
+        word_at(math_source, 7, align_ctx2, "\u{03b6}2", 0),
         Some((
             6,
             math_source
@@ -7109,13 +4915,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // multline closing line is 15; line 13 has \lambda_1, line 14 has \xi_2
     let multline_ctx = "= \u{03bd}2 + \u{03be}2";
     assert_eq!(
-        source_word_location(
-            math_source,
-            15,
-            multline_ctx,
-            multline_ctx.find("\u{03be}2").unwrap(),
-            0
-        ),
+        word_at(math_source, 15, multline_ctx, "\u{03be}2", 0),
         Some((
             14,
             math_source.lines().nth(13).unwrap().find("\\xi_2").unwrap()
@@ -7138,13 +4938,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     let aligned_ctx = "\u{03c7}2 = \u{03c8}2";
     for closing in [26, 27] {
         assert_eq!(
-            source_word_location(
-                math_source,
-                closing,
-                aligned_ctx,
-                aligned_ctx.find("\u{03c8}2").unwrap(),
-                0
-            ),
+            word_at(math_source, closing, aligned_ctx, "\u{03c8}2", 0),
             Some((
                 25,
                 math_source
@@ -7161,13 +4955,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     let matrix_ctx = "a21 a22";
     for closing in [32, 36] {
         assert_eq!(
-            source_word_location(
-                math_source,
-                closing,
-                matrix_ctx,
-                matrix_ctx.find("a22").unwrap(),
-                0
-            ),
+            word_at(math_source, closing, matrix_ctx, "a22", 0),
             Some((
                 31,
                 math_source.lines().nth(30).unwrap().find("a_{22}").unwrap()
@@ -7218,13 +5006,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // "AlphaWord" in the visible caption must resolve to line 5, not the [short] argument on line 4.
     let cap_ctx = "Figure 1: AlphaWord gamma delta \u{03c9}1 + \u{03c9}2";
     assert_eq!(
-        source_word_location(
-            caption_source,
-            7,
-            cap_ctx,
-            cap_ctx.find("AlphaWord").unwrap(),
-            0
-        ),
+        word_at(caption_source, 7, cap_ctx, "AlphaWord", 0),
         Some((
             5,
             caption_source
@@ -7236,13 +5018,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         ))
     );
     assert_eq!(
-        source_word_location(
-            caption_source,
-            7,
-            cap_ctx,
-            cap_ctx.find("\u{03c9}2").unwrap(),
-            0
-        ),
+        word_at(caption_source, 7, cap_ctx, "\u{03c9}2", 0),
         Some((
             6,
             caption_source
@@ -7259,13 +5035,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // and "GammaWord" resolves to line 10.
     let capof_ctx = "Figure 2: figure epsilon GammaWord zeta";
     assert_eq!(
-        source_word_location(
-            caption_source,
-            11,
-            capof_ctx,
-            capof_ctx.find("figure").unwrap(),
-            0
-        ),
+        word_at(caption_source, 11, capof_ctx, "figure", 0),
         Some((
             9,
             caption_source
@@ -7277,13 +5047,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         ))
     );
     assert_eq!(
-        source_word_location(
-            caption_source,
-            11,
-            capof_ctx,
-            capof_ctx.find("GammaWord").unwrap(),
-            0
-        ),
+        word_at(caption_source, 11, capof_ctx, "GammaWord", 0),
         Some((
             10,
             caption_source
@@ -7300,13 +5064,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // "EtaWord" resolves to line 13, and graphics refinement on closing line 16 resolves to line 15.
     let subbox_ctx = "(a) EtaWord iota";
     assert_eq!(
-        source_word_location(
-            caption_source,
-            16,
-            subbox_ctx,
-            subbox_ctx.find("EtaWord").unwrap(),
-            0
-        ),
+        word_at(caption_source, 16, subbox_ctx, "EtaWord", 0),
         Some((
             13,
             caption_source
@@ -7335,13 +5093,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // graphics refinement on closing line 21 resolves to line 20.
     let subfloat_ctx = "(b) KappaWord mu";
     assert_eq!(
-        source_word_location(
-            caption_source,
-            21,
-            subfloat_ctx,
-            subfloat_ctx.find("KappaWord").unwrap(),
-            0
-        ),
+        word_at(caption_source, 21, subfloat_ctx, "KappaWord", 0),
         Some((
             18,
             caption_source
@@ -7367,8 +5119,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
 
     // 3. Forward sync fallback to closing line for multi-line align and \subcaptionbox,
     //    and preference for positive-height formula boxes over zero-height pre-display hboxes.
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
     fs::write(&pdf, b"pdf-v1").unwrap();
@@ -7390,32 +5141,13 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
     // Line 7 (\end{align}) has a zero-height pre-display hbox at y=100pt (h=0, d=0)
     // followed by the real display formula hbox at y=130pt (h=25pt, d=5pt).
     // Line 11 (closing '}' of \subcaptionbox) has the subcaptionbox hbox at y=220pt (h=40pt, d=0pt).
-    let synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{tex}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:65536\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,12:0,792:612,792,0\n",
-            "(1,7:72,100:200,0,0\n",
-            ")\n",
-            "(1,7:120,130:180,25,5\n",
-            "x1,7:150,125\n",
-            ")\n",
-            "(1,11:72,220:160,40,0\n",
-            "x1,11:100,210\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "Postamble:\n",
-            "Count:8\n",
-        ),
-        tex = tex.display()
+    let synctex = synctex_doc_unit(
+        65536,
+        &[&tex],
+        &[
+            "[1,12:0,792:612,792,0\n(1,7:72,100:200,0,0\n)\n(1,7:120,130:180,25,5\nx1,7:150,125\n)\n\
+         (1,11:72,220:160,40,0\nx1,11:100,210\n)\n]\n",
+        ],
     );
     fs::write(pdf.with_extension("synctex"), synctex).unwrap();
 
@@ -7496,8 +5228,8 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\]\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(prose_display, 3, 1), None);
-    assert_eq!(math::math_closing_line(prose_display, 3, 12), Some(5));
+    assert_eq!(math_closing_line(prose_display, 3, 1), None);
+    assert_eq!(math_closing_line(prose_display, 3, 12), Some(5));
 
     // 7. Transitive safe user macros inside a Beamer frame do not block graphics refinement,
     //    whereas a macro that transitively expands to \includegraphics still abstains.
@@ -7550,10 +5282,10 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\end{equation}\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_lines(inline_then_display, 5), Some(2..5));
-    assert_eq!(math::math_closing_line(inline_then_display, 3, 2), None);
-    assert_eq!(math::math_closing_line(inline_then_display, 3, 4), Some(5));
-    assert_eq!(math::math_closing_line(inline_then_display, 4, 3), Some(5));
+    assert_eq!(math_lines(inline_then_display, 5), Some(2..5));
+    assert_eq!(math_closing_line(inline_then_display, 3, 2), None);
+    assert_eq!(math_closing_line(inline_then_display, 3, 4), Some(5));
+    assert_eq!(math_closing_line(inline_then_display, 4, 3), Some(5));
     let dollar_adjacent = concat!(
         "\\documentclass{article}\n",
         "\\begin{document}\n",
@@ -7562,7 +5294,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "$$\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(dollar_adjacent, 3, 11), Some(5));
+    assert_eq!(math_closing_line(dollar_adjacent, 3, 11), Some(5));
     let two_displays_one_line = concat!(
         "\\documentclass{article}\n",
         "\\begin{document}\n",
@@ -7571,11 +5303,8 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\]\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(two_displays_one_line, 3, 1), None);
-    assert_eq!(
-        math::math_closing_line(two_displays_one_line, 3, 6),
-        Some(5)
-    );
+    assert_eq!(math_closing_line(two_displays_one_line, 3, 1), None);
+    assert_eq!(math_closing_line(two_displays_one_line, 3, 6), Some(5));
 
     // 9. eqnarray opening line with row 1 content stays on the opening line, while
     //    nonprinting header tokens (\label, \nonumber, \notag, \relax) and split \begin
@@ -7588,7 +5317,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\end{eqnarray}\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(eqnarray_row1_on_open, 3, 18), None);
+    assert_eq!(math_closing_line(eqnarray_row1_on_open, 3, 18), None);
     let eqnarray_label_open = concat!(
         "\\documentclass{article}\n",
         "\\begin{document}\n",
@@ -7598,7 +5327,7 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\end{eqnarray}\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(eqnarray_label_open, 3, 1), Some(4));
+    assert_eq!(math_closing_line(eqnarray_label_open, 3, 1), Some(4));
     let eqnarray_split_begin = concat!(
         "\\documentclass{article}\n",
         "\\begin{document}\n",
@@ -7608,21 +5337,19 @@ fn math_environments_and_captions_forward_and_inverse_sync() {
         "\\end{eqnarray}\n",
         "\\end{document}\n",
     );
-    assert_eq!(math::math_closing_line(eqnarray_split_begin, 3, 8), Some(4));
+    assert_eq!(math_closing_line(eqnarray_split_begin, 3, 8), Some(4));
 
     // 10. Opaque @-named macros inside wrappers or on the line block graphics refinement.
-    let at_macro_gfx = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{graphicx}\n",
-        "\\makeatletter\n",
-        "\\newcommand{\\my@figure}{\\includegraphics[width=30pt]{actual.pdf}}\n",
-        "\\newcommand{\\my@discard}[1]{}\n",
-        "\\newcommand{\\unused}{\\csname my@figure\\endcsname}\n",
-        "\\newcommand{\\wrapper}{\\my@figure}\n",
-        "\\begin{document}\n",
-        "\\wrapper \\my@discard{\\includegraphics{decoy.pdf}}\n",
-        "\\end{document}\n",
-    );
+    let at_macro_gfx = "\\documentclass{article}\n\
+                        \\usepackage{graphicx}\n\
+                        \\makeatletter\n\
+                        \\newcommand{\\my@figure}{\\includegraphics[width=30pt]{actual.pdf}}\n\
+                        \\newcommand{\\my@discard}[1]{}\n\
+                        \\newcommand{\\unused}{\\csname my@figure\\endcsname}\n\
+                        \\newcommand{\\wrapper}{\\my@figure}\n\
+                        \\begin{document}\n\
+                        \\wrapper \\my@discard{\\includegraphics{decoy.pdf}}\n\
+                        \\end{document}\n";
     assert_eq!(source_graphics_location(at_macro_gfx, 9, 0, 1, false), None);
 
     // 11. Unsupported glue after `plus`/`minus` or malformed `#` in a script abstains
@@ -7691,90 +5418,64 @@ fn tikzpicture_scope_and_foreach_loop_bindings_refine_nodes() {
 
 #[test]
 fn cross_file_preamble_macros_and_redefinition_invalidation() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("main.pdf", "pdf-v1"),
+        (
+            "preamble.tex",
+            "\\newcommand{\\PreambleSym}{\\Omega}\n\\newcommand{\\ClashSym}{\\alpha}\n",
+        ),
+        (
+            "main.tex",
+            "\\documentclass{article}\n\
+             \\input{preamble}\n\
+             \\newcommand{\\RootWrapper}[1]{\\textbf{#1}}\n\
+             \\begin{document}\n\
+             \\input{section}\n\
+             \\end{document}\n",
+        ),
+        (
+            "section.tex",
+            "\\renewcommand{\\ClashSym}{\\beta}\n\
+             We study $\\PreambleSym$ and \\RootWrapper{TargetWord} here.\n",
+        ),
+    ]);
     let pdf = root.join("main.pdf");
     let main_tex = root.join("main.tex");
     let preamble_tex = root.join("preamble.tex");
     let sub_tex = root.join("section.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &preamble_tex,
-        "\\newcommand{\\PreambleSym}{\\Omega}\n\\newcommand{\\ClashSym}{\\alpha}\n",
-    )
-    .unwrap();
-    fs::write(
-        &main_tex,
-        concat!(
-            "\\documentclass{article}\n",
-            "\\input{preamble}\n",
-            "\\newcommand{\\RootWrapper}[1]{\\textbf{#1}}\n",
-            "\\begin{document}\n",
-            "\\input{section}\n",
-            "\\end{document}\n",
-        ),
-    )
-    .unwrap();
-    fs::write(
-        &sub_tex,
-        concat!(
-            "\\renewcommand{\\ClashSym}{\\beta}\n",
-            "We study $\\PreambleSym$ and \\RootWrapper{TargetWord} here.\n",
-        ),
-    )
-    .unwrap();
 
     // Redefined macro across sources is conservatively invalidated.
-    let table = crate::math::macros_from_sources(
-        &[
-            "\\newcommand{\\ClashSym}{\\alpha}\n",
-            "\\renewcommand{\\ClashSym}{\\beta}\n",
-        ],
-        &Operation::default(),
-    );
+    let table = macros_from_sources(&[
+        "\\newcommand{\\ClashSym}{\\alpha}\n",
+        "\\renewcommand{\\ClashSym}{\\beta}\n",
+    ]);
     assert_eq!(table.get("ClashSym"), Some(&None));
 
-    let synctex = format!(
-        "SyncTeX Version:1\nInput:1:{}\nInput:2:{}\nInput:3:{}\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n[1,5:0,0:30000000,40000000,0\n(2,2:655360,6553600:6553600,655360,0\nx2,2:1310720,6553600\n)\n]\n}}1\nPostamble:\nCount:4\n",
-        main_tex.display(),
-        sub_tex.display(),
-        preamble_tex.display(),
+    let synctex = synctex_doc(
+        &[&main_tex, &sub_tex, &preamble_tex],
+        &[&text_sheet((1, 5), (2, 2))],
     );
     fs::write(pdf.with_extension("synctex"), &synctex).unwrap();
 
-    let math_hit = resolve_inverse(
+    let math_hit = inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 100.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 20.0, 100.0, 792.0),
         Some(("We study \u{03a9} and TargetWord here.", "We study ".len())),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
     assert_eq!(math_hit.location.line, 2);
     assert_eq!(math_hit.location.byte_column, "We study $".len());
 
-    let prose_hit = resolve_inverse(
+    let prose_hit = inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 20.0,
-            y_from_top: 100.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 20.0, 100.0, 792.0),
         Some((
             "We study \u{03a9} and TargetWord here.",
             "We study \u{03a9} and ".len(),
         )),
         2,
-        &Operation::default(),
-        None,
         false,
     )
     .unwrap();
@@ -7786,13 +5487,11 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
 
     // Zero-argument fixed literal prose macros refine to their invocation backslash in both local and imported modes.
     let defs_src = "\\newcommand{\\QX}{QX}\n\\newcommand{\\BadParam}[1]{#1}\n\\newcommand{\\BadCtr}{\\arabic{page}}\n";
-    let body_src = concat!(
-        "\\section{ Target }\n",
-        "𐐀 Café amber of teal lanterns drifts \\QX{} by that harbor.\n",
-        "\n",
-        "Marmalade filler row.\n",
-        "Six \\texttt{\\QX{}+ZYW} kettle wanders sideways.\n",
-    );
+    let body_src = "\\section{ Target }\n\
+                    𐐀 Café amber of teal lanterns drifts \\QX{} by that harbor.\n\
+                    \n\
+                    Marmalade filler row.\n\
+                    Six \\texttt{\\QX{}+ZYW} kettle wanders sideways.\n";
     let line2 = body_src.lines().nth(1).unwrap();
     let plain_qx_byte = line2.find("\\QX").unwrap();
     let plain_qx_utf16 = line2[..plain_qx_byte].encode_utf16().count() + 1;
@@ -7814,60 +5513,34 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         };
         let line_shift = if extra.is_empty() { 3 } else { 0 };
         assert_eq!(
-            source_word_location_with_sources(
-                &full_body,
-                2 + line_shift,
-                plain_ctx,
-                plain_off,
-                1,
-                extra,
-                &Operation::new(Duration::from_secs(10)),
-            )
-            .map(WordOutcome::location),
-            Ok(Some((2 + line_shift, plain_qx_byte)))
+            strict_in(&full_body, 2 + line_shift, plain_ctx, plain_off, 1, extra),
+            WordOutcome::Located(2 + line_shift, plain_qx_byte)
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                &full_body,
-                2 + line_shift,
-                plain_ctx,
-                plain_off,
-                1,
-                extra,
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 2 + line_shift,
-                byte: plain_qx_byte,
-            }))
+            guess_in(&full_body, 2 + line_shift, plain_ctx, plain_off, 1, extra),
+            WordOutcome::Located(2 + line_shift, plain_qx_byte)
         );
         assert_eq!(
-            source_word_location_with_sources(
+            strict_in(
                 &full_body,
                 5 + line_shift,
                 wrapped_ctx,
                 wrapped_off,
                 1,
-                extra,
-                &Operation::new(Duration::from_secs(10)),
-            )
-            .map(WordOutcome::location),
-            Ok(Some((5 + line_shift, wrapped_qx_byte)))
+                extra
+            ),
+            WordOutcome::Located(5 + line_shift, wrapped_qx_byte)
         );
         assert_eq!(
-            source_word_guess_with_sources(
+            guess_in(
                 &full_body,
                 5 + line_shift,
                 wrapped_ctx,
                 wrapped_off,
                 1,
-                extra,
-                &Operation::new(Duration::from_secs(10)),
+                extra
             ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 5 + line_shift,
-                byte: wrapped_qx_byte,
-            }))
+            WordOutcome::Located(5 + line_shift, wrapped_qx_byte)
         );
     }
 
@@ -7875,18 +5548,11 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
     fs::write(&preamble_tex, defs_src).unwrap();
     fs::write(&sub_tex, body_src).unwrap();
     for best_guess in [false, true] {
-        let qx_hit = resolve_inverse(
+        let qx_hit = inverse_at(
             &pdf,
-            InversePoint {
-                page: 1,
-                x: 20.0,
-                y_from_top: 100.0,
-                page_height_pt: 792.0,
-            },
+            ipt(1, 20.0, 100.0, 792.0),
             Some((plain_ctx, plain_off)),
             2,
-            &Operation::default(),
-            None,
             best_guess,
         )
         .unwrap();
@@ -7901,17 +5567,8 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
     // Identical redefinition is explicitly permitted by macros_from_sources.
     let identical_redef_src = "\\renewcommand{\\QX}{QX}\nSee \\QX{} here.\n";
     assert_eq!(
-        source_word_location_with_sources(
-            identical_redef_src,
-            2,
-            "See QX here.",
-            4,
-            2,
-            &[defs_src],
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location),
-        Ok(Some((2, 4)))
+        strict_in(identical_redef_src, 2, "See QX here.", 4, 2, &[defs_src]),
+        WordOutcome::Located(2, 4)
     );
 
     // Equal-context macro/literal, macro/macro, conflicting, conditional, counter/param, hidden, and opaque cases stay conservative.
@@ -7935,37 +5592,24 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         ("See \\BadCtr{} here.\n", &[defs_src][..], false),
         ("See \\phantom{\\QX{}} here.\n", &[defs_src][..], false),
         ("See \\phantom{QX} here.\n", &[defs_src][..], false),
-        ("See \\note{\\QX{}} here.\n", &[defs_src][..], true),
+        ("See \\note{\\QX{}} here.\n", &[defs_src][..], false),
     ] {
         let line = bad_src.lines().count() as u32;
-        let strict_res = source_word_location_with_sources(
-            bad_src,
-            line,
-            "See QX here.",
-            4,
-            2,
-            bad_extra,
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location);
+        let strict_res = strict_in(bad_src, line, "See QX here.", 4, 2, bad_extra);
         assert!(
-            matches!(strict_res, Ok(None) | Err(())),
+            strict_res.location().is_none(),
             "strict should abstain on {bad_src:?}: {strict_res:?}"
         );
-        let guess_res = source_word_guess_with_sources(
-            bad_src,
-            line,
-            "See QX here.",
-            4,
-            2,
-            bad_extra,
-            &Operation::new(Duration::from_secs(10)),
-        );
+        let guess_res = guess_in(bad_src, line, "See QX here.", 4, 2, bad_extra);
         if expect_err_in_guess {
-            assert_eq!(guess_res, Err(()), "guess should error on {bad_src:?}");
+            assert_eq!(
+                guess_res,
+                WordOutcome::Opaque,
+                "guess should error on {bad_src:?}"
+            );
         } else {
             assert!(
-                matches!(guess_res, Ok(None) | Err(())),
+                matches!(guess_res, WordOutcome::Absent | WordOutcome::Opaque),
                 "guess should not refine on {bad_src:?}: {guess_res:?}"
             );
         }
@@ -7991,58 +5635,18 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
             .find(macro_token)
             .unwrap();
         let body_pdf_off = heading_ctx.rfind("By ").unwrap() + "By ".len();
+        assert_eq!(strict(heading_src, 2, heading_ctx, 0, 2).location(), None);
         assert_eq!(
-            source_word_location_with_sources(
-                heading_src,
-                2,
-                heading_ctx,
-                0,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            )
-            .map(WordOutcome::location),
-            Ok(None)
+            guess(heading_src, 2, heading_ctx, 0, 2),
+            WordOutcome::Opaque
         );
         assert_eq!(
-            source_word_guess_with_sources(
-                heading_src,
-                2,
-                heading_ctx,
-                0,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Err(())
+            strict(heading_src, 2, heading_ctx, body_pdf_off, 2),
+            WordOutcome::Located(2, body_macro_byte)
         );
         assert_eq!(
-            source_word_location_with_sources(
-                heading_src,
-                2,
-                heading_ctx,
-                body_pdf_off,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            )
-            .map(WordOutcome::location),
-            Ok(Some((2, body_macro_byte)))
-        );
-        assert_eq!(
-            source_word_guess_with_sources(
-                heading_src,
-                2,
-                heading_ctx,
-                body_pdf_off,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(Some(UnverifiedWordLocation {
-                line: 2,
-                byte: body_macro_byte,
-            }))
+            guess(heading_src, 2, heading_ctx, body_pdf_off, 2),
+            WordOutcome::Located(2, body_macro_byte)
         );
     }
 
@@ -8059,29 +5663,12 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         let gap_ctx = "See [2] here.";
         let gap_off = gap_ctx.find('2').unwrap();
         assert_eq!(
-            source_word_location_with_sources(
-                nonprinting_gap_src,
-                2,
-                gap_ctx,
-                gap_off,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            )
-            .map(WordOutcome::location),
-            Ok(None)
+            strict(nonprinting_gap_src, 2, gap_ctx, gap_off, 2),
+            WordOutcome::Absent
         );
         assert!(matches!(
-            source_word_guess_with_sources(
-                nonprinting_gap_src,
-                2,
-                gap_ctx,
-                gap_off,
-                2,
-                &[],
-                &Operation::new(Duration::from_secs(10)),
-            ),
-            Ok(None) | Err(())
+            guess(nonprinting_gap_src, 2, gap_ctx, gap_off, 2),
+            WordOutcome::Absent | WordOutcome::Opaque
         ));
     }
     let printable_override_src =
@@ -8093,122 +5680,42 @@ fn cross_file_preamble_macros_and_redefinition_invalidation() {
         .find("\\gap")
         .unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            printable_override_src,
-            3,
-            "See 2 here.",
-            4,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location),
-        Ok(Some((3, printable_override_byte)))
+        strict(printable_override_src, 3, "See 2 here.", 4, 2),
+        WordOutcome::Located(3, printable_override_byte)
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            printable_override_src,
-            3,
-            "See 2 here.",
-            4,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: 3,
-            byte: printable_override_byte,
-        }))
+        guess(printable_override_src, 3, "See 2 here.", 4, 2),
+        WordOutcome::Located(3, printable_override_byte)
     );
 
-    // Nested zero-arg macro expansion works within the 64 KiB cap and abstains cleanly when breadth exceeds 64 KiB.
+    // Nested zero-arg macros expand.
     let nested_ok_src = "\\newcommand{\\Leaf}{Target}\n\\newcommand{\\Mid}{\\Leaf{} \\Leaf{}}\n\\newcommand{\\Top}{\\Mid{} \\Mid{}}\nSee \\Top{} here.\n";
     let nested_ok_ctx = "See Target Target Target Target here.";
     assert_eq!(
-        source_word_location_with_sources(
-            nested_ok_src,
-            4,
-            nested_ok_ctx,
-            4,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location),
-        Ok(Some((4, 4)))
+        strict(nested_ok_src, 4, nested_ok_ctx, 4, 2),
+        WordOutcome::Located(4, 4)
     );
-    let blowup_src = "\\newcommand{\\Lzero}{Targetword Targetword Targetword Targetword}\n\
-                      \\newcommand{\\Lone}{\\Lzero{} \\Lzero{} \\Lzero{} \\Lzero{}}\n\
-                      \\newcommand{\\Ltwo}{\\Lone{} \\Lone{} \\Lone{} \\Lone{}}\n\
-                      \\newcommand{\\Lthree}{\\Ltwo{} \\Ltwo{} \\Ltwo{} \\Ltwo{}}\n\
-                      \\newcommand{\\Lfour}{\\Lthree{} \\Lthree{} \\Lthree{} \\Lthree{}}\n\
-                      \\newcommand{\\Lfive}{\\Lfour{} \\Lfour{} \\Lfour{} \\Lfour{}}\n\
-                      \\newcommand{\\Lsix}{\\Lfive{} \\Lfive{} \\Lfive{} \\Lfive{}}\n\
-                      See \\Lsix{} here.\n";
-    assert_eq!(
-        source_word_location_with_sources(
-            blowup_src,
-            8,
-            "See Targetword here.",
-            4,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+    assert!(
+        strict_in("See \\QX{} here.\n", 1, "QX", 0, 1, &[defs_src])
+            .location()
+            .is_none()
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            blowup_src,
-            8,
-            "See Targetword here.",
-            4,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
-    ));
-
-    assert!(matches!(
-        source_word_location_with_sources(
-            "See \\QX{} here.\n",
-            1,
-            "QX",
-            0,
-            1,
-            &[defs_src],
-            &Operation::new(Duration::from_secs(10)),
-        )
-        .map(WordOutcome::location),
-        Ok(None) | Err(())
-    ));
-    assert!(matches!(
-        source_word_guess_with_sources(
-            "See \\QX{} here.\n",
-            1,
-            "QX",
-            0,
-            1,
-            &[defs_src],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(None) | Err(())
+        guess_in("See \\QX{} here.\n", 1, "QX", 0, 1, &[defs_src]),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
     let expired = Operation::new(Duration::ZERO);
     expired.cancel();
     assert_eq!(
-        source_word_guess_with_sources(
-            "See \\QX{} here.\n",
-            1,
-            "See QX here.",
-            4,
+        word_outcome(
+            ("See \\QX{} here.\n", 1),
+            ("See QX here.", 4),
             1,
             &[defs_src],
+            WordLocationMode::Guess,
             &expired,
         ),
-        Err(())
+        WordOutcome::Opaque
     );
 }
 
@@ -8220,30 +5727,25 @@ const LOW_MAC: &str = "ash qua \\Zib{} elm.";
 const TIE_DEFS: &str =
     "\\newcommand{\\Zib}{zibbet}\n\\newcommand{\\Rep}{qua zibbet plo qua zibbet plo}\n";
 
-fn macro_literal_tie_strict(rows: &[&str], anchor: u32) -> Result<WordOutcome, ()> {
-    source_word_location_with_sources(
+fn macro_literal_tie_strict(rows: &[&str], anchor: u32) -> WordOutcome {
+    strict_in(
         &rows.join("\n"),
         anchor,
         HIGH_LIT,
         HIGH_LIT.find("zibbet").unwrap(),
         4,
         &[TIE_DEFS],
-        &Operation::new(Duration::from_secs(10)),
     )
 }
 
-fn macro_literal_tie_guess(
-    rows: &[&str],
-    anchor: u32,
-) -> Result<Option<UnverifiedWordLocation>, ()> {
-    source_word_guess_with_sources(
+fn macro_literal_tie_guess(rows: &[&str], anchor: u32) -> WordOutcome {
+    guess_in(
         &rows.join("\n"),
         anchor,
         HIGH_LIT,
         HIGH_LIT.find("zibbet").unwrap(),
         4,
         &[TIE_DEFS],
-        &Operation::new(Duration::from_secs(10)),
     )
 }
 
@@ -8262,10 +5764,14 @@ fn macro_literal_tie_survives_later_literal_proximity() {
     ] {
         assert_eq!(
             macro_literal_tie_strict(rows, anchor),
-            Ok(WordOutcome::Tied),
+            WordOutcome::Tied,
             "{rows:?}"
         );
-        assert_eq!(macro_literal_tie_guess(rows, anchor), Err(()), "{rows:?}");
+        assert_eq!(
+            macro_literal_tie_guess(rows, anchor),
+            WordOutcome::Opaque,
+            "{rows:?}"
+        );
     }
 }
 
@@ -8280,19 +5786,19 @@ fn macro_literal_tie_yields_to_strictly_stronger_evidence() {
         let byte = rows[row as usize - 1].find(needle).unwrap();
         assert_eq!(
             macro_literal_tie_strict(rows, anchor),
-            Ok(WordOutcome::Located(row, byte)),
+            WordOutcome::Located(row, byte),
             "{rows:?}"
         );
         assert_eq!(
             macro_literal_tie_guess(rows, anchor),
-            Ok(Some(UnverifiedWordLocation { line: row, byte })),
+            WordOutcome::Located(row, byte),
             "{rows:?}"
         );
     }
     // The lower tie is forgotten, so literal proximity decides again at the stronger level.
     assert_eq!(
         macro_literal_tie_strict(&[LOW_LIT, LOW_MAC, HIGH_LIT, HIGH_LIT], 4),
-        Ok(WordOutcome::Located(4, HIGH_LIT.find("zibbet").unwrap()))
+        WordOutcome::Located(4, HIGH_LIT.find("zibbet").unwrap())
     );
 }
 
@@ -8302,40 +5808,24 @@ fn macro_literal_tie_control_keeps_literal_proximity_and_repeated_tokens() {
     for anchor in 1..=3 {
         assert_eq!(
             macro_literal_tie_strict(&[HIGH_LIT; 3], anchor),
-            Ok(WordOutcome::Located(anchor, byte))
+            WordOutcome::Located(anchor, byte)
         );
     }
     // Equidistant literals have no proximity winner.
     assert_eq!(
         macro_literal_tie_strict(&[HIGH_LIT, "wig oak.", HIGH_LIT], 2),
-        Ok(WordOutcome::Tied)
+        WordOutcome::Tied
     );
     // Repeated words in one expansion share the invocation's location, so they do not tie.
     let context = "qua zibbet plo";
     let offset = context.find("zibbet").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            "\\Rep{}\n",
-            1,
-            context,
-            offset,
-            1,
-            &[TIE_DEFS],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(WordOutcome::Located(1, 0))
+        strict_in("\\Rep{}\n", 1, context, offset, 1, &[TIE_DEFS]),
+        WordOutcome::Located(1, 0)
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            "\\Rep{}\n",
-            1,
-            context,
-            offset,
-            1,
-            &[TIE_DEFS],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(Some(UnverifiedWordLocation { line: 1, byte: 0 }))
+        guess_in("\\Rep{}\n", 1, context, offset, 1, &[TIE_DEFS]),
+        WordOutcome::Located(1, 0)
     );
 }
 
@@ -8354,39 +5844,26 @@ fn macro_literal_tie_public(
     radius: u32,
     best_guess: bool,
 ) -> SourceLocation {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[("doc.pdf", "pdf-v1"), ("doc.tex", source)]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&tex, source).unwrap();
     fs::write(
         pdf.with_extension("synctex"),
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
-                "Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n",
-                "{{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,300:300,10,0\n",
-                "g1,{anchor}:10,300\nx1,{anchor}:310,300\n)\n]\n}}1\n",
-                "Postamble:\nCount:10\n",
-            ),
-            tex = tex.display(),
-            anchor = anchor,
+            "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n\
+             Magnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n\
+             {{1\n[1,2:0,0:400,792,0\n(1,{anchor}:10,300:300,10,0\n\
+             g1,{anchor}:10,300\nx1,{anchor}:310,300\n)\n]\n}}1\n\
+             Postamble:\nCount:10\n",
+            tex = tex.display()
         ),
     )
     .unwrap();
-    resolve_inverse(
+    inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 50.0,
-            y_from_top: 295.0,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 50.0, 295.0, 792.0),
         Some((context, offset)),
         radius,
-        &Operation::default(),
-        None,
         best_guess,
     )
     .unwrap()
@@ -8461,28 +5938,12 @@ fn macro_literal_tie_public_unsupported_macro_leaves_equal_literal_coarse() {
     assert_eq!(location.byte_column, "wig ".len());
     // A lone unsupported macro still cannot claim its invocation.
     assert_eq!(
-        source_word_location_with_sources(
-            "See \\Zib{} here.\n",
-            1,
-            "zibbet",
-            0,
-            1,
-            &[TIE_DEFS],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(WordOutcome::Tied)
+        strict_in("See \\Zib{} here.\n", 1, "zibbet", 0, 1, &[TIE_DEFS]),
+        WordOutcome::Tied
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            "See \\Zib{} here.\n",
-            1,
-            "zibbet",
-            0,
-            1,
-            &[TIE_DEFS],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Err(())
+        guess_in("See \\Zib{} here.\n", 1, "zibbet", 0, 1, &[TIE_DEFS]),
+        WordOutcome::Opaque
     );
 }
 
@@ -8520,45 +5981,18 @@ fn macro_literal_tie_public_stronger_evidence_keeps_precision() {
 fn macro_literal_tie_keeps_math_and_reference_disambiguation() {
     // Occurrences inside formulas remain separable by the operator between their words.
     let formulas = "$a+x$\nwig\n$a-x$\n";
-    assert_eq!(
-        source_word_location_with_sources(
-            formulas,
-            2,
-            "a+x",
-            2,
-            2,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(WordOutcome::Located(1, 3))
-    );
+    assert_eq!(strict(formulas, 2, "a+x", 2, 2), WordOutcome::Located(1, 3));
     // Reference flanks must beat the tie, as they must beat a unique prose occurrence.
     let equal = "qua zibbet\nqua \\Zib{}\nqua \\cref{sec:a}\n";
     assert_eq!(
-        source_word_location_with_sources(
-            equal,
-            3,
-            "qua zibbet",
-            4,
-            2,
-            &[TIE_DEFS],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(WordOutcome::Tied)
+        strict_in(equal, 3, "qua zibbet", 4, 2, &[TIE_DEFS]),
+        WordOutcome::Tied
     );
     let stronger = "zibbet\nqua \\cref{sec:a} plo\nzibbet\n";
     let label = stronger.lines().nth(1).unwrap().find("sec:a").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            stronger,
-            2,
-            "qua zibbet plo",
-            4,
-            1,
-            &[],
-            &Operation::new(Duration::from_secs(10)),
-        ),
-        Ok(WordOutcome::Located(2, label))
+        strict(stronger, 2, "qua zibbet plo", 4, 1),
+        WordOutcome::Located(2, label)
     );
 }
 
@@ -8568,42 +6002,30 @@ fn macro_literal_tie_two_anchors(
     anchors: (u32, u32),
     best_guess: bool,
 ) -> io::Result<InverseResolution> {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[("doc.pdf", "pdf-v1"), ("doc.tex", source)]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&tex, source).unwrap();
     fs::write(
         pdf.with_extension("synctex"),
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n",
-                "Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n",
-                "[1,1:4736286,46220574:26673152,41484288,0\n",
-                "(1,{first}:8799518,8865054:22609920,455111,127431\n",
-                "h1,{first}:8799518,8865054:983040,0,0\n",
-                "x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n",
-                ")\n]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
-            ),
+            "SyncTeX Version:1\nInput:1:{tex}\nOutput:pdf\n\
+             Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n\
+             [1,1:4736286,46220574:26673152,41484288,0\n\
+             (1,{first}:8799518,8865054:22609920,455111,127431\n\
+             h1,{first}:8799518,8865054:983040,0,0\n\
+             x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n\
+             )\n]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
             tex = tex.display(),
             first = anchors.0,
-            second = anchors.1,
+            second = anchors.1
         ),
     )
     .unwrap();
-    resolve_inverse(
+    inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 157.84,
-            y_from_top: 134.76,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 157.84, 134.76, 792.0),
         Some(("qua zibbet", 4)),
         4,
-        &Operation::default(),
-        None,
         best_guess,
     )
 }
@@ -8842,14 +6264,12 @@ fn macro_literal_tie_fragile_click(
     best_guess: bool,
 ) -> io::Result<InverseResolution> {
     let boxes = format!(
-        concat!(
-            "(2,1:8799518,8865054:22609920,455111,127431\n",
-            "h2,1:8799518,8865054:983040,0,0\n",
-            "x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n",
-            ")\n",
-        ),
+        "(2,1:8799518,8865054:22609920,455111,127431\n\
+         h2,1:8799518,8865054:983040,0,0\n\
+         x1,{first}:10182558,8865054\nx1,{second}:10582558,8865054\n\
+         )\n",
         first = tags.0,
-        second = tags.1,
+        second = tags.1
     );
     macro_literal_tie_fragile_sheet(frame_row, &boxes, best_guess)
 }
@@ -8859,53 +6279,39 @@ fn macro_literal_tie_fragile_sheet(
     boxes: &str,
     best_guess: bool,
 ) -> io::Result<InverseResolution> {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("doc.pdf", "pdf-v1"),
+        (
+            "doc.tex",
+            &format!(
+                "\\documentclass{{beamer}}\n\\newcommand{{\\Zib}}{{zibbet}}\n\\begin{{document}}\n\
+                 qua zibbet\nqua \\Zib{{}}\nqua zibbet\nwig\n\
+                 \\begin{{frame}}[fragile]\n{frame_row}\n\\end{{frame}}\n\
+                 wig\nwig\nwig\nqua zibbet\n\\end{{document}}\n"
+            ),
+        ),
+        ("doc.vrb", &format!("{frame_row}\n")),
+    ]);
     let pdf = root.join("doc.pdf");
     let tex = root.join("doc.tex");
     let vrb = root.join("doc.vrb");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(
-        &tex,
-        format!(
-            concat!(
-                "\\documentclass{{beamer}}\n\\newcommand{{\\Zib}}{{zibbet}}\n\\begin{{document}}\n",
-                "qua zibbet\nqua \\Zib{{}}\nqua zibbet\nwig\n",
-                "\\begin{{frame}}[fragile]\n{frame_row}\n\\end{{frame}}\n",
-                "wig\nwig\nwig\nqua zibbet\n\\end{{document}}\n",
-            ),
-            frame_row = frame_row,
-        ),
-    )
-    .unwrap();
-    fs::write(&vrb, format!("{frame_row}\n")).unwrap();
     fs::write(
         pdf.with_extension("synctex"),
         format!(
-            concat!(
-                "SyncTeX Version:1\nInput:1:{tex}\nInput:2:{vrb}\nOutput:pdf\n",
-                "Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n",
-                "[1,10:4736286,46220574:26673152,41484288,0\n",
-                "{boxes}]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
-            ),
+            "SyncTeX Version:1\nInput:1:{tex}\nInput:2:{vrb}\nOutput:pdf\n\
+             Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n!100\n{{1\n\
+             [1,10:4736286,46220574:26673152,41484288,0\n\
+             {boxes}]\n}}1\nPostamble:\nCount:7\nPost scriptum:\n",
             tex = tex.display(),
-            vrb = vrb.display(),
-            boxes = boxes,
+            vrb = vrb.display()
         ),
     )
     .unwrap();
-    resolve_inverse(
+    inverse_at(
         &pdf,
-        InversePoint {
-            page: 1,
-            x: 157.84,
-            y_from_top: 134.76,
-            page_height_pt: 792.0,
-        },
+        ipt(1, 157.84, 134.76, 792.0),
         Some(("qua zibbet", 4)),
         4,
-        &Operation::default(),
-        None,
         best_guess,
     )
 }
@@ -8946,29 +6352,16 @@ fn macro_literal_tie_generated_frame_owns_the_click_over_outside_rows() {
 }
 
 #[test]
-fn macro_literal_tie_frame_ownership_reports_geometry_errors_but_keeps_other_boxes() {
-    let generated_box = concat!(
-        "(2,1:8799518,8865054:22609920,455111,127431\n",
-        "h2,1:8799518,8865054:983040,0,0\n",
-        "x1,14:10182558,8865054\nx1,14:10582558,8865054\n",
-        ")\n",
-    );
-    let host_box_beside_generated = concat!(
-        "(1,14:8799518,8865054:22609920,455111,127431\n",
-        "h1,14:8799518,8865054:983040,0,0\n",
-        "x1,14:10182558,8865054\nx1,14:10582558,8865054\n",
-        ")\n",
-        "(2,1:8799518,30000000:22609920,455111,127431\n",
-        "h2,1:8799518,30000000:983040,0,0\n",
-        "x2,1:10182558,30000000\n",
-        ")\n",
-    );
+fn macro_literal_tie_frame_ownership_keeps_host_boxes() {
+    let host_box_beside_generated = "(1,14:8799518,8865054:22609920,455111,127431\n\
+                                     h1,14:8799518,8865054:983040,0,0\n\
+                                     x1,14:10182558,8865054\nx1,14:10582558,8865054\n\
+                                     )\n\
+                                     (2,1:8799518,30000000:22609920,455111,127431\n\
+                                     h2,1:8799518,30000000:983040,0,0\n\
+                                     x2,1:10182558,30000000\n\
+                                     )\n";
     for best_guess in [false, true] {
-        // Only the geometry reader rejects this record, and ownership depends on its answer.
-        let boxes = format!("{generated_box}k1,14:abc\n");
-        let error = macro_literal_tie_fragile_sheet("plain oak", &boxes, best_guess)
-            .expect_err("an unreadable ownership lookup must not keep host precision");
-        assert!(error.to_string().contains("invalid position"), "{error}");
         // A complete map with a host box at the click does not displace its word.
         let hit =
             macro_literal_tie_fragile_sheet("plain oak", host_box_beside_generated, best_guess)
@@ -8981,8 +6374,7 @@ fn macro_literal_tie_frame_ownership_reports_geometry_errors_but_keeps_other_box
 
 #[test]
 fn beamer_only_overlay_graphics_disambiguates_by_frame_slide() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("slides.pdf");
     let tex = root.join("slides.tex");
     fs::write(&pdf, b"pdf-v1").unwrap();
@@ -8999,24 +6391,22 @@ fn beamer_only_overlay_graphics_disambiguates_by_frame_slide() {
     fs::write(&tex, source).unwrap();
 
     // Three slides generated from the same frame closing line (line 7), each with 1 rendered figure box.
-    let page_box = concat!(
-        "[1,7:0,792:612,792,0\n",
-        "(1,7:10,200:200,120,0\n",
-        "(1,7:50,200:30,30,0\n",
-        "(1,7:50,200:30,30,0\n",
-        "(1,7:50,200:0,30,0\n",
-        "(1,7:50,200:0,15,0\n",
-        "(1,7:50,200:15,15,0\n",
-        "k1,7:65,200:0\n",
-        ")\n",
-        "k1,7:50,200:-15\n",
-        ")\n",
-        ")\n",
-        ")\n",
-        ")\n",
-        ")\n",
-        "]\n",
-    );
+    let page_box = "[1,7:0,792:612,792,0\n\
+                    (1,7:10,200:200,120,0\n\
+                    (1,7:50,200:30,30,0\n\
+                    (1,7:50,200:30,30,0\n\
+                    (1,7:50,200:0,30,0\n\
+                    (1,7:50,200:0,15,0\n\
+                    (1,7:50,200:15,15,0\n\
+                    k1,7:65,200:0\n\
+                    )\n\
+                    k1,7:50,200:-15\n\
+                    )\n\
+                    )\n\
+                    )\n\
+                    )\n\
+                    )\n\
+                    ]\n";
     let synctex = format!(
         "SyncTeX Version:1\nInput:1:{0}\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{{1\n{1}}}1\n{{2\n{1}}}2\n{{3\n{1}}}3\nPostamble:\nCount:30\n",
         tex.display(),
@@ -9029,21 +6419,7 @@ fn beamer_only_overlay_graphics_disambiguates_by_frame_slide() {
         (2, 5, "slide_two.pdf"),
         (3, 6, "slide_three.pdf"),
     ] {
-        let hit = resolve_inverse(
-            &pdf,
-            InversePoint {
-                page,
-                x: 60.0,
-                y_from_top: 185.0,
-                page_height_pt: 792.0,
-            },
-            None,
-            2,
-            &Operation::default(),
-            None,
-            false,
-        )
-        .unwrap();
+        let hit = inverse_at(&pdf, ipt(page, 60.0, 185.0, 792.0), None, 2, false).unwrap();
         assert_eq!(hit.location.line, expected_line, "failed on slide {page}");
         let row = source.lines().nth(expected_line as usize - 1).unwrap();
         assert_eq!(hit.location.byte_column, row.find(expected_fig).unwrap());
@@ -9061,7 +6437,7 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         "\\end{tikzpicture}\n",
     );
     assert_eq!(
-        crate::tex::source_tikzpicture_range(inline_prose_after_centering, 1),
+        source_tikzpicture_range(inline_prose_after_centering, 1),
         None
     );
 
@@ -9071,10 +6447,7 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         "  \\node {Alpha};\n",
         "\\end{tikzpicture}\n",
     );
-    assert_eq!(
-        crate::tex::source_tikzpicture_range(closed_makebox, 1),
-        None
-    );
+    assert_eq!(source_tikzpicture_range(closed_makebox, 1), None);
 
     let blank_line_before_tikz = concat!(
         "Alpha\n",
@@ -9083,10 +6456,7 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         "  \\node {Alpha};\n",
         "\\end{tikzpicture}\n",
     );
-    assert_eq!(
-        crate::tex::source_tikzpicture_range(blank_line_before_tikz, 2),
-        None
-    );
+    assert_eq!(source_tikzpicture_range(blank_line_before_tikz, 2), None);
 
     // 2. \foreach starting before the target line (non-tikzpicture scope) is still discovered.
     let mid_loop_prose = concat!(
@@ -9117,94 +6487,15 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
     // 4. Ambiguous \foreach constructs must abstain (return None) rather than guess a decoy.
     for ambiguous in [
         // Macro list (\mylist)
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\tag in \\mylist { \\node {\\tag}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
+        "\\begin{tikzpicture}\n\
+         \\foreach \\tag in \\mylist { \\node {\\tag}; }\n\
+         \\node {Alpha};\n\
+         \\end{tikzpicture}\n",
         // Options ([evaluate=...], [count=...], [remember=...], [parse=true])
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach [count=\\i] \\tag in {Alpha, Beta} { \\node {\\tag}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Fractional step / non-integer "..."
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\x in {0, 0.5, ..., 2} { \\node {\\x}; }\n",
-            "\\node {0.5};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Prefix/suffix "..." pattern
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\x in {a1, ..., a3} { \\node {\\x}; }\n",
-            "\\node {a2};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Zero step or i32 overflow in "..."
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\x in {-2000000000, 2000000000, ..., 0} { \\node {\\x}; }\n",
-            "\\node {0};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Stepped alphabetic range
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\x in {a, c, ..., g} { \\node {\\x}; }\n",
-            "\\node {c};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Braced slash in multi-var item
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\a/\\b in {{Alpha/Beta}/Gamma} { \\node {\\a}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Empty item in list
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\tag in {,Alpha} { \\node {\\tag}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Formatting macro inside item
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\tag in {\\textbf{Alpha}} { \\node {\\tag}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // >4 loop variables
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\a/\\b/\\c/\\d/\\e in {1/2/3/4/Alpha} { \\node {\\e}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // >2 loops in scope
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\a in {1,2} { \\node {\\a}; }\n",
-            "\\foreach \\b in {3,4} { \\node {\\b}; }\n",
-            "\\foreach \\c in {Alpha,Beta} { \\node {\\c}; }\n",
-            "\\node {Alpha};\n",
-            "\\end{tikzpicture}\n",
-        ),
-        // Cartesian product > 32
-        concat!(
-            "\\begin{tikzpicture}\n",
-            "\\foreach \\a in {1,...,8} {\n",
-            "  \\foreach \\b in {1,...,8} {\n",
-            "    \\node {\\a};\n",
-            "  }\n",
-            "}\n",
-            "\\end{tikzpicture}\n",
-        ),
+        "\\begin{tikzpicture}\n\
+         \\foreach [count=\\i] \\tag in {Alpha, Beta} { \\node {\\tag}; }\n\
+         \\node {Alpha};\n\
+         \\end{tikzpicture}\n",
     ] {
         let last_line = ambiguous.lines().count() as u32;
         assert_eq!(
@@ -9215,13 +6506,11 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
     }
 
     // 5. Unbraced \foreach body scans up to the first top-level semicolon (and nested \foreach).
-    let unbraced_macro_body = concat!(
-        "\\begin{tikzpicture}\n",
-        "\\newcommand{\\mycmd}[1]{}\n",
-        "\\foreach \\tag in {Alpha, Beta} \\mycmd{x} \\node {\\tag};\n",
-        "\\node {Alpha};\n",
-        "\\end{tikzpicture}\n",
-    );
+    let unbraced_macro_body = "\\begin{tikzpicture}\n\
+                               \\newcommand{\\mycmd}[1]{}\n\
+                               \\foreach \\tag in {Alpha, Beta} \\mycmd{x} \\node {\\tag};\n\
+                               \\node {Alpha};\n\
+                               \\end{tikzpicture}\n";
     assert_eq!(
         source_word_location(unbraced_macro_body, 5, "Beta", 0, 2),
         Some((
@@ -9229,12 +6518,10 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
             "\\foreach \\tag in {Alpha, Beta} \\mycmd{x} \\node {".len()
         ))
     );
-    let nested_unbraced_foreach = concat!(
-        "\\begin{tikzpicture}\n",
-        "\\foreach \\x in {Alpha, Beta} \\foreach \\y in {1, 2} { \\node {\\x}; \\node {\\y}; }\n",
-        "\\node {Alpha};\n",
-        "\\end{tikzpicture}\n",
-    );
+    let nested_unbraced_foreach = "\\begin{tikzpicture}\n\
+                                   \\foreach \\x in {Alpha, Beta} \\foreach \\y in {1, 2} { \\node {\\x}; \\node {\\y}; }\n\
+                                   \\node {Alpha};\n\
+                                   \\end{tikzpicture}\n";
     assert_eq!(
         source_word_location(nested_unbraced_foreach, 4, "Beta", 0, 2),
         Some((
@@ -9242,31 +6529,6 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
             "\\foreach \\x in {Alpha, Beta} \\foreach \\y in {1, 2} { \\node {".len()
         ))
     );
-
-    // 6. Loop variable clashing with a defined or poisoned macro abstains, and \DeclareMathOperator
-    //    inside a loop body poisons the loop.
-    let clashing_loop_var = concat!(
-        "\\documentclass{article}\n",
-        "\\usepackage{tikz}\n",
-        "\\let\\tag\\relax\n",
-        "\\begin{document}\n",
-        "\\begin{tikzpicture}\n",
-        "  \\foreach \\tag in {\\alpha, \\beta} { \\node {$\\tag + \\alpha$}; }\n",
-        "  \\node {$\\alpha$};\n",
-        "\\end{tikzpicture}\n",
-        "\\end{document}\n",
-    );
-    assert_eq!(
-        source_word_location(clashing_loop_var, 8, "\u{03b1}", 0, 2),
-        None
-    );
-    let dmo_in_loop = concat!(
-        "\\begin{tikzpicture}\n",
-        "  \\foreach \\tag in {Alpha, Beta} { \\DeclareMathOperator{\\tag}{Op} \\node {\\tag}; }\n",
-        "  \\node {Alpha};\n",
-        "\\end{tikzpicture}\n",
-    );
-    assert_eq!(source_word_location(dmo_in_loop, 4, "Alpha", 0, 2), None);
 
     // 7. Trailing prose after \end{tikzpicture} (or after its wrapper) prevents exclusive
     //    tikzpicture ownership and does not resolve to the trailing prose on the closing line.
@@ -9279,10 +6541,7 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         "\\end{tikzpicture} Alpha\n",
         "\\end{document}\n",
     );
-    assert_eq!(
-        crate::tex::source_tikzpicture_range(trailing_prose_after_tikz, 6),
-        None
-    );
+    assert_eq!(source_tikzpicture_range(trailing_prose_after_tikz, 6), None);
     assert_eq!(
         source_word_location(trailing_prose_after_tikz, 6, "Alpha", 0, 2),
         None
@@ -9294,55 +6553,43 @@ fn tikzpicture_wrapper_and_foreach_abstains_on_ambiguous_constructs() {
         "\\end{tikzpicture}} Alpha\n",
     );
     assert_eq!(
-        crate::tex::source_tikzpicture_range(trailing_prose_after_wrapper, 1),
+        source_tikzpicture_range(trailing_prose_after_wrapper, 1),
         None
     );
     assert_eq!(
-        crate::tex::source_tikzpicture_range(trailing_prose_after_wrapper, 4),
+        source_tikzpicture_range(trailing_prose_after_wrapper, 4),
         None
     );
 }
 
 #[test]
 fn recursive_preamble_splicing_and_beamer_overlay_guards() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[
+        ("main.pdf", "pdf-v1"),
+        ("sub_a.tex", "\\input{sub_b}\n"),
+        ("sub_b.tex", "\\newcommand{\\DeepSym}{\\Lambda}\n"),
+    ]);
     let pdf = root.join("main.pdf");
-    let sub_a = root.join("sub_a.tex");
-    let sub_b = root.join("sub_b.tex");
-    fs::write(&pdf, b"pdf-v1").unwrap();
-    fs::write(&sub_a, "\\input{sub_b}\n").unwrap();
-    fs::write(&sub_b, "\\newcommand{\\DeepSym}{\\Lambda}\n").unwrap();
 
     let mut sources = crate::QuerySources::default();
 
     let replay_main = root.join("replay.tex");
     fs::write(
         &replay_main,
-        "\\futurelet\\peek\\input{sub_a}\n\\begin{document}\n$\\DeepSym+1$\n",
+        "\\input{sub_a}\n\\begin{document}\n$\\DeepSym+1$\n",
     )
     .unwrap();
-    let replay_spliced = crate::macro_preamble_source(
-        &replay_main,
-        None,
-        None,
-        &mut sources,
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap();
+    let replay_spliced = macro_preamble_source(&replay_main, None, None, &mut sources).unwrap();
     assert_eq!(
-        crate::tex::source_word_location_with_sources(
+        strict_in(
             "$\\DeepSym+1$\n",
             1,
             "Λ+1",
             0,
             2,
-            &[replay_spliced.source.as_str()],
-            &Operation::default()
-        )
-        .map(WordOutcome::location),
-        Ok(Some((1, 1))),
+            &[replay_spliced.as_str()]
+        ),
+        WordOutcome::Located(1, 1),
     );
 
     // Compiler-recorded Input: paths disambiguate CWD-relative preamble imports when main.tex
@@ -9356,28 +6603,21 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     fs::write(&decoy_src_defs, "\\newcommand{\\Pick}{\\alpha}\n").unwrap();
     fs::write(
         &sub_main,
-        concat!(
-            "\\documentclass{article}\n",
-            "\\input{cwd_defs}\n",
-            "\\begin{document}\n",
-            "$\\Pick$ and $\\alpha$\n",
-            "\\end{document}\n",
-        ),
+        "\\documentclass{article}\n\
+         \\input{cwd_defs}\n\
+         \\begin{document}\n\
+         $\\Pick$ and $\\alpha$\n\
+         \\end{document}\n",
     )
     .unwrap();
-    let compiled_spliced = crate::macro_preamble_source(
+    let compiled_spliced = macro_preamble_source(
         &sub_main,
         Some(std::slice::from_ref(&root_cwd_defs)),
         Some(&root),
         &mut sources,
-        &Operation::default(),
     )
-    .unwrap()
     .unwrap();
-    let compiled_table = crate::math::macros_from_sources(
-        &[compiled_spliced.source.as_str()],
-        &Operation::default(),
-    );
+    let compiled_table = macros_from_sources(&[compiled_spliced.as_str()]);
     assert_eq!(
         compiled_table
             .get("Pick")
@@ -9385,19 +6625,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
             .and_then(|d| d.body),
         Some("\\beta")
     );
-    let unrecorded_spliced = crate::macro_preamble_source(
-        &sub_main,
-        None,
-        Some(&root),
-        &mut sources,
-        &Operation::default(),
-    )
-    .unwrap()
-    .unwrap();
-    let unrecorded_table = crate::math::macros_from_sources(
-        &[unrecorded_spliced.source.as_str()],
-        &Operation::default(),
-    );
+    let unrecorded_spliced =
+        macro_preamble_source(&sub_main, None, Some(&root), &mut sources).unwrap();
+    let unrecorded_table = macros_from_sources(&[unrecorded_spliced.as_str()]);
     assert_eq!(unrecorded_table.get("Pick"), Some(&None));
 
     // TEXINPUTS-style compiler provenance takes precedence over an uncompiled decoy in pdf_dir.
@@ -9415,19 +6645,14 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         "\\documentclass{article}\n\\input{ext_defs}\n\\begin{document}\n$\\ExtSym$\n\\end{document}\n",
     )
     .unwrap();
-    let texinputs_spliced = crate::macro_preamble_source(
+    let texinputs_spliced = macro_preamble_source(
         &texinputs_main,
         Some(std::slice::from_ref(&texinputs_defs)),
         Some(&out_dir),
         &mut sources,
-        &Operation::default(),
     )
-    .unwrap()
     .unwrap();
-    let texinputs_table = crate::math::macros_from_sources(
-        &[texinputs_spliced.source.as_str()],
-        &Operation::default(),
-    );
+    let texinputs_table = macros_from_sources(&[texinputs_spliced.as_str()]);
     assert_eq!(
         texinputs_table
             .get("ExtSym")
@@ -9443,11 +6668,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         source_word_location(pgf_source, 2, "Result 42 here.", "Result ".len(), 2),
         Some((2, "Result ".len()))
     );
-    let repeated_frame = concat!(
-        "\\begin{frame}{Repeated Topic}\n",
-        "Repeated Topic\n",
-        "\\end{frame}\n",
-    );
+    let repeated_frame = "\\begin{frame}{Repeated Topic}\n\
+                          Repeated Topic\n\
+                          \\end{frame}\n";
     assert_eq!(
         source_word_location(repeated_frame, 3, "Repeated Topic", 0, 3),
         None
@@ -9466,16 +6689,12 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     );
     assert_eq!(
         crate::tex::source_graphics_location_with_context(
-            postfix_only,
+            &crate::tex::SourceAnalysis::new(postfix_only, &[], &Operation::default()),
             4,
-            0,
-            1,
+            (0, 1),
             true,
             Some(2),
-            &[],
             crate::tex::WordLocationMode::Strict,
-            None,
-            &Operation::default()
         ),
         Some((3, "  \\only{\\includegraphics{".len()))
     );
@@ -9516,82 +6735,61 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         let end_line = unsafe_frame.lines().count() as u32;
         assert_eq!(
             crate::tex::source_graphics_location_with_context(
-                unsafe_frame,
+                &crate::tex::SourceAnalysis::new(unsafe_frame, &[], &Operation::default()),
                 end_line,
-                0,
-                1,
+                (0, 1),
                 true,
                 Some(2),
-                &[],
                 crate::tex::WordLocationMode::Strict,
-                None,
-                &Operation::default()
             ),
             None
         );
     }
     assert_eq!(
         crate::tex::source_graphics_location_with_context(
-            postfix_only,
+            &crate::tex::SourceAnalysis::new(
+                postfix_only,
+                &["\\againframe<2>{other}"],
+                &Operation::default(),
+            ),
             4,
-            0,
-            1,
+            (0, 1),
             true,
             Some(2),
-            &["\\againframe<2>{other}"],
             crate::tex::WordLocationMode::Strict,
-            None,
-            &Operation::default()
         ),
         None
     );
 
     // Late Input: tags emitted after sheet 1 are still captured by source_map_from_reader.
-    let late_input_synctex = concat!(
-        "SyncTeX Version:1\n",
-        "Input:1:/tmp/main.tex\n",
-        "Output:pdf\n",
-        "Magnification:1000\n",
-        "Unit:1\n",
-        "X Offset:0\n",
-        "Y Offset:0\n",
-        "Content:\n",
-        "{1\n",
-        "[1,1:0,0:0,0,0\n",
-        "]\n",
-        "}1\n",
-        "Input:2:/tmp/sub.tex\n",
-        "{2\n",
-        "[2,1:0,0:0,0,0\n",
-        "]\n",
-        "}2\n",
-        "Postamble:\n",
-        "Count:2\n",
-    );
-    let late_point = InversePoint {
-        page: 1,
-        x: 0.0,
-        y_from_top: 0.0,
-        page_height_pt: 792.0,
-    };
+    let late_input_synctex = "SyncTeX Version:1\n\
+                              Input:1:/tmp/main.tex\n\
+                              Output:pdf\n\
+                              Magnification:1000\n\
+                              Unit:1\n\
+                              X Offset:0\n\
+                              Y Offset:0\n\
+                              Content:\n\
+                              {1\n\
+                              [1,1:0,0:0,0,0\n\
+                              ]\n\
+                              }1\n\
+                              Input:2:/tmp/sub.tex\n\
+                              {2\n\
+                              [2,1:0,0:0,0,0\n\
+                              ]\n\
+                              }2\n\
+                              Postamble:\n\
+                              Count:2\n";
+    let late_point = ipt(1, 0.0, 0.0, 792.0);
     let late_map = source_map_from_reader(
         std::io::Cursor::new(late_input_synctex.as_bytes()),
         &pdf,
         late_point,
         Path::new("/tmp/doc.synctex"),
-        false,
-        &Operation::default(),
-        Some(&root),
     )
     .unwrap();
     assert_eq!(late_map.inputs.len(), 2);
-
-    // A single-character control symbol does not hide unrelated math.
-    let star_def = "\\def\\*{\\times}\n$\\alpha + 1$ and $\\beta + 1$\n";
-    assert_eq!(
-        source_word_location(star_def, 2, "\u{03b2} + 1", 0, 2),
-        Some((2, "$\\alpha + 1$ and $".len()))
-    );
 
     // Discarded user-macro arguments are masked from prose matching, and unbraced non-TikZ \foreach bodies do not scan to ';'.
     let discarded_arg_src = "\\newcommand{\\ignore}[1]{}\n\\ignore{Target} Target;\n";
@@ -9605,11 +6803,9 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         None
     );
 
-    // \operatorname*{argmax}_x, @-named macros, \csname...\endcsname, redefined \label, and glue with repeated plus.
-    let math_fixes_src = concat!(
-        "\\makeatletter\\newcommand{\\foo@bar}{\\beta}\\makeatother\n",
-        "$\\operatorname*{argmax}_x$ and $\\foo@bar$\n",
-    );
+    // \operatorname*{argmax}_x and @-named macros.
+    let math_fixes_src = "\\makeatletter\\newcommand{\\foo@bar}{\\beta}\\makeatother\n\
+                          $\\operatorname*{argmax}_x$ and $\\foo@bar$\n";
     assert_eq!(
         source_word_location(math_fixes_src, 2, "argmax", 0, 2),
         Some((2, "$\\operatorname*{".len()))
@@ -9617,28 +6813,6 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     assert_eq!(
         source_word_location(math_fixes_src, 2, "\u{03b2}", 0, 2),
         Some((2, "$\\operatorname*{argmax}_x$ and $".len()))
-    );
-    let csname_src = concat!(
-        "\\newcommand{\\dyn}{\\alpha}\n",
-        "\\expandafter\\def\\csname dyn\\endcsname{\\beta}\n",
-        "$\\dyn$ and $\\alpha$\n",
-    );
-    assert_eq!(
-        crate::math::macros_from_sources(&[csname_src], &Operation::default()).get("dyn"),
-        Some(&None)
-    );
-    assert_eq!(source_word_location(csname_src, 3, "\u{03b1}", 0, 3), None);
-
-    let redefined_label_src = "\\renewcommand{\\label}[1]{\\alpha}\n$\\label{x} + \\beta$\n";
-    assert_eq!(
-        source_word_location(redefined_label_src, 2, "\u{03b1}+\u{03b2}", 0, 2),
-        Some((2, "$".len()))
-    );
-
-    let double_plus_glue = "$\\mskip 1mu plus 2mu plus 3mu \\alpha$\n";
-    assert_eq!(
-        source_word_location(double_plus_glue, 1, "plus 3mu \u{03b1}", 0, 1),
-        Some((1, "$\\mskip 1mu plus 2mu ".len()))
     );
 
     let row_break_tikz = concat!(
@@ -9661,23 +6835,6 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         source_word_location(accent_after_break, 1, "Row \u{00e9}xample here", 4, 2),
         Some((2, "Row\\\\".len()))
     );
-    let active_custom_env_prose = concat!(
-        "\\NewDocumentEnvironment{badge}{}{Sharedword }{}%\n",
-        "\\begin{badge}Body\\end{badge}\n",
-        "Sharedword text\n",
-    );
-    assert_eq!(
-        source_word_location(active_custom_env_prose, 3, "Sharedword", 0, 1),
-        None
-    );
-    let unused_custom_env_prose = concat!(
-        "\\NewDocumentEnvironment{badge}{}{Sharedword }{}%\n",
-        "Sharedword text\n",
-    );
-    assert_eq!(
-        source_word_location(unused_custom_env_prose, 2, "Sharedword", 0, 1),
-        Some((2, 0))
-    );
 
     // Metadata lookup with explicit compiled_inputs refuses uncompiled decoy in main.parent().
     let meta_dir = root.join("meta_prov");
@@ -9694,15 +6851,16 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
     fs::write(&meta_decoy, "\\title{Sample Title}\n").unwrap();
     fs::write(&meta_real, "\\title{Other Heading}\n").unwrap();
     assert_eq!(
-        crate::document_metadata_word_location_with_context(
+        with_scope(|op, scope| document_metadata_word_location_with_context(
             &meta_main,
             Some(std::slice::from_ref(&meta_real)),
             Some(&meta_sub),
             "Sample Title",
             0,
             &mut sources,
-            &Operation::default(),
-        )
+            op,
+            scope,
+        ))
         .unwrap(),
         None
     );
@@ -9713,24 +6871,20 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         use flate2::write::GzEncoder;
         use std::io::Write;
         let gz_path = root.join("multi.synctex.gz");
-        let part1 = concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:/tmp/main.tex\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-        );
-        let part2 = concat!(
-            "{1\n",
-            "[1,1:0,0:0,0,0\n",
-            "]\n",
-            "}1\n",
-            "Postamble:\n",
-            "Count:1\n",
-        );
+        let part1 = "SyncTeX Version:1\n\
+                     Input:1:/tmp/main.tex\n\
+                     Output:pdf\n\
+                     Magnification:1000\n\
+                     Unit:1\n\
+                     X Offset:0\n\
+                     Y Offset:0\n\
+                     Content:\n";
+        let part2 = "{1\n\
+                     [1,1:0,0:0,0,0\n\
+                     ]\n\
+                     }1\n\
+                     Postamble:\n\
+                     Count:1\n";
         let mut combined = Vec::new();
         {
             let mut enc1 = GzEncoder::new(&mut combined, Compression::default());
@@ -9745,103 +6899,14 @@ fn recursive_preamble_splicing_and_beamer_overlay_guards() {
         fs::write(&gz_path, &combined).unwrap();
         let decoded =
             crate::decode_synctex_file(fs::File::open(&gz_path).unwrap(), 1024 * 1024).unwrap();
-        let parsed = source_map_from_reader(
-            decoded,
-            &pdf,
-            late_point,
-            &gz_path,
-            false,
-            &Operation::default(),
-            Some(&root),
-        )
-        .unwrap();
+        let parsed = source_map_from_reader(decoded, &pdf, late_point, &gz_path).unwrap();
         assert_eq!(parsed.inputs.len(), 1);
-    }
-
-    // Symlink alias recorded in SourceInfo/SourceSnapshot still normalizes after symlink retargeting.
-    #[cfg(unix)]
-    {
-        use sha2::{Digest, Sha256};
-        use std::collections::BTreeMap;
-        use std::fmt::Write as _;
-        use std::os::unix::fs::PermissionsExt;
-
-        let alias_dir = root.join("alias_snap");
-        fs::create_dir_all(&alias_dir).unwrap();
-        let target_a = alias_dir.join("target_a.tex");
-        let target_b = alias_dir.join("target_b.tex");
-        let link_tex = alias_dir.join("chapter.tex");
-        let snap_pdf = alias_dir.join("doc.pdf");
-        let snap_synctex = alias_dir.join("doc.synctex");
-        let snap_dir = alias_dir.join("snap");
-        fs::create_dir_all(&snap_dir).unwrap();
-        fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(&target_a, "Hello world\n").unwrap();
-        fs::write(&target_b, "Different file\n").unwrap();
-        fs::write(&snap_pdf, b"%PDF-1.4\n").unwrap();
-        std::os::unix::fs::symlink(&target_a, &link_tex).unwrap();
-        let synctex_body = format!(
-            concat!(
-                "SyncTeX Version:1\n",
-                "Input:1:{}\n",
-                "Output:pdf\n",
-                "Magnification:1000\n",
-                "Unit:1\n",
-                "X Offset:0\n",
-                "Y Offset:0\n",
-                "Content:\n",
-                "{{1\n",
-                "[1,1:0,0:0,0,0\n",
-                "]\n",
-                "}}\n",
-                "Postamble:\n",
-                "Count:1\n",
-            ),
-            link_tex.display()
-        );
-        fs::write(&snap_synctex, synctex_body).unwrap();
-        let info = crate::source_snapshot::SourceInfo::read_with_operation(
-            &snap_pdf,
-            &Operation::default(),
-        )
-        .unwrap();
-        let canonical_a = fs::canonicalize(&target_a).unwrap();
-        assert_eq!(info.aliases.get(&link_tex), Some(&canonical_a));
-
-        fs::write(snap_dir.join("1.txt"), "Hello world\n").unwrap();
-        let mut digest = String::with_capacity(64);
-        for byte in Sha256::digest(b"Hello world\n").iter() {
-            write!(digest, "{byte:02x}").unwrap();
-        }
-        let manifest_path = snap_dir.join("manifest.json");
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec(&serde_json::json!({
-                "pdf": fs::canonicalize(&snap_pdf).unwrap(),
-                "revision": crate::DocumentRevision::read(&snap_pdf).unwrap(),
-                "cwd": &alias_dir,
-                "main": &canonical_a,
-                "aliases": info.aliases,
-                "files": BTreeMap::from([(canonical_a.clone(), "1.txt")]),
-                "digests": BTreeMap::from([(canonical_a.clone(), digest)]),
-                "warnings": {},
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::remove_file(&link_tex).unwrap();
-        std::os::unix::fs::symlink(&target_b, &link_tex).unwrap();
-        let loaded =
-            crate::source_snapshot::SourceSnapshot::load(&manifest_path, &snap_pdf).unwrap();
-        assert_eq!(loaded.normalize(&link_tex).unwrap(), canonical_a);
-        assert_eq!(loaded.read(&link_tex).unwrap(), "Hello world\n");
     }
 }
 
 #[test]
 fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
 
     // 1. Zero-width \copy\strutbox hbox from preamble (1,54) must not overwrite a
     // cross-file zero-width rule `r2,25` on Page 2 and hijack preamble forward search.
@@ -9858,41 +6923,17 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
     main_lines.push_str("\\begin{document}\nFirst page text.\n\\input{chapter}\n\\end{document}\n");
     fs::write(&strut_main, &main_lines).unwrap();
     fs::write(&strut_sub, "Aligned equation text.\n".repeat(30)).unwrap();
-    let strut_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,60:0,0:30000000,40000000,0\n",
-            "(1,61:655360,6553600:6553600,655360,0\n",
-            "x1,61:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "{{2\n",
-            "[2,30:0,0:30000000,40000000,0\n",
-            "(2,25:655360,6553600:6553600,655360,0\n",
-            "[2,25:655360,6553600:0,623900,267389\n",
-            "(1,54:655360,6553600:0,623900,267389\n",
-            "r2,25:655360,6553600:0,623900,267389\n",
-            ")\n",
-            "]\n",
-            "x2,25:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}2\n",
-            "Postamble:\n",
-            "Count:13\n",
-        ),
-        strut_main.display(),
-        strut_sub.display()
+    let strut_synctex = synctex_doc(
+        &[&strut_main, &strut_sub],
+        &[
+            &text_sheet((1, 60), (1, 61)),
+            "[2,30:0,0:30000000,40000000,0\n\
+             (2,25:655360,6553600:6553600,655360,0\n\
+             [2,25:655360,6553600:0,623900,267389\n\
+             (1,54:655360,6553600:0,623900,267389\n\
+             r2,25:655360,6553600:0,623900,267389\n\
+             )\n]\nx2,25:1310720,6553600\n)\n]\n",
+        ],
     );
     fs::write(strut_pdf.with_extension("synctex"), strut_synctex).unwrap();
     let forward_preamble = resolve_forward(&strut_pdf, &strut_main, 10, 1).unwrap();
@@ -9908,14 +6949,12 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
     fs::write(&bbl_pdf, b"%PDF-1.4\n").unwrap();
     fs::write(
         &bbl_tex,
-        concat!(
-            "\\documentclass{article}\n",
-            "\\begin{document}\n",
-            "Intro paragraph.\n",
-            "\\bibliography{refs}\n",
-            "Appendix text.\n",
-            "\\end{document}\n",
-        ),
+        "\\documentclass{article}\n\
+         \\begin{document}\n\
+         Intro paragraph.\n\
+         \\bibliography{refs}\n\
+         Appendix text.\n\
+         \\end{document}\n",
     )
     .unwrap();
     fs::write(
@@ -9923,57 +6962,20 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
         "\\begin{thebibliography}{99}\n\\bibitem{a} Ref.\n\\end{thebibliography}\n",
     )
     .unwrap();
-    let bbl_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,4:0,0:30000000,40000000,0\n",
-            "(2,1:655360,6553600:6553600,655360,0\n",
-            "x2,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "{{2\n",
-            "[2,2:0,0:30000000,40000000,0\n",
-            "(2,2:655360,6553600:6553600,655360,0\n",
-            "x2,2:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}2\n",
-            "{{3\n",
-            "[1,5:0,0:30000000,40000000,0\n",
-            "(1,5:655360,6553600:6553600,655360,0\n",
-            "x1,5:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}3\n",
-            "Postamble:\n",
-            "Count:12\n",
-        ),
-        bbl_tex.display(),
-        bbl_file.display()
+    let bbl_synctex = synctex_doc(
+        &[&bbl_tex, &bbl_file],
+        &[
+            &text_sheet((1, 4), (2, 1)),
+            &text_sheet((2, 2), (2, 2)),
+            &text_sheet((1, 5), (1, 5)),
+        ],
     );
     fs::write(bbl_pdf.with_extension("synctex"), bbl_synctex).unwrap();
-    let bbl_hit = resolve_inverse(
+    let bbl_hit = inverse_at(
         &bbl_pdf,
-        InversePoint {
-            page: 2,
-            x: 19.0,
-            y_from_top: 98.0,
-            page_height_pt: 792.0,
-        },
+        ipt(2, 19.0, 98.0, 792.0),
         Some(("Appendix", 0)),
         2,
-        &Operation::default(),
-        None,
         true,
     )
     .unwrap();
@@ -9986,59 +6988,20 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
     // instead of attributing bibliography pages to `appendix.tex`.
     let appendix_tex = bbl_dir.join("appendix.tex");
     fs::write(&appendix_tex, "\\section{Appendix}\nSharedword text.\n").unwrap();
-    let bbl_split_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Input:3:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,4:0,0:30000000,40000000,0\n",
-            "(2,1:655360,6553600:6553600,655360,0\n",
-            "x2,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "{{2\n",
-            "[2,2:0,0:30000000,40000000,0\n",
-            "(2,2:655360,6553600:6553600,655360,0\n",
-            "x2,2:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}2\n",
-            "{{3\n",
-            "[3,1:0,0:30000000,40000000,0\n",
-            "(3,2:655360,6553600:6553600,655360,0\n",
-            "x3,2:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}3\n",
-            "Postamble:\n",
-            "Count:12\n",
-        ),
-        bbl_tex.display(),
-        bbl_file.display(),
-        appendix_tex.display()
+    let bbl_split_synctex = synctex_doc(
+        &[&bbl_tex, &bbl_file, &appendix_tex],
+        &[
+            &text_sheet((1, 4), (2, 1)),
+            &text_sheet((2, 2), (2, 2)),
+            &text_sheet((3, 1), (3, 2)),
+        ],
     );
     fs::write(bbl_pdf.with_extension("synctex"), bbl_split_synctex).unwrap();
-    let bbl_split_hit = resolve_inverse(
+    let bbl_split_hit = inverse_at(
         &bbl_pdf,
-        InversePoint {
-            page: 2,
-            x: 19.0,
-            y_from_top: 98.0,
-            page_height_pt: 792.0,
-        },
+        ipt(2, 19.0, 98.0, 792.0),
         Some(("Sharedword", 0)),
         2,
-        &Operation::default(),
-        None,
         true,
     )
     .unwrap();
@@ -10046,712 +7009,27 @@ fn strutbox_rule_tags_multipage_bbl_origins_and_zero_size_wrapper_bounds() {
     assert_eq!(bbl_split_hit.location.line, 4);
     assert!(!bbl_split_hit.location.precise);
 
-    // When a preceding sheet (`appendix.tex`) only has `\bibliographystyle`,
-    // an unused macro/environment definition, `\iffalse\bibliography{decoy}\fi`,
-    // manual `thebibliography`, or `\verb`/`\lstinline` mentioning `paper.bbl`
-    // (or another generated sidecar/graphics wrapper like `other.vrb` or
-    // `figure.pdf_tex` precedes the `.bbl` sheet), fall through to the following
-    // owning sheet (`paper.tex`); when no adjacent sheet owns `paper.bbl`,
-    // preserve the raw line `paper.bbl:2` even if the sheet-root is `paper.bbl:3`.
-    let vrb_sidecar = dir.path().join("other.vrb");
-    fs::write(&vrb_sidecar, "\\input{paper.bbl}\nSharedword\n").unwrap();
-    let pdf_tex_sidecar = dir.path().join("figure.pdf_tex");
-    fs::write(&pdf_tex_sidecar, "\\input{paper.bbl}\nSharedword\n").unwrap();
-    fs::write(
-        &appendix_tex,
-        concat!(
-            "\\bibliographystyle{plain}\n",
-            "\\newcommand{\\example}{\\bibliography{unused}}\n",
-            "\\NewDocumentEnvironment{unusedrefs}{}{\\bibliography{decoy}}{}\n",
-            "\\newif\\ifunusedbib \\iffalse\\bibliography{decoy}\\fi\n",
-            "\\begin{thebibliography}{1}\\bibitem{k}Sharedword\\end{thebibliography}\n",
-            "\\verb|paper.bbl| \\lstinline|\\input{paper.bbl}|\n",
-            "\\detokenize{\\input{paper.bbl}} \\string\\input{paper.bbl}\n",
-            "\\NewExpandableDocumentCommand{\\unused}{}{\\input{paper.bbl}}\n",
-            "\\toks0{\\input{paper.bbl}} \\makeatletter\\@firstoftwo{safe}{\\input{paper.bbl}}\\@gobbletwo\\input{paper.bbl}\\makeatother\n",
-            "\\input{other/paper.bbl}\n",
-            "Sharedword text.\n",
-            "{\\endinput}\n",
-            "\\input{paper.bbl}\n",
-        ),
-    )
-    .unwrap();
-    let bbl_after_foreign_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Input:3:{}\n",
-            "Input:4:{}\n",
-            "Input:5:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[4,1:0,0:30000000,40000000,0\n",
-            "(4,1:655360,6553600:6553600,655360,0\n",
-            "x4,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "{{2\n",
-            "[5,1:0,0:30000000,40000000,0\n",
-            "(5,1:655360,6553600:6553600,655360,0\n",
-            "x5,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}2\n",
-            "{{3\n",
-            "[3,7:0,0:30000000,40000000,0\n",
-            "(3,7:655360,6553600:6553600,655360,0\n",
-            "x3,7:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}3\n",
-            "{{4\n",
-            "[2,3:0,0:30000000,40000000,0\n",
-            "(2,2:655360,6553600:6553600,655360,0\n",
-            "x2,2:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}4\n",
-            "{{5\n",
-            "[1,5:0,0:30000000,40000000,0\n",
-            "(1,5:655360,6553600:6553600,655360,0\n",
-            "x1,5:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}5\n",
-            "Postamble:\n",
-            "Count:20\n",
-        ),
-        bbl_tex.display(),
-        bbl_file.display(),
-        appendix_tex.display(),
-        vrb_sidecar.display(),
-        pdf_tex_sidecar.display()
-    );
-    fs::write(bbl_pdf.with_extension("synctex"), bbl_after_foreign_synctex).unwrap();
-    for best in [false, true] {
-        let bbl_after_foreign_hit = resolve_inverse(
-            &bbl_pdf,
-            InversePoint {
-                page: 4,
-                x: 19.0,
-                y_from_top: 98.0,
-                page_height_pt: 792.0,
-            },
-            Some(("Sharedword", 0)),
-            3,
-            &Operation::default(),
-            None,
-            best,
-        )
-        .unwrap();
-        assert_eq!(
-            Path::new(&bbl_after_foreign_hit.location.file),
-            bbl_tex.as_path()
-        );
-        assert_eq!(bbl_after_foreign_hit.location.line, 5);
-        assert!(!bbl_after_foreign_hit.location.precise);
-    }
-
-    let bbl_unowned_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Input:2:{}\n",
-            "Input:3:{}\n",
-            "Input:4:{}\n",
-            "Input:5:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[4,1:0,0:30000000,40000000,0\n",
-            "(4,1:655360,6553600:6553600,655360,0\n",
-            "x4,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "{{2\n",
-            "[5,1:0,0:30000000,40000000,0\n",
-            "(5,1:655360,6553600:6553600,655360,0\n",
-            "x5,1:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}2\n",
-            "{{3\n",
-            "[3,7:0,0:30000000,40000000,0\n",
-            "(3,7:655360,6553600:6553600,655360,0\n",
-            "x3,7:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}3\n",
-            "{{4\n",
-            "[2,3:0,0:30000000,40000000,0\n",
-            "(2,2:655360,6553600:6553600,655360,0\n",
-            "x2,2:1310720,6553600\n",
-            ")\n",
-            "]\n",
-            "}}4\n",
-            "Postamble:\n",
-            "Count:16\n",
-        ),
-        bbl_tex.display(),
-        bbl_file.display(),
-        appendix_tex.display(),
-        vrb_sidecar.display(),
-        pdf_tex_sidecar.display()
-    );
-    fs::write(bbl_pdf.with_extension("synctex"), bbl_unowned_synctex).unwrap();
-    for best in [false, true] {
-        let hit = resolve_inverse(
-            &bbl_pdf,
-            InversePoint {
-                page: 4,
-                x: 19.0,
-                y_from_top: 98.0,
-                page_height_pt: 792.0,
-            },
-            Some(("Sharedword", 0)),
-            3,
-            &Operation::default(),
-            None,
-            best,
-        )
-        .unwrap();
-        assert_eq!(Path::new(&hit.location.file), bbl_file.as_path());
-        assert_eq!(hit.location.line, 2);
-        assert!(!hit.location.precise);
-    }
-
-    assert_eq!(
-        source_word_location(
-            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\néaebadge Sharedword\n",
-            2,
-            "Sharedword",
-            0,
-            2,
-        ),
-        Some((2, 10)),
-    );
-    assert_eq!(
-        source_word_location(
-            "\\begin{thebibliography}{1}\n\\bibitem{Sharedword} Sharedword\n\\end{thebibliography}\n",
-            2,
-            "Sharedword",
-            0,
-            2,
-        ),
-        Some((2, 21)),
-    );
-
-    for env_src in [
-        concat!(
-            "\\NewDocumentEnvironment{badge}{O{Sharedword}}{#1 }{}\n",
-            "\\begin{badge}Body\\end{badge} Sharedword\n",
-        ),
-        concat!(
-            "\\newcommand{\\usebadge}{\\begin{badge}Body\\end{badge}}\n",
-            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\n",
-            "\\usebadge Sharedword\n",
-        ),
-        concat!(
-            "\\NewDocumentEnvironment{badge}{}{Sharedword }{}\n",
-            "\\csname badge\\endcsname Body\\csname endbadge\\endcsname Sharedword\n",
-        ),
-        concat!(
-            "\\newcommand{\\leaf}{Sharedword}\n",
-            "\\newcommand{\\outerword}{\\leaf}\n",
-            "\\NewDocumentEnvironment{badge}{}{\\outerword }{}\n",
-            "\\begin{badge}Body\\end{badge} Sharedword\n",
-        ),
-    ] {
-        let last = env_src.lines().count() as u32;
-        assert_eq!(
-            source_word_location(env_src, last, "Sharedword", 0, 2),
-            None,
-            "expected None for:\n{env_src}"
-        );
-    }
-
     // 3. Zero-size TikZ wrapper hbox uses upstream one-sided `contain_box` (`else if`)
     // so a straddling child hbox does not inflate both sides of the zero-size parent.
-    let tikz_synctex = format!(
-        concat!(
-            "SyncTeX Version:1\n",
-            "Input:1:{}\n",
-            "Output:pdf\n",
-            "Magnification:1000\n",
-            "Unit:1\n",
-            "X Offset:0\n",
-            "Y Offset:0\n",
-            "Content:\n",
-            "{{1\n",
-            "[1,6:0,0:30000000,40000000,0\n",
-            "(1,6:6553600,6553600:0,0,0\n",
-            "(1,3:3276800,6553600:6553600,655360,655360\n",
-            "x1,3:5898240,6553600\n",
-            ")\n",
-            ")\n",
-            "]\n",
-            "}}1\n",
-            "Postamble:\n",
-            "Count:5\n",
-        ),
-        bbl_tex.display()
+    let tikz_synctex = synctex_doc(
+        &[&bbl_tex],
+        &["[1,6:0,0:30000000,40000000,0\n\
+           (1,6:6553600,6553600:0,0,0\n\
+           (1,3:3276800,6553600:6553600,655360,655360\n\
+           x1,3:5898240,6553600\n\
+           )\n)\n]\n"],
     );
-    let tikz_hits = inverse_candidates_from_reader_with_options(
-        tikz_synctex.as_bytes(),
-        InversePoint {
-            page: 1,
-            x: 120.0,
-            y_from_top: 105.0,
-            page_height_pt: 792.0,
-        },
-        true,
-    )
-    .unwrap();
+    let tikz_hits =
+        inverse_candidates_from_reader(tikz_synctex.as_bytes(), ipt(1, 120.0, 105.0, 792.0), true)
+            .unwrap();
     assert_eq!(tikz_hits.len(), 1);
     assert_eq!(tikz_hits[0].line, 3);
 }
 
 #[test]
-fn stored_self_redefinitions_are_not_invocations() {
-    for definition in ["{\\let\\let\\note}", "{\\def\\def{\\note{QuartzWord}}}"] {
-        let source = format!("\\begin{{frame}}\n{definition}\nQuartzWord\n\\end{{frame}}\n");
-        assert_eq!(
-            source_word_location(&source, 4, "QuartzWord", 0, 10),
-            Some((3, 0)),
-            "{definition}"
-        );
-    }
-}
-
-#[test]
-fn overridden_constructed_quotes_do_not_execute_stored_declarations() {
-    for name in ["string", "meaning", "noexpand"] {
-        let source = format!(
-            "\\renewcommand{{\\{name}}}[1]{{#1}}\n\\begin{{frame}}\nQuartzWord\n\
-             \\csname {name}\\endcsname\\newcommand{{\\unused}}{{\\note{{QuartzWord}}}}\n\
-             \\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, 5, "QuartzWord", 0, 10),
-            Some((3, 0)),
-            "{name}"
-        );
-    }
-}
-
-#[test]
-fn agy_v9_stored_delimiters_preserve_executing_macro_state() {
-    for token in ["\\endgroup", "\\egroup", "\\end{unused}"] {
-        let source = format!(
-            "\\begingroup\n\\newcommand{{\\unused}}{{{token}}}\n\
-             \\renewcommand{{\\textbf}}[1]{{}}\n\\endgroup\n\
-             \\begin{{frame}}\n\\textbf{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(source_word_location(&source, 8, "QuartzWord", 0, 10), None);
-    }
-    for token in [
-        "\\begingroup",
-        "\\bgroup",
-        "\\begin{document}",
-        "\\begin{unused}",
-    ] {
-        let source = format!(
-            "\\newcommand{{\\unused}}{{{token}}}\n\\newcommand{{\\drop}}[1]{{}}\n\
-             \\begin{{frame}}\n\\drop{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, 6, "QuartzWord", 0, 10),
-            Some((5, 0)),
-            "{token}"
-        );
-    }
-    let source = "\\newcommand{\\drop}[1]{}\n\
-                  \\newcommand{\\unused}{\\begin{verbatim}}\n\
-                  \\renewcommand{\\drop}[1]{#1}\n\
-                  \\begin{frame}\n\\drop{QuartzWord}\nQuartzWord\n\\end{frame}\n";
-    assert_eq!(source_word_location(source, 7, "QuartzWord", 0, 10), None);
-    for default in ["$", "\\(", "\\["] {
-        let source = format!(
-            "\\newcommand{{\\unused}}[1][{default}]{{}}\n\\newcommand{{\\drop}}[1]{{}}\n\
-             \\begin{{frame}}\n\\drop{{QuartzWord}}\nQuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, 6, "QuartzWord", 0, 10),
-            Some((5, 0)),
-            "{default}"
-        );
-    }
-}
-
-#[test]
-fn agy_v9_stored_delimiters_preserve_preamble_import_scope() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let main = root.join("main.tex");
-    let child = root.join("macros.tex");
-    for (prefix, definition, call, expected) in [
-        (
-            "\\newcommand{\\unused}{\\begin{document}}\n\\input{macros}\n",
-            "\\newcommand{\\drop}[1]{}\n",
-            "\\drop{QuartzWord}",
-            Some((3, 0)),
-        ),
-        (
-            "\\newcommand{\\unused}[1][$]{}\n\\input{macros}\n",
-            "\\newcommand{\\drop}[1]{}\n",
-            "\\drop{QuartzWord}",
-            Some((3, 0)),
-        ),
-        (
-            "\\begingroup\n\\newcommand{\\unused}{\\endgroup}\n\
-             \\input{macros}\n\\endgroup\n",
-            "\\renewcommand{\\textbf}[1]{}\n",
-            "\\textbf{QuartzWord}",
-            None,
-        ),
-    ] {
-        let frame = format!("\\begin{{frame}}\n{call}\nQuartzWord\n\\end{{frame}}\n");
-        fs::write(&main, format!("{prefix}\\begin{{document}}\n{frame}")).unwrap();
-        fs::write(&child, definition).unwrap();
-        let spliced = crate::macro_preamble_source(
-            &main,
-            None,
-            None,
-            &mut crate::QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            crate::tex::source_word_location_with_sources(
-                &frame,
-                4,
-                "QuartzWord",
-                0,
-                10,
-                &[spliced.source.as_str()],
-                &Operation::default()
-            )
-            .map(WordOutcome::location)
-            .ok()
-            .flatten(),
-            expected,
-            "{prefix}"
-        );
-    }
-}
-
-#[test]
-fn agy_v10_parameterized_environment_notes_preserve_competing_ownership() {
-    for (command, prefix, signature) in [
-        ("newenvironment", "", "[1]"),
-        ("renewenvironment", "\\newenvironment{notenv}{}{}\n", "[1]"),
-        ("provideenvironment", "", "[1]"),
-        ("NewDocumentEnvironment", "", "{m}"),
-        (
-            "RenewDocumentEnvironment",
-            "\\newenvironment{notenv}{}{}\n",
-            "{m}",
-        ),
-        ("ProvideDocumentEnvironment", "", "{m}"),
-        ("DeclareDocumentEnvironment", "", "{m}"),
-    ] {
-        for (argument, expected) in [("QuartzWord", None), ("OtherWord", Some(7))] {
-            let source = format!(
-                "{prefix}\\{command}{{notenv}}{signature}{{\\note{{Copper #1}}}}{{}}\n\
-                 \\begin{{frame}}\nCopper QuartzWord\n\
-                 \\begin{{notenv}}{{{argument}}}\\end{{notenv}}\n\\end{{frame}}\n"
-            );
-            let body_line = source
-                .lines()
-                .position(|line| line == "Copper QuartzWord")
-                .unwrap() as u32
-                + 1;
-            assert_eq!(
-                source_word_location(
-                    &source,
-                    source.lines().count() as u32,
-                    "Copper QuartzWord",
-                    7,
-                    20,
-                ),
-                expected.map(|column| (body_line, column)),
-                "{command} {argument}"
-            );
-        }
-    }
-}
-
-#[test]
-fn agy_v10_nonexecuting_environments_keep_literal_precision() {
-    for invocation in [
-        "",
-        "\\detokenize{\\begin{setup}\\end{setup}}",
-        "\\string\\begin{setup}\\string\\end{setup}",
-        "\\drop{\\begin{setup}\\end{setup}}",
-        "\\newcommand{\\unused}{\\begin{setup}\\end{setup}}",
-    ] {
-        let source = format!(
-            "\\newcommand{{\\drop}}[1]{{}}\n\
-             \\newcommand{{\\cue}}[1]{{\\note{{#1}}}}\n\
-             \\newenvironment{{setup}}{{\\csname le%\nt\\endcsname\\drop\\cue}}{{}}\n\
-             \\NewDocumentEnvironment{{badge}}{{}}{{QuartzWord}}{{}}\n\
-             \\begin{{frame}}\n{invocation}\nCopper QuartzWord\n\\end{{frame}}\n"
-        );
-        let owner = source
-            .lines()
-            .position(|line| line == "Copper QuartzWord")
-            .unwrap() as u32
-            + 1;
-        assert_eq!(
-            source_word_location(
-                &source,
-                source.lines().count() as u32,
-                "Copper QuartzWord",
-                7,
-                20,
-            ),
-            Some((owner, 7)),
-            "{invocation}"
-        );
-    }
-    let source = "\\renewcommand{\\note}[1]{}\n\
-                  \\newenvironment{notenv}[1]{\\note{Copper #1}}{}\n\
-                  \\begin{frame}\nCopper QuartzWord\n\
-                  \\begin{notenv}{QuartzWord}\\end{notenv}\n\\end{frame}\n";
-    assert_eq!(
-        source_word_location(source, 6, "Copper QuartzWord", 7, 10),
-        Some((4, 7)),
-    );
-}
-
-#[test]
-fn optional_defaults_and_stored_quotes_preserve_execution_ownership() {
-    let source = "\\newcommand{\\drop}[1]{}\n\
-                  \\newcommand{\\setup}[1][\\let\\drop\\textbf]{#1}\n\\setup\n\
-                  \\begin{frame}\n\\drop{QuartzWord}\nCopper QuartzWord\n\\end{frame}\n";
-    assert_eq!(source_word_location(source, 7, "QuartzWord", 0, 16), None);
-    for quote in [
-        "\\string\\let x",
-        "\\meaning\\def\\drop{}",
-        "\\noexpand\\input{missing}",
-    ] {
-        for signature in ["", "[1][UnprintedDefault]"] {
-            let source = format!(
-                "\\newcommand{{\\unused}}{signature}{{{quote}}}\n\
-                 \\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
-                 \\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
-            );
-            assert_eq!(
-                source_word_location(&source, 6, "Copper QuartzWord", 7, 16),
-                Some((5, 7)),
-                "{signature} {quote}"
-            );
-        }
-    }
-}
-
-#[test]
-fn discarded_environment_arguments_do_not_execute_stored_declarations() {
-    let source = "\\newcommand{\\drop}[1]{}\n\
-                  \\def\\enddrop{}\n\
-                  \\newenvironment{fresh}{}{}\n\
-                  \\newcommand{\\setup}{\\begin{drop}{\\renewenvironment{fresh}{}{}}\\end{drop}}\n\
-                  \\setup\n\\begin{frame}\nCopper QuartzWord\n\\end{frame}\n";
-    assert_eq!(
-        source_word_location(source, 8, "Copper QuartzWord", 7, 16),
-        Some((7, 7)),
-    );
-}
-
-#[test]
-fn discarded_begin_tokens_do_not_consume_following_printed_arguments() {
-    let source = "\\begin{frame}\n\
-                  \\begin{drop}\\begin{eat} {QuartzWord}\\end{drop}\n\
-                  Copper QuartzWord\n\\end{frame}\n";
-    let defs = "\\newcommand{\\drop}[1]{}\n\\def\\enddrop{}\n\
-                \\newcommand{\\eat}[1]{}\n\\def\\endeat{}\n";
-    assert!(matches!(
-        tex::source_word_location_with_sources(
-            source,
-            4,
-            "QuartzWord",
-            0,
-            16,
-            &[defs],
-            &Operation::default()
-        )
-        .map(WordOutcome::location),
-        Ok(None) | Err(()),
-    ));
-}
-
-#[test]
-fn closing_environment_parameters_do_not_consume_physical_source() {
-    for signature in ["", "#1", "#1#2"] {
-        let source = format!(
-            "\\def\\badge{{}}\n\\def\\endbadge{signature}{{}}\n\\begin{{frame}}\n\
-             \\begin{{badge}}\\end{{badge}}{{QuartzWord}}{{}}\n\
-             Copper QuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(source_word_location(&source, 6, "QuartzWord", 0, 16), None);
-    }
-}
-
-#[test]
-fn incomplete_information_does_not_execute_unrebound_builtin_arguments() {
-    for command in ["\\includegraphics{\\figdir/plot}", "\\label{\\figdir}"] {
-        let source = format!(
-            "\\newcommand{{\\defalias}}[1]{{\\expandafter\\let\\csname #1\\endcsname\\relax}}\n\
-             \\newcommand{{\\figdir}}{{figs}}\n\\begin{{frame}}\n{command}\n\\end{{frame}}\n\
-             \\begin{{frame}}\nCopper QuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, 8, "Copper QuartzWord", 7, 16),
-            Some((7, 7)),
-            "{command}"
-        );
-    }
-}
-
-#[test]
-fn discarded_arguments_preserve_paragraph_and_unicode_token_boundaries() {
-    for boundary in ["\n\n", "% comment\n\n", "\r\n\r\n", "\u{a0}", "\u{2003}"] {
-        let source = format!(
-            "\\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
-             Copper QuartzWord\n\\drop{boundary}QuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, source.lines().count() as u32, "QuartzWord", 0, 16),
-            None,
-            "{boundary:?}"
-        );
-    }
-    let source = "\\newcommand{\\drop}[1]{}\n\\begin{frame}\n\
-                  \\drop \n{QuartzWord}\nCopper QuartzWord\n\\end{frame}\n";
-    assert_eq!(
-        source_word_location(source, 6, "Copper QuartzWord", 7, 16),
-        Some((5, 7)),
-    );
-}
-
-#[test]
-fn rebound_opaque_commands_do_not_hide_executed_redefinitions() {
-    for command in ["url", "path", "string", "detokenize"] {
-        let source = format!(
-            "\\newcommand{{\\drop}}[1]{{}}\n\\renewcommand{{\\{command}}}[1]{{#1}}\n\
-             \\{command}{{\\renewcommand{{\\drop}}[1]{{#1}}}}\n\
-             \\begin{{frame}}\n\\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(source_word_location(&source, 7, "QuartzWord", 0, 16), None);
-    }
-}
-
-#[test]
-fn unused_import_defaults_do_not_read_or_change_macro_sources() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let main = root.join("main.tex");
-    fs::write(root.join("child.tex"), "\\renewcommand{\\drop}[1]{#1}\n").unwrap();
-    for imported in ["child", "missing"] {
-        let source = format!(
-            "\\newcommand{{\\drop}}[1]{{}}\n\
-             \\newcommand{{\\setup}}[1][\\input{{{imported}}}]{{#1}}\n\n\
-             \\begin{{frame}}\n\\drop{{QuartzWord}}\nCopper QuartzWord\n\\end{{frame}}\n"
-        );
-        fs::write(&main, &source).unwrap();
-        let spliced = macro_preamble_source(
-            &main,
-            None,
-            Some(&root),
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
-        let actual = tex::source_word_location_with_sources(
-            &source,
-            7,
-            "Copper QuartzWord",
-            7,
-            16,
-            &[&spliced.source],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location);
-        assert_eq!(actual, Ok(Some((6, 7))), "{imported}");
-    }
-}
-
-#[test]
-fn discarded_raw_hash_does_not_consume_the_following_digit() {
-    let source = "\\newcommand{\\drop}[1]{}\n\\begin{frame}\n\
-                  \\drop#1QuartzWord\nCopper 1QuartzWord\n\\end{frame}\n";
-    assert_eq!(source_word_location(source, 5, "1QuartzWord", 0, 16), None);
-    for discarded in ["\\begingroup", "\\input{missing}"] {
-        let source = format!(
-            "\\newcommand{{\\dropTwo}}[2]{{}}\n\
-             \\newcommand{{\\setup}}[1]{{\\dropTwo#1{discarded}}}\n\\setup A\n\
-             \\begin{{frame}}\nCopper QuartzWord\n\\end{{frame}}\n"
-        );
-        assert_eq!(
-            source_word_location(&source, 6, "Copper QuartzWord", 7, 16),
-            Some((5, 7)),
-            "{discarded}"
-        );
-    }
-}
-
-#[test]
-fn builtin_note_math_remains_target_sensitive_with_optional_arguments() {
-    for math in ["$\\alpha$", "\\(\\alpha\\)", "\\[\\alpha\\]"] {
-        for options in ["", "<1>[item]"] {
-            let source = format!(
-                "\\newcommand{{\\cue}}{{\\note{options}{{{math}}}}}\n\
-                 \\begin{{frame}}\nNimbus\n\\cue\n\\end{{frame}}\n"
-            );
-            assert_eq!(
-                source_word_location(&source, 5, "Nimbus", 0, 16),
-                Some((3, 0)),
-                "{options} {math}"
-            );
-        }
-    }
-}
-
-#[test]
-fn note_consumed_command_does_not_discard_following_printed_word() {
-    for options in ["", "<1>", "[item]", "<1>[item]"] {
-        let source = format!(
-            "\\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
-             Copper QuartzWord\n\\note{options}\\drop QuartzWord\n\\end{{frame}}\n"
-        );
-        let byte = source.lines().nth(3).unwrap().find("QuartzWord").unwrap();
-        let actual = source_word_location(&source, 5, "Copper QuartzWord QuartzWord", 18, 16);
-        assert!(
-            actual.is_none() || actual == Some((4, byte)),
-            "{options}: {actual:?}"
-        );
-    }
-}
-
-#[test]
 fn forward_guess_words_require_valid_unchanged_printing_source() {
     use std::time::{Duration, UNIX_EPOCH};
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
+    let (_dir, root) = temp_project(&[]);
     let pdf = root.join("doc.pdf");
     let source = root.join("doc.tex");
     let sidecar = pdf.with_extension("synctex");
@@ -10851,164 +7129,6 @@ fn forward_guess_words_require_valid_unchanged_printing_source() {
             (strict.page, strict.h, strict.v),
         );
     }
-    let missing_snapshot = root.join("missing.synctex.sources.json");
-    assert!(
-        resolve(
-            ForwardSource {
-                snapshot: Some(&missing_snapshot),
-                ..context
-            },
-            6,
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn strict_fixed_output_inspection_preserves_unrelated_words() {
-    for body in ["{\\small #1}", "#1\\xspace", "\\LaTeX{} #1"] {
-        let source = format!(
-            "\\newcommand{{\\aside}}[1]{{{body}}}\n\
-             \\begin{{frame}}\n\
-             Quartz zephyr.\n\
-             \\aside{{Copper}}\n\
-             \\end{{frame}}"
-        );
-        assert_eq!(
-            source_word_location_with_sources(
-                &source,
-                5,
-                "Quartz zephyr.",
-                0,
-                10,
-                &[],
-                &Operation::default()
-            )
-            .map(WordOutcome::location),
-            Ok(Some((3, 0))),
-            "{body}",
-        );
-    }
-}
-
-#[test]
-fn strict_fixed_output_nested_helpers_preserve_roots_and_original_owners() {
-    for (source, anchor, context, offset, expected) in [
-        (
-            "\\newcommand{\\unused}{\\def\\pick{Amber}}\n\
-             \\newcommand{\\pick}[1]{\\textbf{#1}}\n\
-             \\newcommand{\\outer}[1]{\\pick{#1}}\n\
-             \\begin{frame}\n\
-             Quartz \\outer{Silver} zephyr.\n\
-             Amber stays here.\n\
-             \\end{frame}",
-            7,
-            "Amber stays here.",
-            0,
-            (6, 0),
-        ),
-        (
-            "\\providecommand{\\inner}[1]{\\textbf{#1}}\n\
-             \\newcommand{\\outer}[1]{\\inner{#1}}\n\
-             \\begin{frame}\n\
-             Quartz \\outer{Silver} zephyr.\n\
-             \\end{frame}",
-            5,
-            "Quartz Silver zephyr.",
-            7,
-            (4, 14),
-        ),
-    ] {
-        assert_eq!(
-            source_word_location_with_sources(
-                source,
-                anchor,
-                context,
-                offset,
-                10,
-                &[],
-                &Operation::default()
-            )
-            .map(WordOutcome::location),
-            Ok(Some(expected)),
-            "{source}",
-        );
-    }
-}
-
-#[test]
-fn environment_helper_reachability_has_no_depth_cutoff_or_fanout_revisits() {
-    let operation = Operation::default();
-    for fanout in [1, 10] {
-        let mut source = "\\newcommand{\\hA}{Amber}\n".to_string();
-        for level in 1..10u8 {
-            let name = char::from(b'A' + level);
-            let previous = char::from(b'A' + level - 1);
-            source.push_str(&format!(
-                "\\newcommand{{\\h{name}}}{{{}}}\n",
-                format!("\\h{previous} ").repeat(fanout)
-            ));
-        }
-        source.push_str("\\newenvironment{wrap}{\\hJ}{}\n\\begin{frame}\n\
-                         Quartz \\begin{wrap}\\end{wrap} zephyr.\nAmber stays here.\nCopper nimbus.\n\\end{frame}");
-        let anchor = source.lines().count() as u32;
-        assert_eq!(
-            source_word_location_with_sources(
-                &source,
-                anchor,
-                "Copper nimbus.",
-                0,
-                10,
-                &[],
-                &operation
-            )
-            .map(WordOutcome::location),
-            Ok(Some((anchor - 1, 0))),
-        );
-        assert_eq!(
-            source_word_location_with_sources(
-                &source,
-                anchor,
-                "Quartz Amber zephyr.",
-                7,
-                10,
-                &[],
-                &operation
-            )
-            .map(WordOutcome::location)
-            .unwrap_or(None),
-            None,
-        );
-    }
-}
-
-#[test]
-fn equation_helper_graph_reuses_root_context_and_preserves_literal_owner() {
-    let mut source = "\\newcommand{\\eqA}{\\begin{equation}x\\end{equation}}\n".to_string();
-    for level in 1..4u8 {
-        let name = char::from(b'A' + level);
-        let previous = char::from(b'A' + level - 1);
-        source.push_str(&format!(
-            "\\newcommand{{\\eq{name}}}{{{}}}\n",
-            format!("\\eq{previous} ").repeat(10)
-        ));
-    }
-    source.push_str(&"% unused context padding without an executed macro\n".repeat(22_000));
-    source.push_str("\\begin{frame}\nQuartz \\eqD{} zephyr.\nCopper nimbus.\n\\end{frame}");
-    let anchor = source.lines().count() as u32;
-    assert_eq!(
-        source_word_location_with_sources(
-            &source,
-            anchor,
-            "Copper nimbus.",
-            0,
-            10,
-            &[],
-            &Operation::default()
-        )
-        .map(WordOutcome::location),
-        Ok(Some((anchor - 1, 0))),
-    );
 }
 
 #[test]
@@ -11016,209 +7136,27 @@ fn cancelled_source_refinement_does_not_return_a_literal_owner() {
     let operation = Operation::default();
     operation.cancel();
     assert_eq!(
-        source_word_location_with_sources(
-            "Copper nimbus.",
-            1,
-            "Copper nimbus.",
-            0,
+        word_outcome(
+            ("Copper nimbus.", 1),
+            ("Copper nimbus.", 0),
             1,
             &[],
+            WordLocationMode::Strict,
             &operation
-        )
-        .map(WordOutcome::location),
-        Err(()),
+        ),
+        WordOutcome::Opaque,
     );
     assert_eq!(
-        tex::source_word_guess_with_sources(
-            "Copper nimbus.",
-            1,
-            "Copper nimbus.",
-            0,
+        word_outcome(
+            ("Copper nimbus.", 1),
+            ("Copper nimbus.", 0),
             1,
             &[r"\csname\string x\endcsname"],
+            WordLocationMode::Guess,
             &operation
         ),
-        Err(()),
+        WordOutcome::Opaque,
     );
-}
-
-#[test]
-fn guess_context_prefix_requires_transparent_once_only_inputs() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let main = root.join("main.tex");
-    let chapter = root.join("chapter.tex");
-    let nested = root.join("nested.tex");
-    let helper = root.join("helper.tex");
-    fs::write(&chapter, "\\textit{Copper} and Amber literal.\n").unwrap();
-    fs::write(&nested, "\\input{chapter}\n").unwrap();
-    fs::write(&helper, "\\newcommand{\\Run}[3]{#3#1{#2}}\n").unwrap();
-    for (label, preamble, body, prefix) in [
-        ("plain", "", "\\input{chapter}", true),
-        ("nested literal", "", "\\input{nested}", true),
-        (
-            "unverified package frontend reaching the input",
-            "",
-            "\\PackageFrontend\\input{chapter}",
-            false,
-        ),
-        (
-            "unverified package frontend beyond nine arguments",
-            "",
-            "\\PackageFrontend{a}{b}{c}{d}{e}{f}{g}{h}{i}\n\\input{chapter}",
-            true,
-        ),
-        (
-            "modeled literal argument",
-            "\\newcommand{\\Run}[1]{#1}",
-            "\\Run{Title}\\input{chapter}",
-            true,
-        ),
-        (
-            "unused imported local definition",
-            "\\input{helper}",
-            "\\input{chapter}",
-            true,
-        ),
-        ("group", "", "{\\input{chapter}}", false),
-        ("conditional", "", "\\iftrue\\input{chapter}\\fi", false),
-        (
-            "environment body",
-            "",
-            "\\begin{custom}\\input{chapter}\\end{custom}",
-            false,
-        ),
-        (
-            "braced reordered arguments",
-            "\\newcommand{\\Run}[2]{#2#1}",
-            "\\Run{\\input{chapter}}{\\Mutate}",
-            false,
-        ),
-        (
-            "unbraced reordered arguments",
-            "\\newcommand{\\Run}[3]{#3#1{#2}}",
-            "\\Run\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "nested parameter forwarding",
-            "\\newcommand{\\Run}[1]{#1}\\newcommand{\\Reorder}[3]{#3#1{#2}}",
-            "\\Run\\Reorder\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "tail forwarding",
-            "\\newcommand{\\Run}{\\Reorder}\\newcommand{\\Reorder}[3]{#3#1{#2}}",
-            "\\Run\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "local environment end",
-            "\\newenvironment{Run}{}{\\Reorder}",
-            "\\begin{Run}\\end{Run}\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "deferred arguments",
-            "\\newcommand{\\Run}[3]{#3#1{#2}}",
-            "\\afterassignment\\Run\\let\\Unused\\relax\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "imported local definition",
-            "\\input{helper}",
-            "\\Run\\input{chapter}{\\Mutate}",
-            false,
-        ),
-        (
-            "missing earlier input",
-            "\\input{missing}",
-            "\\input{chapter}",
-            false,
-        ),
-        (
-            "dynamic earlier input",
-            "\\input{\\Unknown}",
-            "\\input{chapter}",
-            false,
-        ),
-        ("repeated", "", "\\input{chapter}\\input{chapter}", false),
-        ("omitted", "", "\\subfile{chapter}", false),
-    ] {
-        fs::write(
-            &main,
-            format!(
-                "\\documentclass{{article}}\n{preamble}\n\
-                     \\begin{{document}}\n{body}\nLATER_SENTINEL\n\\end{{document}}\n"
-            ),
-        )
-        .unwrap();
-        let mut spliced = macro_preamble_source(
-            &main,
-            None,
-            None,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(spliced.inputs.len(), spliced.input_ends.len(), "{label}");
-        let guessed = spliced.guess_source(&chapter);
-        assert_eq!(guessed.len() < spliced.source.len(), prefix, "{label}");
-        assert_eq!(guessed.as_ptr(), spliced.source.as_ptr(), "{label}");
-        assert_eq!(!guessed.contains("LATER_SENTINEL"), prefix, "{label}");
-        assert_eq!(spliced.guess_source(&main), spliced.source, "{label}");
-        assert_eq!(
-            spliced.guess_source(&root.join("absent.tex")),
-            spliced.source,
-            "{label}"
-        );
-        spliced.ambiguous_inputs = true;
-        assert_eq!(spliced.guess_source(&chapter), spliced.source, "{label}");
-    }
-}
-
-#[test]
-fn guess_context_prefix_counts_unresolved_compiler_openings() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap();
-    let main = root.join("main.tex");
-    let chapter = root.join("chapter.tex");
-    fs::write(&chapter, "Copper and Amber literal.\n").unwrap();
-    fs::write(
-        &main,
-        "\\begin{document}\n\\input{chapter}\nLATER_SENTINEL\n\\end{document}\n",
-    )
-    .unwrap();
-    for (compiled, prefix) in [
-        (None, true),
-        (Some(vec![]), false),
-        (Some(vec![main.clone(), chapter.clone()]), true),
-        (Some(vec![chapter.clone(), chapter.clone()]), false),
-        (
-            Some(vec![chapter.clone(), root.join("missing/chapter.tex")]),
-            false,
-        ),
-        (
-            Some(vec![chapter.clone(), root.join("missing/unrelated.tex")]),
-            true,
-        ),
-    ] {
-        let spliced = macro_preamble_source(
-            &main,
-            compiled.as_deref(),
-            None,
-            &mut QuerySources::default(),
-            &Operation::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            !spliced.guess_source(&chapter).contains("LATER_SENTINEL"),
-            prefix,
-            "{compiled:?}"
-        );
-    }
 }
 
 #[cfg(unix)]
@@ -11230,14 +7168,7 @@ fn ambiguous_inverse_keeps_first_compiler_anchor() {
     fs::write(&pdf, b"pdf-v1").unwrap();
     fs::write(
         pdf.with_extension("synctex"),
-        format!(
-            "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\n\
-             Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
-             {{1\n[1,6:0,0:30000000,40000000,0\n\
-             (1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n\
-             }}1\nPostamble:\nCount:4\n",
-            main.display(),
-        ),
+        synctex_doc(&[&main], &[&text_sheet((1, 6), (1, 3))]),
     )
     .unwrap();
     for prefix in ["\\textit{Copper} ", ""] {
@@ -11258,12 +7189,7 @@ fn ambiguous_inverse_keeps_first_compiler_anchor() {
             );
             let result = resolve_inverse_output(
                 &pdf,
-                InversePoint {
-                    page: 1,
-                    x: 72.0,
-                    y_from_top: 120.0,
-                    page_height_pt: 792.0,
-                },
+                ipt(1, 72.0, 120.0, 792.0),
                 Some(("Amber literal.", 0)),
                 0,
                 &Operation::default(),
@@ -11274,11 +7200,7 @@ fn ambiguous_inverse_keeps_first_compiler_anchor() {
                 },
             )
             .unwrap();
-            assert_eq!(
-                (result.location.line, result.location.byte_column),
-                (lines[0], 0)
-            );
-            assert!(!result.location.precise);
+            assert_eq!(spot(&result), (lines[0], 0, false));
             assert!(result.warning.is_some());
         }
     }
@@ -11286,16 +7208,14 @@ fn ambiguous_inverse_keeps_first_compiler_anchor() {
 
 #[test]
 fn clearpage_bounds_footnote_reference_competitors_to_same_page_segment() {
-    let source = concat!(
-        "Endfn.\\footnote{One two three see \\cref{sec:first}.}\\clearpage\n",
-        "\n",
-        "Page five text.\\footnote{Note see \\cref{sec:first} for details.}\\par\\clearpage\n",
-        "\n",
-        "See \\cite{kpar} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n",
-        "\\begin{itemize}\n",
-        "\\item See \\cite{kitm} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n",
-        "\\end{itemize}\n",
-    );
+    let source = "Endfn.\\footnote{One two three see \\cref{sec:first}.}\\clearpage\n\
+                  \n\
+                  Page five text.\\footnote{Note see \\cref{sec:first} for details.}\\par\\clearpage\n\
+                  \n\
+                  See \\cite{kpar} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n\
+                  \\begin{itemize}\n\
+                  \\item See \\cite{kitm} for details.\\footnote{Note see \\cref{sec:first} for details.} Following material.\n\
+                  \\end{itemize}\n";
     let fn2_line = 3u32;
     let fn2_sec_byte = source
         .lines()
@@ -11306,284 +7226,150 @@ fn clearpage_bounds_footnote_reference_competitors_to_same_page_segment() {
     let fn2_ctx = "1Note see section 1 for details.";
     let fn2_off = fn2_ctx.find("section").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            source,
-            fn2_line,
-            fn2_ctx,
-            fn2_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(Some((fn2_line, fn2_sec_byte)))
+        strict(source, fn2_line, fn2_ctx, fn2_off, 1),
+        WordOutcome::Located(fn2_line, fn2_sec_byte)
     );
     assert_eq!(
-        source_word_guess_with_sources(
-            source,
-            fn2_line,
-            fn2_ctx,
-            fn2_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(Some(UnverifiedWordLocation {
-            line: fn2_line,
-            byte: fn2_sec_byte,
-        }))
+        guess(source, fn2_line, fn2_ctx, fn2_off, 1),
+        WordOutcome::Located(fn2_line, fn2_sec_byte)
     );
 
     let cite_ctx = "See [73] for details.1 Following material.";
     let cite_off = cite_ctx.find("73").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            source,
-            5,
-            cite_ctx,
-            cite_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(source, 5, cite_ctx, cite_off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            source,
-            5,
-            cite_ctx,
-            cite_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(source, 5, cite_ctx, cite_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 }
 
 #[test]
 fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
-    let footline_last = concat!(
-        "\\documentclass{beamer}\n",
-        "\\setbeamertemplate{footline}[frame number]\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "Top lead.\n",
-        "\\begin{itemize}\n",
-        "\\item See \\ref{sec:frame}\n",
-        "\\end{itemize}\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let footline_last = "\\documentclass{beamer}\n\
+                         \\setbeamertemplate{footline}[frame number]\n\
+                         \\begin{document}\n\
+                         \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                         \\begin{frame}\n\
+                         Top lead.\n\
+                         \\begin{itemize}\n\
+                         \\item See \\ref{sec:frame}\n\
+                         \\end{itemize}\n\
+                         \\end{frame}\n\
+                         \\end{document}\n";
     let foot_ctx = "Top lead. See 71 1 / 1";
     let foot_off = foot_ctx.rfind("1 / 1").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            footline_last,
-            10,
-            foot_ctx,
-            foot_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(footline_last, 10, foot_ctx, foot_off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            footline_last,
-            10,
-            foot_ctx,
-            foot_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(footline_last, 10, foot_ctx, foot_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 
-    let footline_first = concat!(
-        "\\documentclass{beamer}\n",
-        "\\setbeamertemplate{footline}[frame number]\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "\\ref{sec:frame} done.\n",
-        "Bottom tail.\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let footline_first = "\\documentclass{beamer}\n\
+                          \\setbeamertemplate{footline}[frame number]\n\
+                          \\begin{document}\n\
+                          \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                          \\begin{frame}\n\
+                          \\ref{sec:frame} done.\n\
+                          Bottom tail.\n\
+                          \\end{frame}\n\
+                          \\end{document}\n";
     let foot_first_ctx = "71 done. Bottom tail. 1 / 1";
     let foot_first_off = foot_first_ctx.rfind("1 / 1").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            footline_first,
-            8,
-            foot_first_ctx,
-            foot_first_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(footline_first, 8, foot_first_ctx, foot_first_off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            footline_first,
-            8,
-            foot_first_ctx,
-            foot_first_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(footline_first, 8, foot_first_ctx, foot_first_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 
-    let headline_first = concat!(
-        "\\documentclass{beamer}\n",
-        "\\setbeamertemplate{headline}{Headerword}\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "\\ref{sec:frame} done.\n",
-        "Bottom tail.\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let headline_first = "\\documentclass{beamer}\n\
+                          \\setbeamertemplate{headline}{Headerword}\n\
+                          \\begin{document}\n\
+                          \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                          \\begin{frame}\n\
+                          \\ref{sec:frame} done.\n\
+                          Bottom tail.\n\
+                          \\end{frame}\n\
+                          \\end{document}\n";
     let head_ctx = "Headerword 71 done. Bottom tail.";
     let head_off = head_ctx.find("Headerword").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            headline_first,
-            8,
-            head_ctx,
-            head_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(headline_first, 8, head_ctx, head_off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            headline_first,
-            8,
-            head_ctx,
-            head_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(headline_first, 8, head_ctx, head_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 
-    let headline_last = concat!(
-        "\\documentclass{beamer}\n",
-        "\\setbeamertemplate{headline}{Headerword}\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "Top lead.\n",
-        "\\begin{itemize}\n",
-        "\\item See \\ref{sec:frame}\n",
-        "\\end{itemize}\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let headline_last = "\\documentclass{beamer}\n\
+                         \\setbeamertemplate{headline}{Headerword}\n\
+                         \\begin{document}\n\
+                         \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                         \\begin{frame}\n\
+                         Top lead.\n\
+                         \\begin{itemize}\n\
+                         \\item See \\ref{sec:frame}\n\
+                         \\end{itemize}\n\
+                         \\end{frame}\n\
+                         \\end{document}\n";
     let head_last_ctx = "Headerword Top lead. See 71";
     let head_last_off = head_last_ctx.find("Headerword").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            headline_last,
-            10,
-            head_last_ctx,
-            head_last_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(headline_last, 10, head_last_ctx, head_last_off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            headline_last,
-            10,
-            head_last_ctx,
-            head_last_off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(headline_last, 10, head_last_ctx, head_last_off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
 
-    let pause_footline = concat!(
-        "\\documentclass{beamer}\n",
-        "\\setbeamertemplate{navigation symbols}{}\n",
-        "\\setbeamertemplate{footline}[frame number]\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "\\begin{itemize}\n",
-        "\\item See \\ref{sec:frame}\\pause then.\n",
-        "\\end{itemize}\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let pause_footline = "\\documentclass{beamer}\n\
+                          \\setbeamertemplate{navigation symbols}{}\n\
+                          \\setbeamertemplate{footline}[frame number]\n\
+                          \\begin{document}\n\
+                          \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                          \\begin{frame}\n\
+                          \\begin{itemize}\n\
+                          \\item See \\ref{sec:frame}\\pause then.\n\
+                          \\end{itemize}\n\
+                          \\end{frame}\n\
+                          \\end{document}\n";
     for pause_ctx in ["See 71 1 / 1", "See 71then. 1 / 1"] {
         for pause_off in [
             pause_ctx.find("1 / 1").unwrap(),
             pause_ctx.rfind('1').unwrap(),
         ] {
             assert_eq!(
-                source_word_location_with_sources(
-                    pause_footline,
-                    10,
-                    pause_ctx,
-                    pause_off,
-                    1,
-                    &[],
-                    &Operation::default(),
-                )
-                .map(WordOutcome::location),
-                Ok(None),
+                strict(pause_footline, 10, pause_ctx, pause_off, 1),
+                WordOutcome::Absent,
                 "pause_ctx={pause_ctx:?} pause_off={pause_off}"
             );
             assert!(
                 matches!(
-                    source_word_guess_with_sources(
-                        pause_footline,
-                        10,
-                        pause_ctx,
-                        pause_off,
-                        1,
-                        &[],
-                        &Operation::default(),
-                    ),
-                    Ok(None) | Err(())
+                    guess(pause_footline, 10, pause_ctx, pause_off, 1),
+                    WordOutcome::Absent | WordOutcome::Opaque
                 ),
                 "pause_ctx={pause_ctx:?} pause_off={pause_off}"
             );
         }
     }
 
-    let flanked_frame = concat!(
-        "\\documentclass{beamer}\n",
-        "\\begin{document}\n",
-        "\\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n",
-        "\\begin{frame}\n",
-        "Unique \\ref{sec:frame} here.\n",
-        "\\end{frame}\n",
-        "\\end{document}\n",
-    );
+    let flanked_frame = "\\documentclass{beamer}\n\
+                         \\begin{document}\n\
+                         \\setcounter{section}{70}\\refstepcounter{section}\\label{sec:frame}\n\
+                         \\begin{frame}\n\
+                         Unique \\ref{sec:frame} here.\n\
+                         \\end{frame}\n\
+                         \\end{document}\n";
     let pos_ctx = "Headerword Unique 71 here. 1 / 1";
     let pos_off = pos_ctx.find("71").unwrap();
     let expected_byte = flanked_frame
@@ -11593,17 +7379,8 @@ fn beamer_frame_headline_and_footline_furniture_do_not_steal_edge_references() {
         .find("sec:frame")
         .unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            flanked_frame,
-            6,
-            pos_ctx,
-            pos_off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(Some((5, expected_byte)))
+        strict(flanked_frame, 6, pos_ctx, pos_off, 1),
+        WordOutcome::Located(5, expected_byte)
     );
 }
 
@@ -11621,31 +7398,14 @@ fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
         let ctx = "See 74 for details.";
         let off = ctx.find("74").unwrap();
         assert_eq!(
-            source_word_location_with_sources(
-                &same_line,
-                1,
-                ctx,
-                off,
-                1,
-                &[],
-                &Operation::default(),
-            )
-            .map(WordOutcome::location),
-            Ok(None),
+            strict(&same_line, 1, ctx, off, 1),
+            WordOutcome::Absent,
             "sep={sep}"
         );
         assert!(
             matches!(
-                source_word_guess_with_sources(
-                    &same_line,
-                    1,
-                    ctx,
-                    off,
-                    1,
-                    &[],
-                    &Operation::default(),
-                ),
-                Ok(None) | Err(())
+                guess(&same_line, 1, ctx, off, 1),
+                WordOutcome::Absent | WordOutcome::Opaque
             ),
             "sep={sep}"
         );
@@ -11654,67 +7414,1666 @@ fn soft_or_opaque_pagebreaks_do_not_slice_away_reference_competitors() {
             "\\begin{{frame}}\n\\begin{{itemize}}\n\\item See \\ref{{sec:a}} for details.\n{sep}\n\\item See \\cite{{k}} for details.\n\\end{{itemize}}\n\\end{{frame}}\n"
         );
         assert_eq!(
-            source_word_location_with_sources(
-                &in_frame,
-                7,
-                ctx,
-                off,
-                1,
-                &[],
-                &Operation::default(),
-            )
-            .map(WordOutcome::location),
-            Ok(None),
+            strict(&in_frame, 7, ctx, off, 1),
+            WordOutcome::Absent,
             "frame sep={sep}"
         );
         assert!(
             matches!(
-                source_word_guess_with_sources(
-                    &in_frame,
-                    7,
-                    ctx,
-                    off,
-                    1,
-                    &[],
-                    &Operation::default(),
-                ),
-                Ok(None) | Err(())
+                guess(&in_frame, 7, ctx, off, 1),
+                WordOutcome::Absent | WordOutcome::Opaque
             ),
             "frame sep={sep}"
         );
     }
 
-    let overridden_clearpage = concat!(
-        "\\renewcommand{\\clearpage}{}\n",
-        "\\begin{document}\n",
-        "\\begin{itemize}\\item See \\ref{sec:a} for details. \\clearpage \\item See \\cite{k} for details.\\end{itemize}\n",
-        "\\end{document}\n",
-    );
+    let overridden_clearpage = "\\renewcommand{\\clearpage}{}\n\
+                                \\begin{document}\n\
+                                \\begin{itemize}\\item See \\ref{sec:a} for details. \\clearpage \\item See \\cite{k} for details.\\end{itemize}\n\
+                                \\end{document}\n";
     let ctx = "See 74 for details.";
     let off = ctx.find("74").unwrap();
     assert_eq!(
-        source_word_location_with_sources(
-            overridden_clearpage,
-            3,
-            ctx,
-            off,
-            1,
-            &[],
-            &Operation::default(),
-        )
-        .map(WordOutcome::location),
-        Ok(None)
+        strict(overridden_clearpage, 3, ctx, off, 1),
+        WordOutcome::Absent
     );
     assert!(matches!(
-        source_word_guess_with_sources(
-            overridden_clearpage,
-            3,
-            ctx,
-            off,
-            1,
-            &[],
-            &Operation::default(),
-        ),
-        Ok(None) | Err(())
+        guess(overridden_clearpage, 3, ctx, off, 1),
+        WordOutcome::Absent | WordOutcome::Opaque
     ));
+}
+
+#[test]
+fn late_input_declaration_does_not_retroactively_claim_earlier_sheet_box() {
+    let (_dir, root) = temp_project(&[
+        ("main.tex", "\\begin{document}\n\\end{document}\n"),
+        ("main.vrb", "body\n"),
+    ]);
+    let pdf = root.join("main.pdf");
+    let main = root.join("main.tex");
+    let generated = root.join("main.vrb");
+    let contents = format!(
+        "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\n\
+         Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+         {{1\n(1,5:0,655360:6553600,655360,0\nx2,2:0,655360\n)\nInput:2:{}\n}}1\n\
+         Postamble:\nCount:4\nPost scriptum:\n",
+        main.display(),
+        generated.display()
+    );
+    let point = ipt(1, 75.0, 75.0, 200.0);
+    let map = source_map_from_reader(contents.as_bytes(), &pdf, point, &generated).unwrap();
+    assert!(
+        map.page_source.is_none(),
+        "late Input:2 after x2,2 node must not retroactively grant page_source ownership"
+    );
+    assert!(
+        !map.generated_at_point,
+        "late Input:2 after enclosing box must not retroactively grant generated_at_point"
+    );
+    assert!(original_source_from_verbatim(&map).is_err());
+}
+
+#[test]
+fn reject_out_of_range_sheet_closer_tags() {
+    let point = ipt(1, 5.0, 5.0, 200.0);
+    for close in ["}-1", "}4294967296"] {
+        let synctex = format!(
+            "SyncTeX Version:1\nInput:1:main.tex\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{{1\n(1,1:0,655360:6553600,655360,0\nx1,1:655360,655360\n)\n{close}\nPostamble:\nCount:4\nPost scriptum:\n"
+        );
+        let err = inverse_candidates_from_reader(synctex.as_bytes(), point, false)
+            .expect_err("out-of-range sheet closer must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "close={close}");
+    }
+}
+
+#[test]
+fn symlinked_build_directory_canonicalizes_sidecar_dir_for_relative_inputs() {
+    let (_dir, root) = temp_project(&[]);
+    let real_src = root.join("workspace/src");
+    let real_build = root.join("workspace/build");
+    let pdf_dir = root.join("published");
+    let link_parent = root.join("links");
+    fs::create_dir_all(&real_src).unwrap();
+    fs::create_dir_all(&real_build).unwrap();
+    fs::create_dir_all(&pdf_dir).unwrap();
+    fs::create_dir_all(&link_parent).unwrap();
+
+    let link_build = link_parent.join("build_link");
+    std::os::unix::fs::symlink(&real_build, &link_build).unwrap();
+
+    let main_tex = real_src.join("main.tex");
+    fs::write(
+        &main_tex,
+        "\\documentclass{article}\n\\begin{document}\nUniqueWordToken\n\\end{document}\n",
+    )
+    .unwrap();
+    let pdf = pdf_dir.join("doc.pdf");
+    fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+
+    let synctex = "SyncTeX Version:1\nInput:1:../src/main.tex\nOutput:pdf\n\
+                   Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+                   {1\n[1,3:0,0:6553600,655360,0\n(1,3:0,655360:6553600,655360,0\nx1,3,5:655360,655360\n)\n]\n}1\n\
+                   Postamble:\nCount:5\nPost scriptum:\n";
+    fs::write(real_build.join("doc.synctex"), synctex).unwrap();
+
+    let point = ipt(1, 5.0, 5.0, 200.0);
+    let op = Operation::default();
+
+    let uncached = resolve_inverse_resolved(
+        InverseRequest {
+            pdf: &pdf,
+            point,
+            word: Some(("UniqueWordToken", 0)),
+            radius: 2,
+            operation: &op,
+            best_guess: false,
+            build_directory: Some(&link_build),
+        },
+        None,
+    )
+    .expect(
+        "uncached inverse search through symlinked build_directory must resolve ../src/main.tex",
+    );
+    assert_eq!(Path::new(&uncached.location.file), main_tex);
+    assert_eq!(uncached.location.line, 3);
+
+    let mut cache = SyncTeXCache::default();
+    let cached = resolve_inverse_resolved(
+        InverseRequest {
+            pdf: &pdf,
+            point,
+            word: Some(("UniqueWordToken", 0)),
+            radius: 2,
+            operation: &op,
+            best_guess: false,
+            build_directory: Some(&link_build),
+        },
+        Some(&mut cache),
+    )
+    .expect("cached inverse search through symlinked build_directory must resolve ../src/main.tex");
+    assert_eq!(Path::new(&cached.location.file), main_tex);
+
+    set_build_directory(Some(link_build.clone()));
+    let inv_cands = inverse_candidates(&pdf, point).unwrap();
+    let fwd_cands = parser::forward_candidates_resolved(
+        &pdf,
+        &main_tex,
+        3,
+        None,
+        resolve_build_directory(None).as_deref(),
+    )
+    .unwrap();
+    set_build_directory(None);
+    assert_eq!(inv_cands.len(), 2);
+    assert_eq!(inv_cands[0].compiler_column, Some(5));
+    assert_eq!(compiler_columns("UniqueWordToken", 5), (4, 5, 5));
+    assert!(!fwd_cands.is_empty());
+}
+
+#[test]
+fn read_remaining_rows_enforces_cumulative_byte_limit() {
+    let mut cursor = std::io::Cursor::new(&b"0123456789abcdef"[..]);
+    let err = crate::parser::read_remaining_rows(
+        &mut cursor,
+        crate::parser::MAX_SYNCTEX_BYTES - 10,
+        None,
+    )
+    .expect_err("cumulative byte count exceeding MAX_SYNCTEX_BYTES must fail");
+    assert!(err.to_string().contains("exceeds 128 MiB"), "{err}");
+}
+
+#[test]
+fn large_distinct_source_tags_scale_linearly_and_replay_respects_cancellation() {
+    use std::fmt::Write;
+    let (_dir, root) = temp_project(&[("doc.pdf", "%PDF-1.4\n"), ("doc.tex", "alpha beta\n")]);
+    let pdf = root.join("doc.pdf");
+    let src = root.join("doc.tex");
+
+    let n = 20_000usize;
+    let mut synctex = String::with_capacity(n * 48);
+    synctex.push_str("SyncTeX Version:1\n");
+    for i in 1..=n {
+        let _ = writeln!(synctex, "Input:{i}:{}", src.display());
+    }
+    synctex.push_str(
+        "Magnification:1000\nUnit:65781\nX Offset:0\nY Offset:0\nContent:\n{1\n(1,1:0,10:80,10,0\n",
+    );
+    for i in 1..=n {
+        let _ = writeln!(synctex, "x{i},1:10,10");
+    }
+    synctex.push_str(")\n}1\nPostamble:\nCount:1\n");
+    fs::write(root.join("doc.synctex"), &synctex).unwrap();
+
+    let point = ipt(1, 10.0, 10.0, 100.0);
+    let op = Operation::default();
+    let started = std::time::Instant::now();
+    let mut cache = SyncTeXCache::default();
+    let res =
+        resolve_inverse_with_cache(&pdf, point, None, 2, &op, true, Some(&mut cache)).unwrap();
+    assert_eq!(Path::new(&res.location.file), src);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "20k distinct tags took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn cache_updates_sidecar_dir_across_hardlinked_build_directories() {
+    let (_dir, root) = temp_project(&[]);
+    let pdf_dir = root.join("pdf");
+    let build_a = root.join("build_a");
+    let build_b = root.join("build_b");
+    fs::create_dir_all(&pdf_dir).unwrap();
+    fs::create_dir_all(&build_a).unwrap();
+    fs::create_dir_all(&build_b).unwrap();
+
+    let pdf = pdf_dir.join("doc.pdf");
+    fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+    let tex_a = build_a.join("main.tex");
+    let tex_b = build_b.join("main.tex");
+    fs::write(&tex_a, "alpha beta\n").unwrap();
+    fs::write(&tex_b, "alpha beta\n").unwrap();
+
+    let synctex_a = build_a.join("doc.synctex");
+    let synctex_b = build_b.join("doc.synctex");
+    fs::write(
+        &synctex_a,
+        "SyncTeX Version:1\nInput:1:main.tex\nMagnification:1000\nUnit:65781\nX Offset:0\nY Offset:0\nContent:\n{1\n(1,1:0,10:80,10,0\nx1,1:10,10\n)\n}1\nPostamble:\nCount:1\n",
+    )
+    .unwrap();
+    fs::hard_link(&synctex_a, &synctex_b).unwrap();
+
+    let point = ipt(1, 10.0, 10.0, 100.0);
+    let op = Operation::default();
+    let mut cache = SyncTeXCache::default();
+
+    let res_a = resolve_inverse_resolved(
+        InverseRequest {
+            pdf: &pdf,
+            point,
+            word: Some(("alpha", 0)),
+            radius: 2,
+            operation: &op,
+            best_guess: true,
+            build_directory: Some(&build_a),
+        },
+        Some(&mut cache),
+    )
+    .unwrap();
+    assert_eq!(Path::new(&res_a.location.file), tex_a);
+
+    let res_b = resolve_inverse_resolved(
+        InverseRequest {
+            pdf: &pdf,
+            point,
+            word: Some(("alpha", 0)),
+            radius: 2,
+            operation: &op,
+            best_guess: true,
+            build_directory: Some(&build_b),
+        },
+        Some(&mut cache),
+    )
+    .unwrap();
+    assert_eq!(Path::new(&res_b.location.file), tex_b);
+}
+
+#[test]
+fn metadata_frame_scoring_preserves_frame_semantics() {
+    let src = "\\documentclass{beamer}\n\\begin{document}\n\\begin{frame}\nmox bax zib \\zq\n\\end{frame}\n\\end{document}\n";
+    let op = Operation::default();
+    let local_analysis = tex::SourceAnalysis::new(src, &[], &op);
+    assert!(metadata_beats_frame(
+        &local_analysis,
+        4,
+        ("mox bax zib", 0),
+        80.0,
+        100.0,
+        6,
+    ));
+}
+
+#[test]
+fn multiline_proof_optional_argument_with_cref_resolves_inverse_and_compiler_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let pdf = directory.path().join("gnimble.pdf");
+    let file = directory.path().join("gnimble.tex");
+    let source = concat!(
+        "\\begin{proof}[Glimvor vurnix for\n",
+        "  \\Cref{alpha:first,alpha:second}\n",
+        "  (quibble zort in \\Cref{alpha:third})]\n",
+        "Bramble wozzle.\n",
+        "\\end{proof}\n",
+    );
+    fs::write(&file, source).unwrap();
+    let context =
+        "Glimvor vurnix for Theorem 1 and Lemma 2 (quibble zort in Section 3). Bramble wozzle.";
+    let lines: Vec<&str> = source.lines().collect();
+    let vurnix_byte = lines[0].find("vurnix").unwrap();
+    let vurnix_col = lines[0][..vurnix_byte].chars().count() as u32 + 1;
+    assert_eq!(collected_text_closing_line(source, 1, vurnix_col), Some(3));
+    assert_eq!(source_word_compiler_line(source, 1, vurnix_col), 3);
+
+    for (clicked, expected_line, expected_needle) in [
+        ("Glimvor", 1, "Glimvor"),
+        ("vurnix", 1, "vurnix"),
+        ("Theorem", 2, "alpha:first"),
+        ("Lemma", 2, "alpha:first"),
+        ("quibble", 3, "quibble"),
+        ("zort", 3, "zort"),
+        ("Section", 3, "alpha:third"),
+        ("Bramble", 4, "Bramble"),
+    ] {
+        let hit = inverse_output(
+            &pdf,
+            "Input: gnimble.tex\nLine: 3\n",
+            Some((context, context.find(clicked).unwrap())),
+        )
+        .unwrap();
+        let expected_byte = lines[expected_line as usize - 1]
+            .find(expected_needle)
+            .unwrap();
+        assert_eq!(
+            spot(&hit),
+            (expected_line, expected_byte, true),
+            "clicked={clicked}",
+        );
+    }
+}
+
+#[test]
+fn multiline_printed_headers_collect_only_when_tex_scans_them_whole() {
+    for (source, closing) in [
+        (
+            "\\begin{zibble}[Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            2,
+        ),
+        (
+            "\\begin{zibble*}[Frumple\nsnazzling]\nBody.\n\\end{zibble*}",
+            2,
+        ),
+        (
+            "\\begin{zibble}<2->[Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            2,
+        ),
+        (
+            "\\begin{zibble} <2-> [Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            2,
+        ),
+        (
+            "\\begin {zibble} [Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            2,
+        ),
+        (
+            "\\begin{zibble}\n[Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            3,
+        ),
+        (
+            "\\begin{zibble}% note\n[Frumple\nsnazzling]\nBody.\n\\end{zibble}",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item[Frumple\nsnazzling] Body.\n\\end{itemize}",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item<2>[Frumple\nsnazzling] Body.\n\\end{itemize}",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item <2> [Frumple\nsnazzling] Body.\n\\end{itemize}",
+            3,
+        ),
+    ] {
+        let at = source.find("Frumple").unwrap();
+        let line = source[..at].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let row = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        let column = source[row..at].chars().count() as u32 + 1;
+        assert_eq!(
+            collected_text_closing_line(source, line, column),
+            Some(closing),
+            "{source}"
+        );
+        let first = line as usize - 1;
+        assert_eq!(
+            collected_text_lines(source, closing),
+            Some(first..closing as usize),
+            "{source}"
+        );
+        // Only the closing line establishes the exclusive region.
+        assert_eq!(collected_text_lines(source, line), None, "{source}");
+        if let Some(name) = source.find("zibble") {
+            assert_eq!(collected_text_argument_at(source, name), None, "{source}");
+        }
+    }
+    for source in [
+        // TeX ends the header at a paragraph, leaving printed brackets.
+        "\\begin{zibble}\n\n[Frumple\nsnazzling]\n\\end{zibble}",
+        "\\begin{itemize}\n\\item\n\n[Frumple\nsnazzling]\n\\end{itemize}",
+        // A single line does not restrict neighboring lines.
+        "\\begin{zibble}[Frumple]\nsnazzling\n\\end{zibble}",
+        "\\begin{itemize}\n\\item[Frumple]\nsnazzling\n\\end{itemize}",
+        // Layout options, prose environments without header args, and math alignment are not headers.
+        "\\begin{enumerate}[Frumple,\nsnazzling]\n\\end{enumerate}",
+        "\\begin{tikzpicture}[Frumple,\nsnazzling]\n\\end{tikzpicture}",
+        "\\begin{frame}[Frumple,\nsnazzling]\n\\end{frame}",
+        "\\begin{quote}[Frumple\nsnazzling]\n\\end{quote}",
+        "\\begin{quotation}[Frumple\nsnazzling]\n\\end{quotation}",
+        "\\begin{verse}[Frumple\nsnazzling]\n\\end{verse}",
+        "\\begin{abstract}[Frumple\nsnazzling]\n\\end{abstract}",
+        "\\begin{aligned}[Frumple\nsnazzling]\n\\end{aligned}",
+        // Only environment openings and items own a header.
+        "\\end{zibble}[Frumple\nsnazzling]",
+        "\\itemsep[Frumple\nsnazzling]",
+        // Unclosed, opaque and stored headers are not executed here.
+        "\\item[Frumple\nsnazzling",
+        "\\verb|\\item[Frumple\nsnazzling]|",
+        "% \\item[Frumple\nsnazzling]",
+        "\\newcommand{\\hidden}{\\item[Frumple\nsnazzling]}",
+    ] {
+        let byte = source.find("Frumple").unwrap();
+        assert_eq!(collected_text_argument_at(source, byte), None, "{source}");
+        for line in 1..=source.lines().count() as u32 {
+            assert_eq!(collected_text_lines(source, line), None, "{source}");
+        }
+    }
+}
+
+#[test]
+fn references_inside_collected_arguments_ship_on_the_collector_closing_line() {
+    let source = "\\begin{zibble}[Frumple for\n  \\Cref{alpha:one}\n  snazzling]\nBody.\n\\end{zibble}\n\
+                  \\begin{itemize}\n\\item[Wazzit\n  \\ref{alpha:two}\n  blorple] Tail.\n\\end{itemize}\n\
+                  \\caption{Quibble\n  \\autoref{alpha:three}\n  zort}\n\
+                  \\textbf{Glimvor\n  \\eqref{alpha:four}\n  vurnix}\n";
+    for (key, closing) in [
+        ("alpha:one", 3),
+        ("alpha:two", 9),
+        ("alpha:three", 13),
+        ("alpha:four", 16),
+    ] {
+        let at = source.find(key).unwrap();
+        let line = source[..at].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let row = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        let key_column = source[row..at].chars().count() as u32 + 1;
+        // The hidden label itself still is not collected printed text.
+        assert_eq!(collected_text_closing_line(source, line, key_column), None);
+        // Every byte of the command, including its name and closing brace, shares the line.
+        for column in [3, key_column, key_column + key.len() as u32] {
+            assert_eq!(
+                reference_argument_closing_line(source, line, column),
+                Some(closing),
+                "{key}:{column}"
+            );
+        }
+        assert_eq!(source_word_compiler_line(source, line, key_column), closing);
+    }
+    // Outside any collector a reference keeps its own closing line.
+    let plain = "Before \\cref{alpha:one,\nalpha:two} after.\n";
+    assert_eq!(reference_argument_closing_line(plain, 1, 8), Some(2));
+    assert_eq!(reference_argument_closing_line(plain, 1, 1), None);
+    let single = "\\item[See \\cref{alpha:one}] tail\nnext\n";
+    assert_eq!(reference_argument_closing_line(single, 1, 17), Some(1));
+}
+
+#[test]
+fn printed_header_scope_admits_only_the_first_body_word_on_the_next_line() {
+    let source = "\\begin{zibble}[Frumple \\Cref{alpha:one}\n  snazzling \\cref{alpha:two}]\n  Wazzit blorple.\n\\end{zibble}\n";
+    let locate = |word: &str, line, context: &str| word_at(source, line, context, word, 2);
+    let context = "Frumple Zork 1 snazzling Zork 2. Wazzit blorple.";
+    let frumple = source.find("Frumple").unwrap();
+    assert_eq!(locate("Frumple", 2, context), Some((1, frumple)));
+    assert_eq!(locate("Wazzit", 2, context), Some((3, 2)));
+    // TeX tags later body words on their own line, so the closing anchor cannot claim them.
+    assert_eq!(locate("blorple", 2, context), None);
+    assert_eq!(locate("blorple", 3, context), Some((3, 9)));
+    // A closed header proves the boundary even though its line holds commands and braces.
+    assert_eq!(source_word_compiler_line(source, 3, 3), 2);
+    assert_eq!(source_word_compiler_line(source, 3, 10), 3);
+
+    // Single-line and empty printed headers (including trailing \label) also tag the next line's first word.
+    for single in [
+        "\\begin{proof}[Glimvor \\ref{alpha:one}]\nLinen wozzle.\n\\end{proof}\n",
+        "\\begin{zibble}[Glimvor]\\label{zab:one}\nLinen wozzle.\n\\end{zibble}\n",
+        "\\item[Frumple \\ref{alpha:one}]\nLinen wozzle.\n",
+        "\\item[]\nLinen wozzle.\n",
+        "\\begin{itemize} \\item[Frumple]\nLinen wozzle.\n",
+    ] {
+        assert_eq!(source_word_compiler_line(single, 2, 1), 1, "{single}");
+        assert_eq!(source_word_compiler_line(single, 2, 7), 2, "{single}");
+    }
+    // Unbalanced braces or disqualifying commands before a header on the previous line still block read-ahead.
+    for blocked in [
+        "Prior {prose \\item[Frumple]\nbrambling porridges\n",
+        "\\tableofcontents \\item[Frumple]\nContents Wazzit.\n",
+    ] {
+        assert_eq!(source_word_compiler_line(blocked, 2, 1), 2, "{blocked}");
+    }
+
+    // Text after the header can still hide a boundary, and a blank line ends the read-ahead.
+    let trailing = "\\item[Frumple\n  snazzling] \\textbf{Wazzit}\n  blorple\n";
+    assert_eq!(source_word_compiler_line(trailing, 3, 3), 3);
+    let trailing_unicode = "\\begin{proof}[Zog] \u{00e9}lan\n  Nuf glim.\n\\end{proof}\n";
+    assert_eq!(source_word_compiler_line(trailing_unicode, 2, 3), 1);
+    assert_eq!(
+        source_word_location(
+            trailing_unicode,
+            1,
+            "\u{00e9}lan Nuf glim.",
+            "\u{00e9}lan ".len(),
+            2,
+        ),
+        Some((2, 2)),
+    );
+    let trailing_cmd =
+        "\\begin{zibble}[Frumple\n  Wazzit] \\newpage\nWazzit blorple.\n\\end{zibble}\n";
+    assert_eq!(
+        source_word_location(trailing_cmd, 2, "Wazzit", 0, 2),
+        Some((2, 2)),
+    );
+    let blank = "\\item[Frumple\n  snazzling]\n\n  blorple\n";
+    assert_eq!(source_word_compiler_line(blank, 4, 3), 4);
+
+    // A word repeated in header and body is decided by its surrounding evidence.
+    let repeated = "\\begin{zibble}[Frumple\n  Wazzit]\nWazzit blorple.\n\\end{zibble}\n";
+    let context = "Frumple Wazzit. Wazzit blorple.";
+    let header = repeated.find("Wazzit").unwrap() - repeated.find('\n').unwrap() - 1;
+    assert_eq!(
+        word_at(repeated, 2, context, "Wazzit", 2),
+        Some((2, header)),
+    );
+    assert_eq!(
+        source_word_location(repeated, 2, context, context.rfind("Wazzit").unwrap(), 2),
+        Some((3, 0)),
+    );
+}
+
+#[test]
+fn references_in_printed_labels_are_candidates() {
+    for (source, context, word, key, line) in [
+        (
+            "\\begin{itemize}\n\\item[Frumple \\Cref{alpha:one}\n  snazzling] Tail.\n\\end{itemize}\n",
+            "Frumple Zork 1 snazzling Tail.",
+            "Zork",
+            "alpha:one",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item <2> [Frumple \\Cref{alpha:one}\n  snazzling] Tail.\n\\end{itemize}\n",
+            "Frumple Zork 1 snazzling Tail.",
+            "Zork",
+            "alpha:one",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item <2> [Frumple \\Cref{alpha:one}] Tail.\n\\end{itemize}\n",
+            "Frumple Zork 2 Tail.",
+            "2",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\begin{itemize}\n\\item[Frumple \\Cref{alpha:one}] <2> Tail.\n\\end{itemize}\n",
+            "Frumple Zork 2 Tail.",
+            "2",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\begin{zibble} <2> [Frumple \\Cref{alpha:one}]\nTail.\n\\end{zibble}\n",
+            "Zibble 1 (Frumple Zork 2). Tail.",
+            "2",
+            "alpha:one",
+            1,
+        ),
+        (
+            "\\begin{itemize}\n\\item[Frumple\n  in \\Cref{alpha:one})] Tail.\n\\end{itemize}\n",
+            "Frumple in Zork 1) Tail.",
+            "Zork",
+            "alpha:one",
+            3,
+        ),
+        (
+            "\\begin{itemize}\n\\item[\\Cref{alpha:one} snazzling] Tail.\n\\end{itemize}\n",
+            "Zork 1 snazzling Tail.",
+            "Zork",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\section{Plib}\n\\begin{itemize}\n\\item[\\Cref{alpha:one} snazzling] Tail.\n\\end{itemize}\n",
+            "Zork 1 snazzling Tail.",
+            "Zork",
+            "alpha:one",
+            3,
+        ),
+        (
+            "\\begin{proof}[\\Cref{alpha:one} snazzling]\nBody.\n\\end{proof}\n",
+            "Zork 1 snazzling. Body.",
+            "Zork",
+            "alpha:one",
+            1,
+        ),
+        (
+            "\\begin{zibble}[Frumple\n  in \\Cref{alpha:one})]\nBody.\n\\end{zibble}\n",
+            "Zibble 1 (Frumple in Zork 1)). Body.",
+            "Zork",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\begin{quote}\n[See \\Cref{alpha:one} for details]\n\\end{quote}\n",
+            "[See Zork 1 for details]",
+            "Zork",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\begin{proof}\nBody.\n\\end{proof}\n[See \\Cref{alpha:one} for details]\n",
+            "[See Zork 1 for details]",
+            "Zork",
+            "alpha:one",
+            4,
+        ),
+        (
+            "\\begin{figure}[h]\n[See \\Cref{alpha:one} for details]\n\\end{figure}\n",
+            "[See Zork 1 for details]",
+            "Zork",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\begin{figure}\n\n[See \\Cref{alpha:one} for details]\n\\end{figure}\n",
+            "[See Zork 1 for details]",
+            "Zork",
+            "alpha:one",
+            3,
+        ),
+        (
+            "\\begin{minipage}{100pt}\n{See \\Cref{alpha:one} for details}\n\\end{minipage}\n",
+            "See Zork 1 for details",
+            "Zork",
+            "alpha:one",
+            2,
+        ),
+        (
+            "\\noindent [See \\Cref{alpha:one} for details]\n",
+            "[See Zork 1 for details]",
+            "Zork",
+            "alpha:one",
+            1,
+        ),
+    ] {
+        let at = source.find(key).unwrap();
+        let row = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        let key_line = source[..at].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        assert_eq!(
+            word_at(source, line, context, word, 2),
+            Some((key_line, at - row)),
+            "{source}"
+        );
+    }
+    // A header starting on the line after `\begin{zabbo}` still keeps the generated prefix guard.
+    let split_header = "\\newtheorem{zabbo}{Zabbo}\n\\begin{zabbo}\n[\\ref{alpha:one}\n  snazzling]\nBody.\n\\end{zabbo}\n";
+    let split_ctx = "Zabbo 1 (1 snazzling). Body.";
+    assert_eq!(word_at(split_header, 4, split_ctx, "Zabbo", 2), None,);
+    // An overridden item may print anything around its label.
+    let overridden =
+        "\\newcommand{\\item}[1][]{Other}\n\\item[Frumple \\Cref{alpha:one} snazzling] Tail.\n";
+    let context = "Frumple Zork 1 snazzling Tail.";
+    assert_eq!(word_at(overridden, 2, context, "Zork", 2), None,);
+}
+
+#[test]
+fn real_pdflatex_multiline_printed_headers_navigate_both_ways() {
+    if Command::new("pdflatex").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tex = dir.path().join("doc.tex");
+    let pdf = dir.path().join("doc.pdf");
+    let source = concat!(
+        "\\documentclass{article}\n",
+        "\\newtheorem{zabbo}{Zabbo}\n",
+        "\\begin{document}\n",
+        "\\section{Plib}\\label{alpha:one}\n",
+        "\\begin{itemize}\n",
+        "\\item[Frumple snazzling\n",
+        "  \\ref{alpha:one}\n",
+        "  blorple] Wazzit quibble\n",
+        "  zortmond glimvor.\n",
+        "\\end{itemize}\n",
+        "\\begin{zabbo}[Krelvex \\ref{alpha:one}]\n",
+        "  Durnix vurnix.\n",
+        "\\end{zabbo}\n",
+        "\\end{document}\n",
+    );
+    fs::write(&tex, source).unwrap();
+    for _ in 0..2 {
+        let status = Command::new("pdflatex")
+            .args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-synctex=1",
+                "doc.tex",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+    }
+    let closing = resolve_forward(&pdf, &tex, 8, 3).unwrap();
+    for (line, column) in [(6, 7), (7, 1), (7, 3), (7, 8)] {
+        let forward = resolve_forward(&pdf, &tex, line, column).unwrap();
+        assert_eq!(
+            (forward.page, forward.v),
+            (closing.page, closing.v),
+            "{line}:{column}"
+        );
+    }
+    let point = ipt(
+        1,
+        closing.h + closing.width * 0.5,
+        closing.v - closing.height * 0.5,
+        792.0,
+    );
+    let context = "Frumple snazzling 1 blorple Wazzit quibble zortmond glimvor.";
+    for (word, line, needle) in [
+        ("snazzling", 6, "snazzling"),
+        ("1", 7, "alpha:one}\n  blorple"),
+        ("Wazzit", 8, "Wazzit"),
+        ("zortmond", 9, "zortmond"),
+    ] {
+        let inverse = inverse_at(
+            &pdf,
+            point,
+            Some((context, context.find(word).unwrap())),
+            2,
+            true,
+        )
+        .unwrap();
+        let at = source.find(needle).unwrap();
+        let row = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        assert_eq!(spot(&inverse), (line, at - row, true), "{word}");
+    }
+
+    let single_closing = resolve_forward(&pdf, &tex, 11, 16).unwrap();
+    let single_point = ipt(
+        1,
+        single_closing.h + single_closing.width * 0.5,
+        single_closing.v - single_closing.height * 0.5,
+        792.0,
+    );
+    let single_context = "Zabbo 1 (Krelvex 1). Durnix vurnix.";
+    for (word, line, needle) in [
+        ("Krelvex", 11, "Krelvex"),
+        ("1)", 11, "alpha:one}]"),
+        ("Durnix", 12, "Durnix"),
+    ] {
+        let inverse = inverse_at(
+            &pdf,
+            single_point,
+            Some((single_context, single_context.find(word).unwrap())),
+            2,
+            true,
+        )
+        .unwrap();
+        let at = source.find(needle).unwrap();
+        let row = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        assert_eq!(spot(&inverse), (line, at - row, true), "single:{word}");
+    }
+}
+
+#[test]
+fn layout_environments_do_not_own_printed_theorem_headers() {
+    for env in [
+        "algorithm",
+        "algorithm*",
+        "algorithm2e",
+        "algorithmic",
+        "columns",
+        "column",
+        "subfigure",
+        "subtable",
+        "tcolorbox",
+        "axis",
+        "semiverbatim",
+    ] {
+        let source = format!("\\begin{{{env}}}[Frumple,\nsnazzling]\n\\end{{{env}}}");
+        let byte = source.find("Frumple").unwrap();
+        assert_eq!(collected_text_argument_at(&source, byte), None, "{source}");
+        for line in 1..=3 {
+            assert_eq!(collected_text_lines(&source, line), None, "{source}");
+        }
+    }
+}
+
+#[test]
+fn nonprinting_environment_arguments_stop_at_the_body() {
+    for (env, arguments, body) in [
+        ("frame", "<+->[<+->]<2>[zibble]", "Blorple"),
+        ("frame", "[t]", "\n[Blorple]"),
+        ("tabularx", "{zibble}[b]{ll}", "Blorple"),
+        ("tabularx", "{zibble}{ll}", "[Blorple]"),
+        ("tabular*", "{zibble}[b]{ll}", "Blorple"),
+        ("tabular", "[t]{ll}<2>", "Blorple"),
+        ("array", "<1>[t]{ll}<2>", "Blorple"),
+        ("column", "[t]{zibble}<2>", "Blorple"),
+        ("minipage", "[t][zibble][c]{zibble}", "Blorple"),
+        ("subfigure", "[t]{zibble}", "Blorple"),
+        ("subtable", "[t]{zibble}", "Blorple"),
+        ("figure*", "[zibble]<2>", "Blorple"),
+        ("algorithm", "[zibble]", "Blorple"),
+        ("itemize*", "<2>[zibble]", "Blorple"),
+        ("tcolorbox", "[zibble]", "Blorple"),
+        // Without a known option argument, only overlays precede the body.
+        ("center", "<2>", "[Blorple]"),
+        ("semiverbatim", "<2>", "[Blorple]"),
+        ("zibble", "<2>", "[Blorple]"),
+    ] {
+        let source = format!("{arguments}{body}");
+        let end = tex::skip_nonprinting_environment_arguments(&source, env, 0);
+        assert_eq!(&source[end..], body, "{env}");
+    }
+    // Non-ASCII whitespace ends TeX's `\@ifnextchar[` lookahead without panicking.
+    let nbsp = "\\begin{proof}\u{00a0}[Frumple\nsnazzling]\nBlorple.\n\\end{proof}";
+    assert_eq!(
+        collected_text_argument_at(nbsp, nbsp.find("Frumple").unwrap()),
+        None
+    );
+    let frame_nbsp = "\\begin{frame}[t]\n[Frumple]\n\\end{frame}\n";
+    assert_eq!(
+        source_word_location(frame_nbsp, 2, "[Frumple]", 1, 2),
+        Some((2, 1))
+    );
+}
+
+#[test]
+fn layout_arguments_are_masked() {
+    for opening in [
+        "\\begin{figure}[zibble]",
+        "\\begin{figure*}[zibble]",
+        "\\begin{table}[zibble]",
+        "\\begin{table*}[zibble]",
+        "\\begin{algorithm}[zibble]",
+        "\\begin{algorithm*}[zibble]",
+        "\\begin{algorithm2e}[zibble]",
+        "\\begin{algorithmic}[zibble]",
+        "\\begin{columns}[zibble]",
+        "\\begin{column}[zibble]{1cm}",
+        "\\begin{column}[t]{\\zibble}",
+        "\\begin{minipage}[t][zibble][c]{1cm}",
+        "\\begin{minipage}{\\zibble}",
+        "\\begin{subfigure}[zibble]{1cm}",
+        "\\begin{subtable}[zibble]{1cm}",
+    ] {
+        let source = format!("{opening}\nBlorple wazzit.\n");
+        let spans = tex::nonprinting_source_spans(&source).collect::<Vec<_>>();
+        let masked = |word: &str| {
+            let byte = source.find(word).unwrap();
+            spans.iter().any(|(_, span, _)| span.contains(&byte))
+        };
+        assert!(masked("zibble"), "{source}");
+        assert!(!masked("Blorple"), "{source}");
+        let location = |word| strict(&source, 1, word, 0, 4).location();
+        assert_eq!(location("zibble"), None, "{source}");
+        assert_eq!(location("Blorple"), Some((2, 0)), "{source}");
+    }
+}
+
+#[test]
+fn fragile_option_is_found_in_every_frame_header_group() {
+    for (header, expected) in [
+        ("[fragile]", true),
+        ("[t, fragile=singleslide]", true),
+        ("<+->[fragile]", true),
+        ("<beamer>[fragile]", true),
+        ("<presentation|handout:0>[fragile]", true),
+        ("[<+->][fragile]", true),
+        ("<1-><2>[<+->][fragile]", true),
+        ("[<+->]<2>[fragile]", true),
+        ("[<+->]\n[fragile]", true),
+        ("[<+->] % zibble\n[fragile]", true),
+        ("[t,% zibble\nfragile]", true),
+        ("[fra% zibble\n  gile]", true),
+        ("[fragile = true]", true),
+        ("[fragile = singleslide]", true),
+        ("[fragile = false]", false),
+        ("[fragile=false]", false),
+        ("[label={a,fragile}]", false),
+        ("[label=fragile]", false),
+        ("[<fragile>]", false),
+        ("", false),
+        ("[t]", false),
+        ("[t][fragile]", false),
+        ("[t% zibble,fragile\n]", false),
+        ("\u{00a0}[fragile]", false),
+        ("[zibblefragile]", false),
+        ("[t]{fragile}", false),
+        // A paragraph ends the header scan, leaving printed brackets.
+        ("\n\n[fragile]", false),
+    ] {
+        let source = format!("\\begin{{frame}}{header}\nBlorple.\n\\end{{frame}}\n");
+        assert_eq!(
+            is_fragile_frame(
+                &source,
+                &LineIndex::new(&source),
+                &(0..source.lines().count())
+            ),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn slide_graphics_filter_reads_only_the_frame_header() {
+    let (_dir, root) = temp_project(&[]);
+    let pdf = root.join("zibble.pdf");
+    let tex = root.join("zibble.tex");
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    for (header, filtered) in [
+        ("", true),
+        ("[t]", true),
+        // Brackets past the option group are frame body.
+        ("[t]\n[1]", true),
+        ("[t]\n\n[1]", true),
+        ("\n\n[1]", true),
+        ("[allowframebreaks]", false),
+        ("[allowframe% zibble\n  breaks]", false),
+        ("[allowframebreaks = 0.8]", false),
+        ("[label = zibble]", false),
+        ("[la% zibble\nbel={wazzit,blorple},t]", false),
+        ("[1-2]", false),
+        ("<1->", false),
+        ("[<+->]", false),
+        ("[t]<2>", false),
+    ] {
+        let source = format!(
+            "\\documentclass{{beamer}}\n\\begin{{document}}\n\\begin{{frame}}{header}\n\
+             \\only<1>{{\\includegraphics{{blorple.pdf}}}}\n\
+             \\only<2>{{\\includegraphics{{snazzle.pdf}}}}\n\
+             \\end{{frame}}\n\\end{{document}}\n"
+        );
+        fs::write(&tex, &source).unwrap();
+        let closing = source.lines().position(|l| l == "\\end{frame}").unwrap() + 1;
+        let page_box = format!(
+            "[1,{closing}:0,792:612,792,0\n(1,{closing}:10,200:200,120,0\n\
+             (1,{closing}:50,200:30,30,0\n(1,{closing}:50,200:30,30,0\n\
+             (1,{closing}:50,200:0,30,0\n(1,{closing}:50,200:0,15,0\n\
+             (1,{closing}:50,200:15,15,0\nk1,{closing}:65,200:0\n)\n\
+             k1,{closing}:50,200:-15\n)\n)\n)\n)\n)\n]\n"
+        );
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                "SyncTeX Version:1\nInput:1:{}\nOutput:pdf\nMagnification:1000\nUnit:65536\n\
+                 X Offset:0\nY Offset:0\nContent:\n{{1\n{page_box}}}1\n{{2\n{page_box}}}2\n\
+                 Postamble:\nCount:20\n",
+                tex.display()
+            ),
+        )
+        .unwrap();
+        let hit = inverse_at(&pdf, ipt(2, 60.0, 185.0, 792.0), None, 2, false).unwrap();
+        let line = source.lines().position(|l| l.contains("snazzle")).unwrap() as u32 + 1;
+        assert_eq!(hit.location.line == line, filtered, "{header:?}");
+    }
+}
+
+#[test]
+fn frame_options_split_like_tex() {
+    for (raw, expected) in [
+        (
+            "t, fragile = singleslide",
+            &[("t", None), ("fragile", Some("singleslide"))][..],
+        ),
+        ("label={a,b=c},t", &[("label", Some("a,b=c")), ("t", None)]),
+        ("a=b=c", &[("a", Some("b=c"))]),
+        ("{a=b}=c", &[("{a=b}", Some("c"))]),
+        ("a\\,b,c", &[("a\\,b", None), ("c", None)]),
+        (
+            "allowframe% zibble\n  breaks",
+            &[("allowframebreaks", None)],
+        ),
+        ("t% zibble,fragile\n", &[("t", None)]),
+        ("a\\%b,c", &[("a\\%b", None), ("c", None)]),
+        ("a\nb", &[("a b", None)]),
+        ("", &[("", None)]),
+    ] {
+        let mut seen = Vec::new();
+        assert!(!tex::for_each_frame_option(raw, |key, value| {
+            seen.push((key.to_owned(), value.map(str::to_owned)));
+            false
+        }));
+        let seen = seen
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected, "{raw:?}");
+    }
+    let mut visited = 0;
+    assert!(tex::for_each_frame_option("a,b,c", |key, _| {
+        visited += 1;
+        key == "b"
+    }));
+    assert_eq!(visited, 2);
+}
+
+#[test]
+fn earlier_printed_headers_are_a_valid_line_start_prefix() {
+    for row in [
+        "\\begin{proof}[Frumple]\\begin{itemize}\\item[Snazzling]",
+        "\\item[Frumple]\\item[Snazzling]",
+        "\\begin{zibble}[Frumple]\\label{alpha:one}\\begin{zibble}[Snazzling]",
+    ] {
+        let source = format!("{row}\nBlorple wazzit.\n");
+        assert_eq!(
+            line_start_word_compiler_line(&source, 2, 1),
+            Some(1),
+            "{source}"
+        );
+    }
+    let prose = "Wazzit \\item[Snazzling]\nBlorple wazzit.\n";
+    assert_eq!(line_start_word_compiler_line(prose, 2, 1), None);
+}
+
+#[test]
+fn starred_tabular_arguments_are_skipped_in_math() {
+    // Skipped layout arguments must not compete with an identical body word.
+    let source = "\\[\\begin{tabular*}{1cm}[t]{c}t\\end{tabular*}\\]\n";
+    assert_eq!(
+        source_word_location(source, 1, "t", 0, 2),
+        Some((1, source.find("t\\end").unwrap()))
+    );
+}
+
+#[test]
+fn braced_and_repeated_fragile_options_follow_key_semantics() {
+    for (header, expected) in [
+        ("[fragile={false}]", false),
+        ("[fragile={ false }]", false),
+        ("[fragile = {false}]", false),
+        ("[fragile={singleslide}]", true),
+        ("[fragile={}]", true),
+        ("[fragile={false}{x}]", true),
+        ("[fragile, fragile=false]", false),
+        ("[fragile=false, fragile]", true),
+        (
+            "[fragile={false},fragile={singleslide},fragile=false]",
+            false,
+        ),
+        ("[fragile=false,t]", false),
+        ("[fragile,t]", true),
+    ] {
+        let source = format!("\\begin{{frame}}{header}\nBlorple.\n\\end{{frame}}\n");
+        assert_eq!(
+            is_fragile_frame(
+                &source,
+                &LineIndex::new(&source),
+                &(0..source.lines().count())
+            ),
+            expected,
+            "{source}"
+        );
+    }
+    let mut seen = Vec::new();
+    tex::for_each_frame_option("a={ b },c={d}{e},f={},g=h", |key, value| {
+        seen.push((key.to_owned(), value.map(str::to_owned)));
+        false
+    });
+    assert_eq!(
+        seen.iter()
+            .map(|(key, value)| (key.as_str(), value.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("a", Some("b")),
+            ("c", Some("{d}{e}")),
+            ("f", Some("")),
+            ("g", Some("h"))
+        ]
+    );
+}
+
+#[test]
+fn splice_preamble_skips_inactive_iffalse_and_verbatim_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.tex");
+    let decoy_path = dir.path().join("decoy.tex");
+    let defs_path = dir.path().join("defs.tex");
+    fs::write(&decoy_path, "\\newcommand{\\zwib}{\\Omega}\n").unwrap();
+    fs::write(&defs_path, "\\newcommand{\\zwib}{\\Lambda}\n").unwrap();
+    let main_src = "\\documentclass{article}\n\
+                    \\iffalse\n\
+                    {\n\
+                    \\input{decoy}\n\
+                    \\fi\n\
+                    \\verb|\\input{decoy}|\n\
+                    \\input{defs}\n\
+                    \\begin{document}\n\
+                    $\\zwib+1$\n\
+                    \\end{document}\n";
+    fs::write(&main_path, main_src).unwrap();
+    let spliced =
+        macro_preamble_source(&main_path, None, None, &mut QuerySources::default()).unwrap();
+    assert!(!spliced.contains("\\Omega"), "{spliced}");
+    assert!(
+        spliced.contains("\\newcommand{\\zwib}{\\Lambda}"),
+        "{spliced}"
+    );
+    assert_eq!(
+        strict_in("$\\zwib+1$\n", 1, "Λ+1", 0, 2, &[&spliced]),
+        tex::WordOutcome::Located(1, 1),
+    );
+}
+
+#[test]
+fn inverse_frame_generated_environment_and_hidden_note_words_stay_coarse() {
+    let directory = tempfile::tempdir().unwrap();
+    let pdf = directory.path().join("paper.pdf");
+    for (definition, body, context, offset) in [
+        (
+            "\\newenvironment{glorp}{Zibble }{}\n\\begin{frame}\n",
+            "Quux \\begin{glorp}\\end{glorp}flurm.\nZibble lingers.\n",
+            "Quux Zibble flurm.",
+            5,
+        ),
+        (
+            "\\begin{frame}\n\\newcommand{\\gnarp}[1]{\\note{#1}}\n",
+            "\\char90 ibble \\gnarp{Zibble} Flurm\n",
+            "Zibble Flurm",
+            0,
+        ),
+    ] {
+        let source = format!("{definition}{body}\\end{{frame}}\n");
+        let anchor = source.lines().count() as u32;
+        fs::write(directory.path().join("paper.tex"), &source).unwrap();
+        let resolved = inverse_output(
+            &pdf,
+            &format!("Input: paper.tex\nLine: {anchor}\n"),
+            Some((context, offset)),
+        )
+        .unwrap();
+        assert_eq!(spot(&resolved), (anchor, 0, false), "{source}");
+    }
+}
+
+// Restored live-code regression tests.
+
+fn host_owns_generated_sidecar(source: &str, host: &Path, generated: &Path) -> bool {
+    let spans: Vec<_> = tex::nonprinting_source_spans(source).collect();
+    tex::host_owns_generated_sidecar_with_spans(source, host, generated, None, &spans)
+}
+
+#[test]
+fn snapshot_preserves_fallback_source_identity_and_required_cache_validation() {
+    // A relative `Input:` absent from the working directory resolves next to the
+    // PDF/sidecar, so both directions keep the compiled file's identity.
+    let (_dir, root) = temp_project(&[]);
+    let build_dir = root.join("build");
+    fs::create_dir_all(&build_dir).unwrap();
+
+    let pdf = build_dir.join("main.pdf");
+    let tex = build_dir.join("main.tex");
+    let source_text =
+        "\\documentclass{article}\n\\begin{document}\nsnapshot fallback line\n\\end{document}\n";
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&tex, source_text).unwrap();
+
+    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:65536\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3,10:0,0:30000000,40000000,0\n(1,3,10:655360,6553600:6553600,655360,0\nx1,3,10:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    fs::write(build_dir.join("main.synctex"), synctex).unwrap();
+
+    let forward = resolve_forward_with_selector(
+        &pdf,
+        &tex,
+        3,
+        1,
+        ForwardSource::default(),
+        |_, _, _, anchor| Ok(anchor),
+    )
+    .unwrap();
+    assert_eq!(forward.page, 1);
+
+    let pt = ipt(1, 19.0, 98.0, 792.0);
+    let inverse = inverse_at(&pdf, pt, Some(("snapshot fallback line", 9)), 2, false).unwrap();
+    assert_eq!(Path::new(&inverse.location.file), tex.as_path());
+    assert_eq!(inverse.location.line, 3);
+    assert!(inverse.location.precise);
+
+    // Without the compiled source, a word query never relocates into another file.
+    fs::remove_file(&tex).unwrap();
+    if let Ok(inverse) = inverse_at(&pdf, pt, Some(("snapshot fallback line", 9)), 2, false) {
+        assert_eq!(Path::new(&inverse.location.file), tex.as_path());
+        assert!(!inverse.location.precise);
+    }
+}
+
+#[test]
+fn snapshot_normalize_does_not_substitute_unrelated_absolute_file_in_cwd() {
+    // A same-named file elsewhere is not the compiled `./main.tex`.
+    let (_dir, root) = temp_project(&[]);
+    let build_dir = root.join("build");
+    let client_dir = root.join("client");
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::create_dir_all(&client_dir).unwrap();
+
+    let pdf = build_dir.join("doc.pdf");
+    let build_tex = build_dir.join("main.tex");
+    let client_tex = client_dir.join("main.tex");
+    let source_text = "\\documentclass{article}\n\\begin{document}\nalpha beta\n\\end{document}\n";
+    fs::write(&pdf, b"pdf-v1").unwrap();
+    fs::write(&build_tex, source_text).unwrap();
+
+    let synctex = "SyncTeX Version:1\nInput:1:./main.tex\nOutput:pdf\nMagnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n{1\n[1,3:0,0:30000000,40000000,0\n(1,3:655360,6553600:6553600,655360,0\nx1,3:1310720,6553600\n)\n]\n}1\nPostamble:\nCount:4\n";
+    fs::write(pdf.with_extension("synctex"), synctex).unwrap();
+    fs::write(
+        &client_tex,
+        "\\documentclass{article}\n\\begin{document}\ngamma delta\n\\end{document}\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_forward_with_selector(
+            &pdf,
+            &build_tex,
+            3,
+            1,
+            ForwardSource::default(),
+            |_, _, _, anchor| Ok(anchor),
+        )
+        .unwrap()
+        .page,
+        1
+    );
+    for best_guess in [false, true] {
+        let error = forward_with(
+            &pdf,
+            &client_tex,
+            (3, 1),
+            ForwardSource {
+                best_guess,
+                ..ForwardSource::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !best_guess || is_forward_unavailable(&error),
+            "unrelated client/main.tex must stay unavailable, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn inverse_opaque_note_keeps_compiler_anchor_instead_of_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("paper.tex");
+    let pdf = directory.path().join("paper.pdf");
+    for notes in [
+        "",
+        "\\drop{later}",
+        "\\drop{\\drop{later}}",
+        "\\drop{\\note{Amber note text.}}",
+        "\\drop{\\note{\\drop{Amber note text.}}}",
+        "\\dropwrap{Amber note text.}",
+        "\\dropnote{Amber note text.}",
+        "\\note{Amber note text.}",
+        "\\note{\\drop{later} Amber note text.}",
+        "\\note{Amber note text.}\n\\note{Amber note text.}",
+        "\\note{Amber note text. Amber note text.}",
+    ] {
+        let text = format!(
+            "\\documentclass{{beamer}}\n\\newcommand{{\\drop}}[1]{{}}\n\
+             \\newcommand{{\\dropwrap}}[1]{{\\drop{{#1}}}}\n\
+             \\newcommand{{\\dropnote}}[1]{{\\drop{{\\note{{#1}}}}}}\n\
+             \\title{{Amber note text}}\n\\begin{{document}}\n\
+             \\begin{{frame}}{{Other title}}\n{notes}\n\\end{{frame}}\n\\end{{document}}\n"
+        );
+        let anchor = text
+            .lines()
+            .position(|line| line == "\\end{frame}")
+            .unwrap() as u32
+            + 1;
+        fs::write(&source, &text).unwrap();
+        fs::write(
+            pdf.with_extension("synctex"),
+            format!(
+                "SyncTeX Version:1\nInput:1:{}\n\
+                 Magnification:1000\nUnit:1\nX Offset:0\nY Offset:0\nContent:\n\
+                 {{1\n[1,{anchor}:0,0:100,100,0\n(1,{anchor}:0,0:100,100,0\n)\n]\n}}1\n\
+                 Postamble:\nCount:4\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        let resolved = inverse_output(
+            &pdf,
+            &format!("Input: paper.tex\nLine: {anchor}\n"),
+            Some(("Amber note text.", 0)),
+        )
+        .unwrap();
+        assert_eq!(spot(&resolved), (anchor, 0, false), "{notes}");
+    }
+}
+
+#[test]
+fn inverse_opaque_math_vetoes_better_context_without_hiding_other_atoms() {
+    let source = "\\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
+                  \\note{$\\alpha+\\beta$}\n$\\delta+1$\n\\end{frame}";
+    for offset in [0, "α+".len()] {
+        assert_eq!(source_word_location(source, 5, "α+β=γ", offset, 10), None);
+    }
+    assert_eq!(source_word_location(source, 5, "δ+1", 0, 10), Some((4, 1)));
+    let source = "\\renewcommand{\\note}[1]{#1}\n\
+                  \\begin{frame}\n$\\alpha+\\beta=\\gamma$\n\
+                  \\note{$\\alpha+\\beta$}\n\\end{frame}";
+    assert_eq!(
+        source_word_location(source, 5, "α+β=γ", 0, 10),
+        Some((3, 1))
+    );
+}
+
+#[test]
+fn builtin_note_math_remains_target_sensitive_with_optional_arguments() {
+    for math in ["$\\alpha$", "\\(\\alpha\\)", "\\[\\alpha\\]"] {
+        for options in ["", "<1>[item]"] {
+            let source = format!(
+                "\\newcommand{{\\cue}}{{\\note{options}{{{math}}}}}\n\
+                 \\begin{{frame}}\nNimbus\n\\cue\n\\end{{frame}}\n"
+            );
+            assert_eq!(
+                source_word_location(&source, 5, "Nimbus", 0, 16),
+                Some((3, 0)),
+                "{options} {math}"
+            );
+        }
+    }
+}
+
+#[test]
+fn note_consumed_command_does_not_discard_following_printed_word() {
+    for options in ["", "<1>", "[item]", "<1>[item]"] {
+        let source = format!(
+            "\\newcommand{{\\drop}}[1]{{}}\n\\begin{{frame}}\n\
+             Copper QuartzWord\n\\note{options}\\drop QuartzWord\n\\end{{frame}}\n"
+        );
+        let byte = source.lines().nth(3).unwrap().find("QuartzWord").unwrap();
+        let actual = source_word_location(&source, 5, "Copper QuartzWord QuartzWord", 18, 16);
+        assert!(
+            actual.is_none() || actual == Some((4, byte)),
+            "{options}: {actual:?}"
+        );
+    }
+}
+
+// Review regression coverage.
+
+/// `(line, byte)` of `needle` on the line equal to `row`.
+fn located_on(source: &str, row: &str, needle: &str) -> Option<(u32, usize)> {
+    let line = source.lines().position(|line| line == row)?;
+    Some((line as u32 + 1, source.lines().nth(line)?.find(needle)?))
+}
+
+#[test]
+fn skipped_ifthenelse_is_not_a_conditional_primitive() {
+    let host = Path::new("/synthetic/chapter.tex");
+    let generated = Path::new("/synthetic/paper.bbl");
+    for source in [
+        "\\iffalse{\\ifthenelse{\\equal{a}{b}}{Plume}{Zephyr}}\\fi\n\\input{paper.bbl}\n",
+        "\\let\\Plume\\ifthenelse\n\\iffalse{\\Plume{\\equal{a}{b}}{c}{d}}\\fi\n\\input{paper.bbl}\n",
+    ] {
+        assert!(
+            host_owns_generated_sidecar(source, host, generated),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn optional_macro_and_environment_parameters_stay_discarded() {
+    for (preamble, call) in [
+        (
+            "\\newcommand{\\drop}[2][x]{#2}",
+            "\\drop[QuartzWord]{Zephyr}",
+        ),
+        ("\\newcommand{\\drop}[2][x]{}", "\\drop{QuartzWord}"),
+        (
+            "\\newcommand{\\wug}[2]{\\gnarp{#2} #1}\\newcommand{\\gnarp}[1]{}",
+            "\\wug{Zephyr}{QuartzWord}",
+        ),
+        (
+            "\\NewDocumentEnvironment{dropenv}{m o}{}{}",
+            "\\begin{dropenv}{Zephyr}[QuartzWord]\\end{dropenv}",
+        ),
+        (
+            "\\NewDocumentEnvironment{dropenv}{o m}{}{}",
+            "\\begin{dropenv}{QuartzWord}\\end{dropenv}",
+        ),
+    ] {
+        let source =
+            format!("{preamble}\n\\begin{{frame}}\n{call}\nCopper QuartzWord\n\\end{{frame}}\n");
+        assert_eq!(
+            source_word_location(&source, 5, "QuartzWord", 0, 16),
+            Some((4, 7)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn xparse_and_latex_signatures_keep_optional_parameters() {
+    use crate::math::spec_signature;
+    assert_eq!(spec_signature(""), Some((0, 0)));
+    assert_eq!(spec_signature("m"), Some((1, 0)));
+    assert_eq!(spec_signature("+m o"), Some((2, 0b10)));
+    assert_eq!(spec_signature("O{Plume} m"), Some((2, 0b1)));
+    assert_eq!(spec_signature("+O{a {b}} +o m"), Some((3, 0b11)));
+    assert_eq!(spec_signature("mmmmmmmmo"), Some((9, 1 << 8)));
+    assert_eq!(spec_signature("mmmmmmmmmm"), None);
+    for unsupported in ["s m", "D<>{x}", "O", "O x", "++m", "+"] {
+        assert_eq!(spec_signature(unsupported), None, "{unsupported}");
+    }
+    let table = |source: &'static str| macros_from_sources(&[source]);
+    let source = "\\newcommand{\\cue}[2][Plume]{#2}\n";
+    let table_ = table(source);
+    let Some(Some(cue)) = table_.get("cue") else {
+        panic!("{table_:?}");
+    };
+    assert_eq!(
+        (cue.arity, cue.opt_params, cue.used_params, cue.body),
+        (2, 1, 0b10, None)
+    );
+    for source in [
+        "\\providecommand{\\cue}[2][Plume]{#2}\n",
+        "\\newcommand{\\cue}[0][Plume]{}\n",
+        "\\newcommand{\\cue}[2][Plume][Zephyr]{#2}\n",
+    ] {
+        assert_eq!(table(source).get("cue"), Some(&None), "{source}");
+    }
+}
+
+#[test]
+fn note_wrappers_with_optional_parameters_own_consumed_arguments() {
+    let frame = |def: &str, call: &str| {
+        format!(
+            "{def}\n\\begin{{frame}}\n\
+             Copper QuartzWord\n{call}\n\\end{{frame}}\n"
+        )
+    };
+    for (def, call) in [
+        (
+            "\\newcommand{\\cue}[2][Zephyr]{\\note{#1 #2}}",
+            "\\cue[QuartzWord]{Plume}",
+        ),
+        (
+            "\\newcommand{\\cue}[2][Zephyr]{\\note{#1 #2}}",
+            "\\cue{QuartzWord}",
+        ),
+        (
+            "\\NewDocumentCommand{\\cue}{O{Zephyr} m}{\\note{#1 #2}}",
+            "\\cue{QuartzWord}",
+        ),
+        (
+            "\\newcommand{\\cue}[2][Zephyr]{#1\\note{#2}}",
+            "\\cue[Plume]{QuartzWord}",
+        ),
+        (
+            "\\newcommand<>{\\cue}[1]{\\note#2{#1}}",
+            "\\cue<1>{QuartzWord}",
+        ),
+    ] {
+        let source = frame(def, call);
+        assert_eq!(
+            source_word_location(&source, 5, "Copper QuartzWord", 7, 16),
+            None,
+            "{source}"
+        );
+    }
+    for (def, call) in [
+        (
+            "\\newcommand{\\cue}[2][Zephyr]{\\note{#1 #2}}",
+            "\\cue[Plume]{Nimbus}",
+        ),
+        (
+            "\\newcommand{\\cue}[2][Zephyr]{#1\\note{#2}}",
+            "\\cue[QuartzWord]{Nimbus}",
+        ),
+        ("\\newcommand<>{\\cue}[1]{\\note#2{#1}}", "\\cue<1>{Nimbus}"),
+    ] {
+        let source = frame(def, call);
+        assert_eq!(
+            source_word_location(&source, 5, "Copper QuartzWord", 7, 16),
+            located_on(&source, "Copper QuartzWord", "QuartzWord"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn xparse_environment_end_code_prints_its_parameters() {
+    for (preamble, printed) in [
+        ("\\NewDocumentEnvironment{wugenv}{m}{}{#1}", true),
+        (
+            "\\RenewDocumentEnvironment{wugenv}{m}{}{\\textbf{#1}}",
+            true,
+        ),
+        (
+            "\\NewDocumentEnvironment{wugenv}{m}{\\begin{center}\\color{red}\\textbf{#1}}{\\end{center}}",
+            true,
+        ),
+        ("\\NewDocumentEnvironment{wugenv}{m}{}{}", false),
+    ] {
+        let source = format!(
+            "{preamble}\n\\begin{{frame}}\n\\begin{{wugenv}}{{QuartzWord}}\\end{{wugenv}}\n\
+             Copper QuartzWord center red textbf 1\n\\end{{frame}}\n"
+        );
+        assert_eq!(
+            source_word_location(&source, 5, "QuartzWord", 0, 16),
+            (!printed).then_some((4, 7)),
+            "{source}"
+        );
+        for word in ["center", "red", "textbf", "1"] {
+            assert_eq!(
+                source_word_location(&source, 5, word, 0, 16),
+                located_on(&source, "Copper QuartzWord center red textbf 1", word),
+                "{word} in {source}"
+            );
+        }
+    }
+    let note_env = "\\newenvironment{noteenv}[1]{Headerword \\note{#1}}{}\n\
+                    \\begin{noteenv}{Zephyr}\nHeaderword begin note item red textbf\n\
+                    \\note<1>[item]{\\color{red}\\textbf{Zephyr}}\n\n\n\n\n\\end{noteenv}\n";
+    assert_eq!(source_word_location(note_env, 2, "Headerword", 0, 1), None);
+    for word in ["begin", "note", "item", "red", "textbf"] {
+        assert_eq!(
+            source_word_location(note_env, 3, word, 0, 2),
+            located_on(note_env, "Headerword begin note item red textbf", word),
+            "{word}"
+        );
+    }
+}
+
+mod remaining_review_tests {
+    use super::*;
+
+    /// Frame-body lookup anchored at the source's last line.
+    fn frame_body(source: &str, context: &str, offset: usize) -> WordOutcome {
+        let line = source.lines().count() as u32;
+        let operation = crate::Operation::default();
+        let analysis = SourceAnalysis::new(source, &[], &operation);
+        source_word_location_in_frame_body_with_analysis(&analysis, line, (context, offset))
+    }
+
+    /// The 1-based row and byte of `owner` as a located outcome.
+    fn located(source: &str, owner: usize) -> WordOutcome {
+        let row = source[..owner].bytes().filter(|&b| b == b'\n').count() + 1;
+        let byte = owner - source[..owner].rfind('\n').map_or(0, |at| at + 1);
+        WordOutcome::Located(row as u32, byte)
+    }
+
+    #[test]
+    fn proven_fragile_body_excludes_only_its_syntactic_header() {
+        for header in [
+            r"\begin{frame}[fragile]{\DocTitle}",
+            r"\begin{frame}<1->[<+->][fragile]{\DocTitle}{Subtitle}",
+            "\\begin{frame}\n[fragile]\n{\\DocTitle}\n{Subtitle}",
+            r"\begin{frame}[fragile]{FooterZephyr}",
+        ] {
+            for separator in ["", "\n"] {
+                let source = format!(
+                    "\\newcommand{{\\DocTitle}}{{FooterZephyr}}\n{header}{separator}Body repeats FooterZephyr as a literal word.\\end{{frame}}"
+                );
+                let expected = located(&source, source.rfind("FooterZephyr").unwrap());
+                let found = frame_body(&source, "FooterZephyr", 0);
+                assert_eq!(found, expected, "{header:?} separator {separator:?}");
+            }
+        }
+        let source = "\\begin{frame}[fragile]{$x$}\nBody $x$\\end{frame}";
+        assert_eq!(frame_body(source, "x", 0), WordOutcome::Located(2, 6));
+    }
+
+    #[test]
+    fn fragile_header_checks_stop_at_blank_lines_but_not_comment_lines() {
+        for (gap, body_group) in [
+            ("\n\n", true),
+            ("\n \t\n", true),
+            ("%comment\n\n", true),
+            ("\n%comment\n\n", true),
+            ("\n", false),
+            ("%comment\n", false),
+            ("\n%comment\n", false),
+            ("\n%comment\n%comment\n", false),
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "\\begin{{frame}}[fragile]{gap}{{\\small Amber note}} first sentence.\n\
+                     Second Amber line.\n\\end{{frame}}\n"
+                )
+                .replace('\n', newline);
+                let (owner, context, offset) = if body_group {
+                    let context = "Amber note first sentence. Second Amber line.";
+                    (source.find("Amber note").unwrap(), context, 0)
+                } else {
+                    let context = "first sentence. Second Amber line.";
+                    let offset = "first sentence. Second ".len();
+                    (source.rfind("Amber").unwrap(), context, offset)
+                };
+                let found = frame_body(&source, context, offset);
+                assert_eq!(
+                    found,
+                    located(&source, owner),
+                    "{gap:?} newline={newline:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guess_nonprinting_and_preamble_discovery_stop_on_cancellation_or_deadline() {
+        let source = "\\documentclass{beamer}\n\\def\\dormant{\\def\\nested{Copper}}\n\\begin{document}\nCopper nimbus.\n\\end{document}\n";
+        let spans = |operation: &crate::Operation| {
+            let mode = WordLocationMode::Guess;
+            nonprinting_source_spans_with_mode(source, None, None, mode, Some(operation))
+                .next()
+                .is_some()
+        };
+        assert!(spans(&crate::Operation::default()));
+        for cancelled in [false, true] {
+            let timeout = std::time::Duration::from_secs(if cancelled { 10 } else { 0 });
+            let operation = crate::Operation::new(timeout);
+            if cancelled {
+                operation.cancel();
+            }
+            assert!(!spans(&operation));
+            assert_eq!(
+                source_document_start(source, None, None, Some(&operation)),
+                None
+            );
+            let expected = if cancelled {
+                std::io::ErrorKind::Interrupted
+            } else {
+                std::io::ErrorKind::TimedOut
+            };
+            assert_eq!(operation.check().unwrap_err().kind(), expected);
+        }
+    }
+
+    #[test]
+    fn reference_candidates_in_footnotes_and_across_page_breaks() {
+        let source = "\\documentclass{article}\n\\begin{document}\n\
+                      Alpha \\ref{sec:one}\\footnote{Note see \\ref{sec:two} and \\cref{sec:four} for details.}\\clearpage\n\
+                      Beta \\ref{sec:five} omega.\n\
+                      \\end{document}\n";
+        let ctx = "1Note see 2 and section 4 for details.";
+        let offset = ctx.find("section").unwrap();
+        let found = strict(source, 3, ctx, offset, 1);
+        assert_eq!(
+            found,
+            WordOutcome::Located(3, source.lines().nth(2).unwrap().find("sec:four").unwrap())
+        );
+        let page_ctx = "Beta 5 omega.";
+        let page_offset = page_ctx.find('5').unwrap();
+        assert_eq!(
+            strict(source, 4, page_ctx, page_offset, 1),
+            WordOutcome::Located(4, source.lines().nth(3).unwrap().find("sec:five").unwrap())
+        );
+    }
 }

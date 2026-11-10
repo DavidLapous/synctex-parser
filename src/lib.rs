@@ -2,24 +2,20 @@
 
 mod math;
 mod parser;
-pub mod source_snapshot;
+mod source_snapshot;
 mod symbols;
 #[cfg(test)]
 mod tests;
 mod tex;
 
-use crate::source_snapshot::{SourceSnapshot, valid_absolute_path, valid_warning};
+use crate::source_snapshot::{valid_absolute_path, valid_warning};
 use parser::*;
 pub use parser::{
-    forward_candidates, forward_candidates_from_reader,
-    forward_candidates_from_reader_with_options, forward_candidates_from_reader_with_page_hint,
-    forward_candidates_in, forward_candidates_with_page_hint, inverse_candidates,
-    inverse_candidates_from_reader, inverse_candidates_from_reader_with_options,
-    inverse_candidates_in,
+    forward_candidates, forward_candidates_from_reader, inverse_candidates,
+    inverse_candidates_from_reader,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use std::process::Command;
+pub use source_snapshot::MAX_WARNING_BYTES;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -33,9 +29,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tex::*;
-pub use tex::{
-    frame_closing_line, is_spacing_diacritic, tabularx_closing_line, word_index_at, words,
-};
+pub use tex::{is_spacing_diacritic, word_index_at, words};
 use unicode_normalization::char::is_combining_mark;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -153,10 +147,12 @@ impl PdfRevision {
 
 static BUILD_DIRECTORY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
+/// Process-wide default build directory; resolved once at operation entry.
 pub fn set_build_directory(path: Option<PathBuf>) {
     *BUILD_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = path;
 }
 
+/// Process-wide default build directory; resolved once at operation entry.
 pub fn build_directory() -> Option<PathBuf> {
     BUILD_DIRECTORY
         .read()
@@ -167,6 +163,12 @@ pub fn build_directory() -> Option<PathBuf> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
+}
+
+pub(crate) fn resolve_build_directory(build_directory: Option<&Path>) -> Option<PathBuf> {
+    build_directory
+        .map(Path::to_path_buf)
+        .or_else(crate::build_directory)
 }
 
 pub(crate) fn synctex_candidates(
@@ -199,10 +201,7 @@ pub(crate) fn synctex_candidates(
         }
     };
     push_pair(pdf);
-    let effective = build_directory
-        .map(Path::to_path_buf)
-        .or_else(crate::build_directory);
-    if let Some(dir) = effective.as_deref()
+    if let Some(dir) = build_directory
         && let Some(name) = pdf.file_name()
     {
         if dir.is_relative()
@@ -215,14 +214,18 @@ pub(crate) fn synctex_candidates(
     candidates
 }
 
-pub fn locate_synctex_in(pdf: &Path, build_directory: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn locate_synctex_resolved(
+    pdf: &Path,
+    build_directory: Option<&Path>,
+) -> Option<PathBuf> {
     synctex_candidates(pdf, build_directory)
         .into_iter()
         .find_map(|(candidate, _)| PdfRevision::read(&candidate).ok().map(|_| candidate))
 }
 
 pub fn locate_synctex(pdf: &Path) -> Option<PathBuf> {
-    locate_synctex_in(pdf, None)
+    let build_directory = resolve_build_directory(None);
+    locate_synctex_resolved(pdf, build_directory.as_deref())
 }
 
 /// Metadata identity of both files observed when PDFium opens a document.
@@ -234,13 +237,13 @@ pub struct DocumentRevision {
     pub pdf: PdfRevision,
     companion: Option<(bool, PdfRevision)>,
 }
-pub(crate) fn companion_revision_in(
+pub(crate) fn companion_revision_and_path_in(
     path: &Path,
     build_directory: Option<&Path>,
-) -> io::Result<Option<(bool, PdfRevision)>> {
+) -> io::Result<Option<((bool, PdfRevision), PathBuf)>> {
     for (candidate, compressed) in synctex_candidates(path, build_directory) {
         match PdfRevision::read(&candidate) {
-            Ok(revision) => return Ok(Some((compressed, revision))),
+            Ok(revision) => return Ok(Some(((compressed, revision), candidate))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -248,20 +251,33 @@ pub(crate) fn companion_revision_in(
     Ok(None)
 }
 
+pub(crate) fn companion_revision_in(
+    path: &Path,
+    build_directory: Option<&Path>,
+) -> io::Result<Option<(bool, PdfRevision)>> {
+    Ok(companion_revision_and_path_in(path, build_directory)?.map(|(companion, _)| companion))
+}
+
 impl DocumentRevision {
     pub fn read(path: &Path) -> io::Result<Self> {
-        Self::read_in(path, None)
+        let build_directory = resolve_build_directory(None);
+        Self::read_resolved(path, build_directory.as_deref())
     }
-    pub fn read_in(path: &Path, build_directory: Option<&Path>) -> io::Result<Self> {
+    pub(crate) fn read_resolved(path: &Path, build_directory: Option<&Path>) -> io::Result<Self> {
         let pdf = PdfRevision::read(path)?;
         let companion = companion_revision_in(path, build_directory)?;
         Ok(Self { pdf, companion })
     }
     pub fn check(self, path: &Path) -> io::Result<()> {
-        self.check_in(path, None)
+        let build_directory = resolve_build_directory(None);
+        self.check_resolved(path, build_directory.as_deref())
     }
-    pub fn check_in(self, path: &Path, build_directory: Option<&Path>) -> io::Result<()> {
-        if Self::read_in(path, build_directory)? != self {
+    pub(crate) fn check_resolved(
+        self,
+        path: &Path,
+        build_directory: Option<&Path>,
+    ) -> io::Result<()> {
+        if Self::read_resolved(path, build_directory)? != self {
             return Err(io::Error::other(
                 "displayed PDF/SyncTeX revision changed; wait for reload and click again",
             ));
@@ -449,7 +465,6 @@ pub fn parse_forward_request(payload: &str) -> io::Result<ForwardRequest> {
 /// Explicit editor context; standalone navigation keeps the strict default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardSource<'a> {
-    pub snapshot: Option<&'a Path>,
     pub best_guess: bool,
     pub anchor_only: bool,
     pub page_hint: Option<u32>,
@@ -508,103 +523,43 @@ pub fn resolve_forward_with_selector(
         return Err(io::Error::other("source line and column must be positive"));
     }
     let pdf = fs::canonicalize(pdf)?;
-    let snapshot = context
-        .snapshot
-        .map(|path| SourceSnapshot::load_in(path, &pdf, context.build_directory))
-        .transpose()?;
+    let resolved_build_directory = resolve_build_directory(context.build_directory);
+    let build_directory = resolved_build_directory.as_deref();
     let allow_anchor = context.best_guess || context.anchor_only;
-    let mut document_revision = match &snapshot {
-        Some(snapshot) => Some(snapshot.revision),
-        None if allow_anchor => {
-            drop(crate::source_snapshot::open_regular(&pdf, false)?);
-            Some(DocumentRevision::read_in(&pdf, context.build_directory)?)
-        }
-        None => None,
-    };
-    if snapshot.is_none()
-        && allow_anchor
-        && document_revision.is_some_and(|revision| revision.companion.is_none())
-    {
-        return Err(io::Error::other(ForwardUnavailable(
-            "no SyncTeX sidecar is available for source positioning",
-        )));
+    drop(crate::source_snapshot::open_regular(&pdf)?);
+    let document_revision = DocumentRevision::read_resolved(&pdf, build_directory)?;
+    if document_revision.companion.is_none() {
+        return Err(if allow_anchor {
+            io::Error::other(ForwardUnavailable(
+                "no SyncTeX sidecar is available for source positioning",
+            ))
+        } else {
+            open_synctex_with_path_in(&pdf, build_directory)
+                .err()
+                .unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
+                })
+        });
     }
-    let file = match &snapshot {
-        Some(snapshot) => snapshot.normalize(file)?,
-        None if context.anchor_only => match fs::canonicalize(file) {
+    let file = if context.anchor_only {
+        match fs::canonicalize(file) {
             Ok(file) => file,
             Err(_) => crate::source_snapshot::normalize_absolute(file, &std::env::current_dir()?)?,
-        },
-        None => fs::canonicalize(file)?,
-    };
-    let revision = match document_revision {
-        Some(revision) => revision.pdf,
-        None => PdfRevision::read(&pdf)?,
-    };
-    // Root identity is compiler metadata, never a basename or a live-source
-    // guess. A published root cache remains required even for LINE fallback.
-    let (root_source, cached_root, cached_sidecar) = match &snapshot {
-        Some(snapshot) => {
-            let root = snapshot.read(&snapshot.main).map_err(|error| {
-                if crate::source_snapshot::required_cache_error(&error) {
-                    error
-                } else {
-                    io::Error::new(
-                        error.kind(),
-                        crate::source_snapshot::SnapshotReadError(error),
-                    )
-                }
-            })?;
-            let root_source = snapshot.main == file;
-            (root_source, root_source.then_some(root), None)
         }
-        None => {
-            let (inputs, sidecar) = crate::source_snapshot::SourceInfo::read_with_sidecar_in(
-                &pdf,
-                context.build_directory,
-            )?;
-            let main = inputs
-                .main
-                .as_ref()
-                .ok_or_else(|| io::Error::other("compiler root source identity is unavailable"))?;
-            if inputs.revision.pdf != revision
-                || document_revision.is_some_and(|revision| revision != inputs.revision)
-            {
-                return Err(io::Error::other(
-                    "document changed while reading compiler root identity",
-                ));
-            }
-            document_revision = Some(inputs.revision);
-            (main == &file, None, sidecar)
-        }
-    };
-    let mut warning = snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.warning(&file))
-        .map(str::to_owned);
-    if snapshot.is_none() && context.anchor_only {
-        warning =
-            Some("best-guess navigation: using saved source and the compiler line anchor".into());
-    }
-    let source_revision = if snapshot.is_none() && !context.anchor_only {
-        Some(PdfRevision::read(&file)?)
     } else {
-        None
+        fs::canonicalize(file)?
     };
-    let source = match &snapshot {
-        Some(_) if root_source => cached_root,
-        Some(snapshot) => match snapshot.read(&file) {
-            Ok(source) => Some(source),
-            Err(error) if allow_anchor && !crate::source_snapshot::required_cache_error(&error) => {
-                warning = Some(format!(
-                    "best-guess navigation: compiled source unavailable: {error}"
-                ));
-                None
-            }
-            Err(error) => return Err(error),
-        },
-        None if context.anchor_only => None,
-        None => match read_source(&file) {
+    let revision = document_revision.pdf;
+    let mut warning = context.anchor_only.then(|| {
+        "best-guess navigation: using saved source and the compiler line anchor".to_owned()
+    });
+    let source_revision = (!context.anchor_only)
+        .then(|| PdfRevision::read(&file))
+        .transpose()?;
+    let source = if context.anchor_only {
+        None
+    } else {
+        match read_source(&file) {
             Ok(source) => Some(source),
             Err(error)
                 if allow_anchor
@@ -619,51 +574,23 @@ pub fn resolve_forward_with_selector(
                 None
             }
             Err(error) => return Err(error),
-        },
+        }
     };
-    if snapshot.is_some()
-        && allow_anchor
-        && document_revision.is_some_and(|revision| revision.companion.is_none())
-    {
-        return Err(io::Error::other(ForwardUnavailable(
-            "no SyncTeX sidecar is available for source positioning",
-        )));
-    }
-    if warning.is_some() && !allow_anchor {
-        return Err(io::Error::other(
-            "compiled source snapshot provenance is unverified",
-        ));
-    }
     let original_line = match source
         .as_deref()
         .map(|source| validate_forward_source_position(source, line, column))
     {
         Some(Ok(text)) => Some(text),
-        Some(Err(_))
-            if context.anchor_only && source.as_deref() == Some("") && line == 1 && column == 1 =>
-        {
-            return Err(io::Error::other(ForwardUnavailable(
-                "compiled source is empty; no printed source position is available",
-            )));
-        }
-        Some(Err(error)) if warning.is_some() && allow_anchor => {
-            warning = Some(format!(
-                "best-guess navigation: compiled source position cannot be qualified: {error}"
-            ));
-            None
-        }
         Some(Err(error)) => return Err(error),
         None => None,
     };
     if let Some(source_revision) = source_revision
-        && document_revision
-            .and_then(|revision| revision.companion)
-            .is_some_and(|(_, companion)| {
-                (
-                    source_revision.modified_seconds,
-                    source_revision.modified_nanoseconds,
-                ) > (companion.modified_seconds, companion.modified_nanoseconds)
-            })
+        && document_revision.companion.is_some_and(|(_, companion)| {
+            (
+                source_revision.modified_seconds,
+                source_revision.modified_nanoseconds,
+            ) > (companion.modified_seconds, companion.modified_nanoseconds)
+        })
     {
         warning = Some(
             "line-only navigation: saved source is newer than SyncTeX; using the compiler line anchor"
@@ -677,40 +604,27 @@ pub fn resolve_forward_with_selector(
     };
     // Collected frame/tabularx/text/math bodies use their closing compiler line.
     // Keep the original source position for the page hint, and give Beamer priority.
+    let file_index = source
+        .as_deref()
+        .map(|src| tex::SourceFileIndex::new(src, &Operation::default()));
     let view_line = source
         .as_deref()
-        .and_then(|source| {
-            frame_closing_line(source, line)
-                .or_else(|| tabularx_closing_line(source, line))
-                .or_else(|| {
-                    original_line
-                        .and_then(|_| collected_text_closing_line(source, line, column))
-                        .max(math::math_closing_line(source, line, column))
+        .zip(file_index.as_ref())
+        .and_then(|(source, file_index)| {
+            collected_closing_line(source, (line, column), file_index, |spans| {
+                original_line.and_then(|_| {
+                    tex::argument_closing_line_with_spans(source, line, column, spans)
                 })
+            })
         })
         .unwrap_or(line);
-    let candidates = match &cached_sidecar {
-        Some((bytes, sidecar_path)) => {
-            crate::parser::forward_candidates_from_reader_with_page_hint_in(
-                io::Cursor::new(bytes),
-                &pdf,
-                &file,
-                snapshot.as_ref(),
-                view_line,
-                true,
-                context.page_hint,
-                sidecar_path.parent(),
-            )?
-        }
-        None => forward_candidates_in(
-            &pdf,
-            &file,
-            snapshot.as_ref(),
-            view_line,
-            context.page_hint,
-            context.build_directory,
-        )?,
-    };
+    let candidates = crate::parser::forward_candidates_resolved(
+        &pdf,
+        &file,
+        view_line,
+        context.page_hint,
+        build_directory,
+    )?;
     let line_candidate = |hint: Option<&ForwardWord>| {
         let anchor = best_guess_forward_candidate(&candidates)?;
         match hint {
@@ -730,31 +644,26 @@ pub fn resolve_forward_with_selector(
             && selected.rect.bottom > selected.rect.top
         {
             page_hint.filter(|_| {
-                source
-                    .as_deref()
+                file_index
+                    .as_ref()
                     .zip(original_line)
-                    .is_some_and(|(source, text)| {
+                    .is_some_and(|(index, text)| {
                         let Some((byte, _)) = text.char_indices().nth(column as usize - 1) else {
                             return false;
                         };
-                        let absolute = source
-                            .split_inclusive('\n')
-                            .take(line as usize - 1)
-                            .map(str::len)
-                            .sum::<usize>()
-                            + byte;
-                        !tex::nonprinting_source_spans(source)
-                            .any(|(_, span, _)| span.contains(&absolute))
+                        let Some(&line_start) = index.line_starts.get(line as usize - 1) else {
+                            return false;
+                        };
+                        let absolute = line_start + byte;
+                        !contains_byte(&index.strict_hidden, absolute)
                     })
             })
         } else {
             None
         };
-        warning = if word.is_some() && snapshot.is_none() {
-            Some("assuming saved source is unchanged since compilation".into())
-        } else {
-            None
-        };
+        warning = word
+            .is_some()
+            .then(|| "assuming saved source is unchanged since compilation".into());
         (selected, word)
     };
     let result = ForwardRequest {
@@ -776,11 +685,7 @@ pub fn resolve_forward_with_selector(
     {
         source_revision.check(&file)?;
     }
-    if let Some(revision) = document_revision {
-        revision.check_in(&result.pdf, context.build_directory)?;
-    } else {
-        revision.check(&result.pdf)?;
-    }
+    document_revision.check_resolved(&result.pdf, build_directory)?;
     Ok(result)
 }
 
@@ -820,56 +725,12 @@ pub fn resolve_inverse(
     word: Option<(&str, usize)>,
     radius: u32,
     operation: &Operation,
-    source_snapshot: Option<&Path>,
     best_guess: bool,
 ) -> io::Result<InverseResolution> {
-    resolve_inverse_in(
-        pdf,
-        point,
-        word,
-        radius,
-        operation,
-        source_snapshot,
-        best_guess,
-        None,
-    )
+    resolve_inverse_with_cache(pdf, point, word, radius, operation, best_guess, None)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn resolve_inverse_in(
-    pdf: &Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    source_snapshot: Option<&Path>,
-    best_guess: bool,
-    build_directory: Option<&Path>,
-) -> io::Result<InverseResolution> {
-    operation.check()?;
-    if !parser::inverse_point_valid(point) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "inverse search requires a positive page and finite compiler coordinates",
-        ));
-    }
-    let pdf = std::path::absolute(pdf)?;
-    let snapshot = source_snapshot
-        .map(|path| SourceSnapshot::load_in(path, &pdf, build_directory))
-        .transpose()?;
-    resolve_inverse_with_snapshot_in(
-        &pdf,
-        point,
-        word,
-        radius,
-        operation,
-        snapshot.as_ref(),
-        best_guess,
-        build_directory,
-    )
-}
-
-type StructuralMapKey = (u32, PathBuf, Option<PathBuf>, Option<PathBuf>);
+type StructuralMapKey = (u32, PathBuf, Option<PathBuf>);
 
 #[derive(Default)]
 pub struct SyncTeXCache {
@@ -879,6 +740,7 @@ pub struct SyncTeXCache {
 struct CachedSyncTeX {
     pdf: PathBuf,
     companion: (bool, PdfRevision),
+    sidecar_dir: Option<PathBuf>,
     raw: Vec<u8>,
     pages: std::collections::HashMap<u32, parser::ParsedSynctex>,
     structural_maps: std::collections::HashMap<StructuralMapKey, Result<Rc<SourceMap>, String>>,
@@ -898,25 +760,26 @@ impl SyncTeXCache {
     )> {
         operation.check()?;
         parser::validate_inverse_point(point)?;
-        let Some(companion) = companion_revision_in(pdf, build_directory)? else {
-            return Err(open_synctex_in(pdf, build_directory)
+        let Some((companion, sidecar_path)) = companion_revision_and_path_in(pdf, build_directory)?
+        else {
+            return Err(open_synctex_with_path_in(pdf, build_directory)
                 .err()
                 .unwrap_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")
                 }));
         };
+        let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
         if self
             .entry
             .as_ref()
             .is_none_or(|entry| entry.pdf != pdf || entry.companion != companion)
         {
-            let mut raw = Vec::new();
-            open_synctex_in(pdf, build_directory)?.read_to_end(&mut raw)?;
-            if raw.len() >= 128 * 1024 * 1024 {
-                return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
-            }
+            let (mut reader, opened_path) = open_synctex_with_path_in(pdf, build_directory)?;
+            let raw = parser::read_remaining_rows(&mut reader, 0, Some(operation))?;
             operation.check()?;
-            if companion_revision_in(pdf, build_directory)? != Some(companion) {
+            if companion_revision_and_path_in(pdf, build_directory)?
+                != Some((companion, opened_path))
+            {
                 return Err(io::Error::other(
                     "displayed PDF/SyncTeX revision changed; wait for reload and click again",
                 ));
@@ -924,10 +787,16 @@ impl SyncTeXCache {
             self.entry = Some(CachedSyncTeX {
                 pdf: pdf.to_owned(),
                 companion,
+                sidecar_dir,
                 raw,
                 pages: std::collections::HashMap::new(),
                 structural_maps: std::collections::HashMap::new(),
             });
+        } else if let Some(entry) = self.entry.as_mut()
+            && entry.sidecar_dir != sidecar_dir
+        {
+            entry.sidecar_dir = sidecar_dir;
+            entry.structural_maps.clear();
         }
         let entry = self.entry.as_mut().expect("cache entry initialized");
         if !entry.pages.contains_key(&point.page) {
@@ -948,72 +817,53 @@ impl SyncTeXCache {
     }
 }
 
-pub fn resolve_inverse_with_snapshot(
-    pdf: &Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    snapshot: Option<&SourceSnapshot>,
-    best_guess: bool,
-) -> io::Result<InverseResolution> {
-    resolve_inverse_with_cache(
-        pdf, point, word, radius, operation, snapshot, best_guess, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn resolve_inverse_with_snapshot_in(
-    pdf: &Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    snapshot: Option<&SourceSnapshot>,
-    best_guess: bool,
-    build_directory: Option<&Path>,
-) -> io::Result<InverseResolution> {
-    resolve_inverse_with_cache_in(
-        pdf,
-        point,
-        word,
-        radius,
-        operation,
-        snapshot,
-        best_guess,
-        None,
-        build_directory,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn resolve_inverse_with_cache(
     pdf: &Path,
     point: InversePoint,
     word: Option<(&str, usize)>,
     radius: u32,
     operation: &Operation,
-    snapshot: Option<&SourceSnapshot>,
     best_guess: bool,
     cache: Option<&mut SyncTeXCache>,
 ) -> io::Result<InverseResolution> {
-    resolve_inverse_with_cache_in(
-        pdf, point, word, radius, operation, snapshot, best_guess, cache, None,
+    let resolved_build_directory = resolve_build_directory(None);
+    resolve_inverse_resolved(
+        InverseRequest {
+            pdf,
+            point,
+            word,
+            radius,
+            operation,
+            best_guess,
+            build_directory: resolved_build_directory.as_deref(),
+        },
+        cache,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn resolve_inverse_with_cache_in(
-    pdf: &Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    snapshot: Option<&SourceSnapshot>,
-    best_guess: bool,
+#[derive(Clone, Copy)]
+pub(crate) struct InverseRequest<'a> {
+    pub(crate) pdf: &'a Path,
+    pub(crate) point: InversePoint,
+    pub(crate) word: Option<(&'a str, usize)>,
+    pub(crate) radius: u32,
+    pub(crate) operation: &'a Operation,
+    pub(crate) best_guess: bool,
+    pub(crate) build_directory: Option<&'a Path>,
+}
+
+fn resolve_inverse_resolved(
+    req: InverseRequest<'_>,
     mut cache: Option<&mut SyncTeXCache>,
-    build_directory: Option<&Path>,
 ) -> io::Result<InverseResolution> {
+    let InverseRequest {
+        pdf,
+        point,
+        operation,
+        best_guess,
+        build_directory,
+        ..
+    } = req;
     operation.check()?;
     if !parser::inverse_point_valid(point) {
         return Err(io::Error::new(
@@ -1022,49 +872,42 @@ pub fn resolve_inverse_with_cache_in(
         ));
     }
     let pdf = std::path::absolute(pdf)?;
-    if let Some(snapshot) = snapshot {
-        snapshot.revision.check_in(&pdf, build_directory)?;
-    }
-    let raw_revision = if best_guess && snapshot.is_none() {
-        drop(crate::source_snapshot::open_regular(&pdf, false)?);
-        Some(DocumentRevision::read_in(&pdf, build_directory)?)
+    let raw_revision = if best_guess {
+        drop(crate::source_snapshot::open_regular(&pdf)?);
+        Some(DocumentRevision::read_resolved(&pdf, build_directory)?)
     } else {
         None
     };
     operation.check()?;
-    let (targets, cached_companion, cache_entry) = match cache.as_deref_mut() {
-        Some(cache) => {
+    let (targets, cached_companion, cache_entry, uncached_sidecar_dir) =
+        if let Some(cache) = cache.as_deref_mut() {
             let (targets, companion, entry) =
                 cache.candidates_and_entry(&pdf, point, operation, build_directory)?;
-            (targets, Some(companion), Some(entry))
-        }
-        None => (
-            parser::inverse_raw_candidates_in(&pdf, point, build_directory, Some(operation))?,
-            None,
-            None,
-        ),
-    };
+            (targets, Some(companion), Some(entry), None)
+        } else {
+            let (reader, sidecar_path) = open_synctex_with_path_in(&pdf, build_directory)?;
+            let parsed = parser::parse_synctex_document_with_options(
+                reader,
+                true,
+                Some(point.page),
+                Some(operation),
+            )?;
+            operation.check()?;
+            let targets = parser::inverse_candidates_in_doc(&parsed, point)?;
+            let sidecar_dir = (!targets.is_empty())
+                .then(|| crate::source_snapshot::canonical_sidecar_dir(&sidecar_path))
+                .flatten();
+            (targets, None, None, sidecar_dir)
+        };
     let sources = QuerySources {
-        snapshot,
         best_guess,
+        sidecar_dir: uncached_sidecar_dir,
         ..QuerySources::default()
     };
-    let result = resolve_inverse_targets(
-        &pdf,
-        point,
-        word,
-        radius,
-        operation,
-        targets,
-        sources,
-        cache_entry,
-        build_directory,
-    )?;
-    if let Some(snapshot) = snapshot {
-        snapshot.revision.check_in(&pdf, build_directory)?;
-    }
+    let result = InverseQuery::new(InverseRequest { pdf: &pdf, ..req }, sources, cache_entry)
+        .resolve_targets(targets)?;
     if let Some(revision) = raw_revision {
-        revision.check_in(&pdf, build_directory)?;
+        revision.check_resolved(&pdf, build_directory)?;
     }
     if let Some(companion) = cached_companion
         && companion_revision_in(&pdf, build_directory)? != Some(companion)
@@ -1084,192 +927,37 @@ fn same_source_position(a: &SourceLocation, b: &SourceLocation) -> bool {
     Path::new(&a.file) == Path::new(&b.file) && a.line == b.line && a.byte_column == b.byte_column
 }
 
-#[cfg(test)]
-fn resolve_inverse_output(
-    pdf: &Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    stdout: &str,
-    sources: QuerySources<'_>,
-) -> io::Result<InverseResolution> {
-    let targets = parse_synctex_edit_candidates(stdout);
-    resolve_inverse_targets(
-        pdf, point, word, radius, operation, targets, sources, None, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_inverse_targets<'a>(
-    pdf: &'a Path,
-    point: InversePoint,
-    word: Option<(&str, usize)>,
-    radius: u32,
-    operation: &Operation,
-    targets: Vec<RawInverseCandidate>,
-    mut sources: QuerySources<'a>,
-    synctex_cache: Option<&mut CachedSyncTeX>,
-    build_directory: Option<&Path>,
-) -> io::Result<InverseResolution> {
-    if targets.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            InverseFailure::NoMatch,
-        ));
-    }
-    sources.pdf_dir = pdf.parent();
-    sources.sidecar_dir = crate::source_snapshot::sidecar_dir_for(pdf, build_directory);
-    let best_guess = sources.best_guess;
-    let assume_unchanged = best_guess && sources.snapshot.is_none();
-    let mut query = InverseQuery {
-        pdf,
-        point,
-        word,
-        radius,
-        operation,
-        sources,
-        synctex_cache,
-        build_directory,
-        structural_map: None,
-        geometry_map: None,
-        metadata: None,
-        spliced_preamble: None,
-    };
-    let mut resolutions = Vec::with_capacity(targets.len());
-    for target in targets {
-        operation.check()?;
-        resolutions.push(query.resolve_target(target)?);
-    }
-    operation.check()?;
-    let mut supported = resolutions
-        .iter()
-        .enumerate()
-        .filter(|(_, (result, _, _))| result.location.precise);
-    let mut ambiguous = None;
-    let selected = if let Some((index, (first, _, _))) = supported.next() {
-        if supported
-            .any(|(_, (other, _, _))| !same_source_position(&first.location, &other.location))
-        {
-            ambiguous = Some("ambiguous inverse search: multiple precise source locations");
-        } else if resolutions.iter().any(|(other, _, word_tied)| {
-            *word_tied && !same_source_position(&first.location, &other.location)
-        }) {
-            // An anchor with tied words is unresolved, unlike one with no matching word.
-            ambiguous = Some("ambiguous inverse search: tied words oppose a precise location");
-        }
-        index
-    } else {
-        if resolutions[1..]
-            .iter()
-            .any(|(other, _, _)| !same_source_position(&resolutions[0].0.location, &other.location))
-        {
-            ambiguous = Some("ambiguous inverse search: multiple coarse source anchors");
-        }
-        0
-    };
-    if let Some(reason) = ambiguous
-        && !best_guess
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            InverseFailure::Ambiguous(reason),
-        ));
-    }
-    // The executable's first result is its nearest compiler anchor. Explicit
-    // best-guess mode cannot turn an ambiguous word refinement into precision.
-    let (mut chosen, raw, _) =
-        resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
-    let mut warnings = std::collections::BTreeSet::new();
-    if let Some(reason) = ambiguous {
-        if let Some(raw) = raw {
-            chosen.location = raw;
-        }
-        chosen.location.precise = false;
-        warnings.insert(format!(
-            "best-guess navigation: {reason}; using the first compiler anchor"
-        ));
-    }
-    if let Some(warning) = chosen.warning {
-        warnings.insert(warning);
-    }
-    for (other, _, _) in resolutions {
-        if same_source_position(&chosen.location, &other.location)
-            && let Some(warning) = other.warning
-        {
-            warnings.insert(warning);
-        }
-    }
-    if best_guess && !chosen.location.precise && warnings.is_empty() {
-        warnings.insert("best-guess navigation: no literal source position was qualified; using the compiler line anchor".into());
-    }
-    if assume_unchanged {
-        warnings.insert(
-            "best-guess navigation: assuming saved source is unchanged since compilation".into(),
-        );
-    }
-    operation.check()?;
-    Ok(InverseResolution {
-        location: chosen.location,
-        warning: (!warnings.is_empty())
-            .then(|| warnings.into_iter().collect::<Vec<_>>().join("; ")),
-    })
-}
-
 #[derive(Default)]
 struct QuerySources<'a> {
-    snapshot: Option<&'a SourceSnapshot>,
     best_guess: bool,
     pdf_dir: Option<&'a Path>,
     sidecar_dir: Option<PathBuf>,
-    files: std::collections::HashMap<PathBuf, Result<Rc<String>, (String, bool)>>,
+    files: std::collections::HashMap<PathBuf, Result<Rc<String>, String>>,
 }
 
 impl QuerySources<'_> {
     fn normalize(&self, path: &Path) -> io::Result<PathBuf> {
-        match self.snapshot {
-            Some(snapshot) => snapshot.normalize(path),
-            None => fs::canonicalize(path).or_else(|err| {
-                crate::source_snapshot::resolve_relative_input(
-                    path,
-                    None,
-                    self.pdf_dir,
-                    self.sidecar_dir.as_deref(),
-                )
-                .ok_or(err)
-            }),
-        }
-    }
-
-    fn warning(&self, path: &Path) -> Option<&str> {
-        self.snapshot.and_then(|snapshot| snapshot.warning(path))
-    }
-
-    fn read_error((message, required): (String, bool)) -> io::Error {
-        let error = io::Error::other(message);
-        if required {
-            io::Error::other(crate::source_snapshot::SnapshotReadError(error))
-        } else {
-            error
-        }
+        fs::canonicalize(path).or_else(|err| {
+            crate::source_snapshot::resolve_relative_input(
+                path,
+                None,
+                self.pdf_dir,
+                self.sidecar_dir.as_deref(),
+            )
+            .ok_or(err)
+        })
     }
 
     fn read(&mut self, path: &Path, operation: &Operation) -> io::Result<Rc<String>> {
         operation.check()?;
         if let Some(result) = self.files.get(path) {
-            return result.clone().map_err(Self::read_error);
+            return result.clone().map_err(io::Error::other);
         }
-        let result = match self.snapshot {
-            Some(snapshot) => snapshot.read(path),
-            None => read_source(path),
-        }
-        .map(Rc::new)
-        .map_err(|error| {
-            let required = crate::source_snapshot::required_cache_error(&error);
-            (error.to_string(), required)
-        });
+        let result = read_source(path)
+            .map(Rc::new)
+            .map_err(|error| error.to_string());
         operation.check()?;
-        let value = result.clone().map_err(Self::read_error);
+        let value = result.clone().map_err(io::Error::other);
         self.files.insert(path.to_owned(), result);
         value
     }
@@ -1284,19 +972,38 @@ type MetadataLocation = (
     Vec<std::ops::Range<usize>>,
 );
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InverseFailure {
-    #[error("synctex edit returned no match")]
     NoMatch,
-    #[error("{0}")]
     Ambiguous(&'static str),
-    #[error("invalid source anchor: {file}:{line} is out of range (available lines: {available})")]
     InvalidSourceAnchor {
         file: PathBuf,
         line: u32,
         available: usize,
     },
 }
+
+impl std::fmt::Display for InverseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoMatch => f.write_str("synctex edit returned no match"),
+            Self::Ambiguous(reason) => f.write_str(reason),
+            Self::InvalidSourceAnchor {
+                file,
+                line,
+                available,
+            } => write!(
+                f,
+                "invalid source anchor: {}:{} is out of range (available lines: {})",
+                file.display(),
+                line,
+                available
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InverseFailure {}
 
 pub fn inverse_failure(error: &io::Error) -> Option<&InverseFailure> {
     error.get_ref()?.downcast_ref::<InverseFailure>()
@@ -1322,7 +1029,53 @@ fn is_generated_or_sidecar_input(path: &Path) -> bool {
             .is_some_and(crate::parser::is_generated_graphics_tex)
 }
 
-struct InverseQuery<'a> {
+#[derive(Default)]
+struct SourceArena {
+    slots: [std::cell::OnceCell<Rc<String>>; 16],
+    next: std::cell::OnceCell<Box<SourceArena>>,
+}
+
+impl SourceArena {
+    fn pin(&self, rc: &Rc<String>) -> &str {
+        let mut node = self;
+        loop {
+            for slot in &node.slots {
+                if let Some(existing) = slot.get() {
+                    if Rc::ptr_eq(existing, rc) {
+                        return existing.as_str();
+                    }
+                } else {
+                    return slot.get_or_init(|| Rc::clone(rc)).as_str();
+                }
+            }
+            node = node.next.get_or_init(Box::default);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QueryAnalysisScope<'q> {
+    arena: &'q SourceArena,
+    analyses: &'q tex::AnalysisCache<'q>,
+}
+
+impl<'q> QueryAnalysisScope<'q> {
+    fn file_index(self, source: &Rc<String>, operation: &'q Operation) -> Rc<tex::SourceFileIndex> {
+        self.analyses.file_index(self.arena.pin(source), operation)
+    }
+
+    fn get(
+        self,
+        source: &Rc<String>,
+        extra_sources: &[&'q str],
+        operation: &'q Operation,
+    ) -> Rc<tex::SourceAnalysis<'q>> {
+        self.analyses
+            .get(self.arena.pin(source), extra_sources, operation)
+    }
+}
+
+pub(crate) struct InverseQuery<'a> {
     pdf: &'a Path,
     point: InversePoint,
     word: Option<(&'a str, usize)>,
@@ -1334,22 +1087,178 @@ struct InverseQuery<'a> {
     structural_map: Option<(PathBuf, Result<Rc<SourceMap>, String>)>,
     geometry_map: Option<Result<Rc<SourceMap>, String>>,
     metadata: Option<Option<MetadataLocation>>,
-    spliced_preamble: Option<Option<Rc<SplicedSource>>>,
+    spliced_preamble: Option<Option<Rc<String>>>,
 }
 
-impl InverseQuery<'_> {
+impl<'a> InverseQuery<'a> {
+    pub(crate) fn new(
+        req: InverseRequest<'a>,
+        mut sources: QuerySources<'a>,
+        synctex_cache: Option<&'a mut CachedSyncTeX>,
+    ) -> Self {
+        sources.pdf_dir = req.pdf.parent();
+        Self {
+            pdf: req.pdf,
+            point: req.point,
+            word: req.word,
+            radius: req.radius,
+            operation: req.operation,
+            sources,
+            synctex_cache,
+            build_directory: req.build_directory,
+            structural_map: None,
+            geometry_map: None,
+            metadata: None,
+            spliced_preamble: None,
+        }
+    }
+
+    pub(crate) fn resolve_targets(
+        mut self,
+        targets: Vec<RawInverseCandidate>,
+    ) -> io::Result<InverseResolution> {
+        if targets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                InverseFailure::NoMatch,
+            ));
+        }
+        if self.sources.sidecar_dir.is_none() {
+            self.sources.sidecar_dir = self
+                .synctex_cache
+                .as_deref()
+                .and_then(|c| c.sidecar_dir.clone())
+                .or_else(|| {
+                    crate::source_snapshot::sidecar_dir_for(self.pdf, self.build_directory)
+                });
+        }
+        let best_guess = self.sources.best_guess;
+        let operation = self.operation;
+        let arena = SourceArena::default();
+        let analyses = tex::AnalysisCache::default();
+        let scope = QueryAnalysisScope {
+            arena: &arena,
+            analyses: &analyses,
+        };
+        let mut resolutions = Vec::with_capacity(targets.len());
+        for target in targets {
+            operation.check()?;
+            resolutions.push(self.resolve_target(target, scope)?);
+        }
+        operation.check()?;
+        let mut supported = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, (result, _, _))| result.location.precise);
+        let mut ambiguous = None;
+        let selected = if let Some((index, (first, _, _))) = supported.next() {
+            if supported
+                .any(|(_, (other, _, _))| !same_source_position(&first.location, &other.location))
+            {
+                ambiguous = Some("ambiguous inverse search: multiple precise source locations");
+            } else if resolutions.iter().any(|(other, _, word_tied)| {
+                *word_tied && !same_source_position(&first.location, &other.location)
+            }) {
+                // An anchor with tied words is unresolved, unlike one with no matching word.
+                ambiguous = Some("ambiguous inverse search: tied words oppose a precise location");
+            }
+            index
+        } else {
+            if resolutions[1..].iter().any(|(other, _, _)| {
+                !same_source_position(&resolutions[0].0.location, &other.location)
+            }) {
+                ambiguous = Some("ambiguous inverse search: multiple coarse source anchors");
+            }
+            0
+        };
+        if let Some(reason) = ambiguous
+            && !best_guess
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                InverseFailure::Ambiguous(reason),
+            ));
+        }
+        // The executable's first result is its nearest compiler anchor. Explicit
+        // best-guess mode cannot turn an ambiguous word refinement into precision.
+        let (mut chosen, raw, _) =
+            resolutions.swap_remove(if ambiguous.is_some() { 0 } else { selected });
+        let mut warnings = std::collections::BTreeSet::new();
+        if let Some(reason) = ambiguous {
+            if let Some(raw) = raw {
+                chosen.location = raw;
+            }
+            chosen.location.precise = false;
+            warnings.insert(format!(
+                "best-guess navigation: {reason}; using the first compiler anchor"
+            ));
+        }
+        if let Some(warning) = chosen.warning {
+            warnings.insert(warning);
+        }
+        for (other, _, _) in resolutions {
+            if same_source_position(&chosen.location, &other.location)
+                && let Some(warning) = other.warning
+            {
+                warnings.insert(warning);
+            }
+        }
+        if best_guess && !chosen.location.precise && warnings.is_empty() {
+            warnings.insert("best-guess navigation: no literal source position was qualified; using the compiler line anchor".into());
+        }
+        if best_guess {
+            warnings.insert(
+                "best-guess navigation: assuming saved source is unchanged since compilation"
+                    .into(),
+            );
+        }
+        operation.check()?;
+        Ok(InverseResolution {
+            location: chosen.location,
+            warning: (!warnings.is_empty())
+                .then(|| warnings.into_iter().collect::<Vec<_>>().join("; ")),
+        })
+    }
+
+    fn load_source_map(
+        &self,
+        generated_path: &Path,
+        geometry_required: bool,
+        input_cwd: Option<&Path>,
+    ) -> Result<Rc<SourceMap>, String> {
+        let loaded = if let Some(cache) = self.synctex_cache.as_deref() {
+            source_map_from_reader_in(
+                std::io::Cursor::new(&cache.raw),
+                self.pdf,
+                self.point,
+                generated_path,
+                geometry_required,
+                self.operation,
+                input_cwd,
+                self.sources.sidecar_dir.as_deref(),
+            )
+        } else {
+            read_source_map_in(
+                self.pdf,
+                self.point,
+                generated_path,
+                geometry_required,
+                self.operation,
+                input_cwd,
+                self.build_directory,
+            )
+        };
+        loaded.map(Rc::new).map_err(|error| error.to_string())
+    }
+
     fn source_map(&mut self, generated: Option<&Path>) -> io::Result<Rc<SourceMap>> {
         self.operation.check()?;
-        let snapshot = self.sources.snapshot;
-        let current_dir = if self.sources.best_guess && snapshot.is_none() {
-            Some(std::env::current_dir()?)
-        } else {
-            None
-        };
-        let input_cwd = snapshot
-            .map(|snapshot| snapshot.cwd.as_path())
-            .or(current_dir.as_deref());
-        let sidecar_dir = self.sources.sidecar_dir.as_deref();
+        let current_dir = self
+            .sources
+            .best_guess
+            .then(std::env::current_dir)
+            .transpose()?;
+        let input_cwd = current_dir.as_deref();
         let default_vrb = self.pdf.with_extension("vrb");
         let generated_path = generated.unwrap_or(&default_vrb);
         let result = if let Some(generated) = generated {
@@ -1357,30 +1266,22 @@ impl InverseQuery<'_> {
                 && let Some(geometry) = &self.geometry_map
             {
                 geometry.clone()
-            } else if let Some(cache) = self.synctex_cache.as_deref_mut() {
+            } else if self.synctex_cache.is_some() {
                 let key = (
                     self.point.page,
                     generated.to_owned(),
                     input_cwd.map(Path::to_owned),
-                    snapshot.map(|s| s.path.clone()),
                 );
-                if let Some(existing) = cache.structural_maps.get(&key) {
+                if let Some(existing) = self
+                    .synctex_cache
+                    .as_deref()
+                    .and_then(|cache| cache.structural_maps.get(&key))
+                {
                     existing.clone()
                 } else {
-                    let loaded = source_map_from_reader_in(
-                        std::io::Cursor::new(&cache.raw),
-                        self.pdf,
-                        self.point,
-                        generated_path,
-                        false,
-                        self.operation,
-                        input_cwd,
-                        snapshot,
-                        sidecar_dir,
-                    )
-                    .map(Rc::new)
-                    .map_err(|error| error.to_string());
+                    let loaded = self.load_source_map(generated_path, false, input_cwd);
                     self.operation.check()?;
+                    let cache = self.synctex_cache.as_deref_mut().unwrap();
                     if cache.structural_maps.len() >= 32 {
                         cache.structural_maps.clear();
                     }
@@ -1393,18 +1294,7 @@ impl InverseQuery<'_> {
                     .as_ref()
                     .is_none_or(|(cached, _)| cached != generated)
                 {
-                    let loaded = read_source_map_in(
-                        self.pdf,
-                        self.point,
-                        generated_path,
-                        false,
-                        self.operation,
-                        input_cwd,
-                        snapshot,
-                        self.build_directory,
-                    )
-                    .map(Rc::new)
-                    .map_err(|error| error.to_string());
+                    let loaded = self.load_source_map(generated_path, false, input_cwd);
                     self.structural_map = Some((generated.to_owned(), loaded));
                 }
                 self.structural_map.as_ref().unwrap().1.clone()
@@ -1421,60 +1311,32 @@ impl InverseQuery<'_> {
                         self.point.page,
                         default_vrb.clone(),
                         input_cwd.map(Path::to_owned),
-                        snapshot.map(|s| s.path.clone()),
                     ))
                     && map.page_source.is_none()
                 {
                     self.geometry_map = Some(Ok(Rc::clone(map)));
                 }
             }
-            let pdf = self.pdf;
-            let point = self.point;
-            let operation = self.operation;
-            let build_directory = self.build_directory;
-            let raw = self
-                .synctex_cache
-                .as_deref()
-                .map(|cache| cache.raw.as_slice());
-            self.geometry_map
-                .get_or_insert_with(|| {
-                    let loaded = match raw {
-                        Some(bytes) => source_map_from_reader_in(
-                            std::io::Cursor::new(bytes),
-                            pdf,
-                            point,
-                            generated_path,
-                            true,
-                            operation,
-                            input_cwd,
-                            snapshot,
-                            sidecar_dir,
-                        ),
-                        None => read_source_map_in(
-                            pdf,
-                            point,
-                            generated_path,
-                            true,
-                            operation,
-                            input_cwd,
-                            snapshot,
-                            build_directory,
-                        ),
-                    };
-                    loaded.map(Rc::new).map_err(|error| error.to_string())
-                })
-                .clone()
+            if self.geometry_map.is_none() {
+                let loaded = self.load_source_map(generated_path, true, input_cwd);
+                self.geometry_map = Some(loaded);
+            }
+            self.geometry_map.as_ref().unwrap().clone()
         };
         self.operation.check()?;
         result.map_err(io::Error::other)
     }
 
-    fn resolve_target(
+    fn resolve_target<'q>(
         &mut self,
         target: RawInverseCandidate,
-    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)> {
+        scope: QueryAnalysisScope<'q>,
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)>
+    where
+        'a: 'q,
+    {
         let mut anchor = self.normalize_anchor(target)?;
-        let Some(source) = self.qualify_source(&mut anchor)? else {
+        let Some(source) = self.qualify_source(&mut anchor, scope)? else {
             return Ok((
                 InverseResolution {
                     location: anchor.target,
@@ -1484,7 +1346,7 @@ impl InverseQuery<'_> {
                 false,
             ));
         };
-        self.refine_target(anchor, source)
+        self.refine_target(anchor, source, scope)
     }
 
     fn normalize_anchor(&mut self, raw: RawInverseCandidate) -> io::Result<InverseAnchor> {
@@ -1492,9 +1354,7 @@ impl InverseQuery<'_> {
         let pdf_dir = self.pdf.parent().unwrap_or(Path::new("."));
         let sidecar_dir = self.sources.sidecar_dir.as_deref();
         let mut warning = None;
-        let resolved = if let Some(snapshot) = self.sources.snapshot {
-            snapshot.normalize(path)?.components().collect()
-        } else if self.sources.best_guess {
+        let resolved = if self.sources.best_guess {
             let absolute: PathBuf = std::path::absolute(path)?.components().collect();
             if !path.is_absolute() && fs::symlink_metadata(&absolute).is_err() {
                 crate::source_snapshot::resolve_relative_input(
@@ -1570,37 +1430,25 @@ impl InverseQuery<'_> {
 
     // Authority and bounds are settled before word ownership. A coarse result
     // carries its compiler anchor unchanged; only a qualified source is refined.
-    fn qualify_source(&mut self, anchor: &mut InverseAnchor) -> io::Result<Option<Rc<String>>> {
+    fn qualify_source<'q>(
+        &mut self,
+        anchor: &mut InverseAnchor,
+        scope: QueryAnalysisScope<'q>,
+    ) -> io::Result<Option<Rc<String>>>
+    where
+        'a: 'q,
+    {
         let target = &mut anchor.target;
         let generated = anchor.generated;
         let source_map = &anchor.source_map;
         let warning = &mut anchor.warning;
         let raw_column = anchor.compiler_column;
-        target.byte_column = 0;
-        target.column = 1;
-        target.column_char = 1;
-        if !generated
-            && let Some(reason) = self
-                .sources
-                .warning(Path::new(&target.file))
-                .map(str::to_owned)
-        {
-            // A provenance warning cannot waive authority for a recorded input.
-            // Uncaptured inputs still retain their original coarse anchor.
-            if let Err(error) = self.sources.read(Path::new(&target.file), self.operation)
-                && crate::source_snapshot::required_cache_error(&error)
-            {
-                return Err(error);
-            }
-            self.operation.check()?;
-            *warning = Some(reason);
-            return Ok(None);
-        }
         let verbatim_only = Path::new(&target.file)
             .extension()
             .is_some_and(|ext| ext == "vrb");
         let source = if generated {
-            let Some(source) = self.remap_generated_source(target, source_map, warning)? else {
+            let Some(source) = self.remap_generated_source(target, source_map, warning, scope)?
+            else {
                 return Ok(None);
             };
             source
@@ -1609,9 +1457,6 @@ impl InverseQuery<'_> {
                 Ok(source) => source,
                 Err(error) => {
                     self.operation.check()?;
-                    if crate::source_snapshot::required_cache_error(&error) {
-                        return Err(error);
-                    }
                     *warning = Some(format!(
                         "line-only navigation: source refinement unavailable: {error}"
                     ));
@@ -1632,10 +1477,6 @@ impl InverseQuery<'_> {
                 return Ok(None);
             }
         };
-        if let Some(reason) = self.sources.warning(Path::new(&target.file)) {
-            *warning = Some(reason.to_owned());
-            return Ok(None);
-        }
         if generated && !verbatim_only {
             return Ok(None);
         }
@@ -1647,12 +1488,16 @@ impl InverseQuery<'_> {
 
     // The structural sheet anchor must identify the enclosing source frame for
     // generated sidecars (.vrb, .toc, .nav, .out, .aux, .snm).
-    fn remap_generated_source(
+    fn remap_generated_source<'q>(
         &mut self,
         target: &mut SourceLocation,
         source_map: &Option<io::Result<Rc<SourceMap>>>,
         warning: &mut Option<String>,
-    ) -> io::Result<Option<Rc<String>>> {
+        scope: QueryAnalysisScope<'q>,
+    ) -> io::Result<Option<Rc<String>>>
+    where
+        'a: 'q,
+    {
         let verbatim_only = Path::new(&target.file)
             .extension()
             .is_some_and(|ext| ext == "vrb");
@@ -1672,13 +1517,19 @@ impl InverseQuery<'_> {
             })
             .and_then(|map| {
                 if verbatim_only {
-                    original_source_from_verbatim(map, &mut self.sources, self.operation)
+                    original_source_from_verbatim_with_scope(
+                        map,
+                        &mut self.sources,
+                        self.operation,
+                        scope,
+                    )
                 } else {
                     original_source_from_generated(
                         map,
                         target.line,
                         &mut self.sources,
                         self.operation,
+                        scope,
                     )
                 }
             });
@@ -1691,9 +1542,6 @@ impl InverseQuery<'_> {
             }
             Err(error) => {
                 self.operation.check()?;
-                if crate::source_snapshot::required_cache_error(&error) {
-                    return Err(error);
-                }
                 if self.sources.best_guess
                     && let Some(map) = source_map.as_ref().and_then(|map| map.as_ref().ok())
                 {
@@ -1717,11 +1565,8 @@ impl InverseQuery<'_> {
                                 "SyncTeX original compiler anchor line must be positive",
                             ));
                         }
-                        let original = if let Some(snapshot) = self.sources.snapshot {
-                            snapshot.normalize(original)?
-                        } else {
-                            fs::canonicalize(original).unwrap_or_else(|_| original.to_owned())
-                        };
+                        let original =
+                            fs::canonicalize(original).unwrap_or_else(|_| original.to_owned());
                         target.file = original
                             .into_os_string()
                             .into_string()
@@ -1738,11 +1583,15 @@ impl InverseQuery<'_> {
         }
     }
 
-    fn refine_target(
+    fn refine_target<'q>(
         &mut self,
         anchor: InverseAnchor,
         mut source: Rc<String>,
-    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)> {
+        scope: QueryAnalysisScope<'q>,
+    ) -> io::Result<(InverseResolution, Option<SourceLocation>, bool)>
+    where
+        'a: 'q,
+    {
         let InverseAnchor {
             mut target,
             graphics,
@@ -1754,20 +1603,22 @@ impl InverseQuery<'_> {
         let is_generated_graphics = crate::parser::is_generated_graphics_tex(&target.file);
         let anchor = (!is_generated_graphics && (self.word.is_some() || graphics.is_some()))
             .then(|| target.clone());
-        let refine_graphics = match graphics {
-            Some(GraphicsHit::Unique { index, count }) => Some((index, count)),
-            Some(GraphicsHit::Ambiguous) => None,
-            None => None,
+        let refine_graphics = if let Some(GraphicsHit::Unique { index, count }) = graphics {
+            Some((index, count))
+        } else {
+            None
         };
         let mut word_tied = false;
         let mut frame_owns_click = false;
         if !is_generated_graphics
             && (refine_graphics.is_some() || (graphics.is_none() && self.word.is_some()))
         {
-            let mut target_frame = source_frame_range(&source, target.line);
+            let mut source_index = scope.file_index(&source, self.operation);
+            let mut target_frame =
+                tex::collected_lines(&source, target.line, "frame", &source_index.strict_ignored);
             let fragile_frame = target_frame
                 .as_ref()
-                .filter(|frame| is_fragile_frame(&source, frame))
+                .filter(|frame| is_fragile_frame(&source, &source_index.line_starts, frame))
                 .cloned();
             if !generated {
                 // Ordinary source refinement and document metadata need only
@@ -1822,12 +1673,13 @@ impl InverseQuery<'_> {
                 match &self.spliced_preamble {
                     Some(cached) => cached.clone(),
                     None => {
-                        let loaded = macro_preamble_source(
+                        let loaded = macro_preamble_source_with_scope(
                             &map.main,
                             Some(&map.inputs),
                             self.pdf.parent(),
                             &mut self.sources,
                             self.operation,
+                            scope,
                         )?
                         .map(Rc::new);
                         self.spliced_preamble = Some(loaded.clone());
@@ -1837,18 +1689,8 @@ impl InverseQuery<'_> {
             } else {
                 None
             };
-            let spliced_ref = spliced_preamble
-                .as_deref()
-                .map(|spliced| spliced.source.as_str());
-            let extra_sources: &[&str] = spliced_ref.as_slice();
-            let execution_root = || {
-                spliced_preamble
-                    .as_deref()
-                    .map(|spliced| tex::ExecutionRoot {
-                        source: &spliced.source,
-                        package_initialization: &spliced.package_initialization,
-                    })
-            };
+            let spliced_ref = spliced_preamble.as_ref().map(|rc| scope.arena.pin(rc));
+            let extra_sources: &[&'q str] = spliced_ref.as_slice();
             let fragile_body_proven = scope_proven
                 && fragile_frame.is_some()
                 && source_map
@@ -1856,34 +1698,31 @@ impl InverseQuery<'_> {
                     .and_then(|map| map.as_ref().ok())
                     .is_some_and(|map| map.generated.extension().is_some_and(|ext| ext == "vrb"));
             let mut opaque_word = false;
-            let mut word_outcome = |candidate: Result<tex::WordOutcome, ()>| {
-                candidate.unwrap_or_else(|()| {
+            let mut word_outcome = |outcome: tex::WordOutcome| {
+                if outcome == tex::WordOutcome::Opaque {
                     opaque_word = true;
-                    tex::WordOutcome::Absent
-                })
+                }
+                outcome
             };
+            let initial_source = Rc::clone(&source);
+            let analysis = scope.get(&initial_source, extra_sources, self.operation);
             let mut location = if let Some((index, count)) = refine_graphics {
                 source_graphics_location_with_context(
-                    &source,
+                    &analysis,
                     target.line,
-                    index,
-                    count,
+                    (index, count),
                     scope_proven,
                     frame_slide,
-                    extra_sources,
                     tex::WordLocationMode::Strict,
-                    None,
-                    self.operation,
                 )
             } else if let Some((context, offset)) = self.word {
                 let outcome = word_outcome(scoped_word_outcome(
-                    &source,
+                    &analysis,
                     target.line,
                     (context, offset),
                     self.radius,
-                    extra_sources,
                     (fragile_body_proven, scope_proven),
-                    self.operation,
+                    tex::WordLocationMode::Strict,
                 ));
                 word_tied = outcome == tex::WordOutcome::Tied;
                 outcome.location()
@@ -1904,10 +1743,12 @@ impl InverseQuery<'_> {
                         self.sources
                             .normalize(path)
                             .is_ok_and(|path| path == Path::new(&target.file))
-                            && fragile_frame_range(&source, *line).is_some_and(|frame| {
-                                *line == frame.end as u32
-                                    && !frame.contains(&(target.line.saturating_sub(1) as usize))
-                            })
+                            && fragile_frame_range_with_index(&source, *line, &source_index)
+                                .is_some_and(|frame| {
+                                    *line == frame.end as u32
+                                        && !frame
+                                            .contains(&(target.line.saturating_sub(1) as usize))
+                                })
                     })
             {
                 let geometry = self.source_map(None)?;
@@ -1938,43 +1779,41 @@ impl InverseQuery<'_> {
                     .and_then(|result| result.as_ref().ok())
                     .filter(|map| map.generated_at_point && map.page_source.is_some())
                 {
-                    match original_source_from_verbatim(map, &mut self.sources, self.operation) {
+                    match original_source_from_verbatim_with_scope(
+                        map,
+                        &mut self.sources,
+                        self.operation,
+                        scope,
+                    ) {
                         Ok((file, original, anchor)) => {
                             let frame_slide = map.frame_slide;
                             let mut original_tied = false;
+                            let original_analysis =
+                                scope.get(&original, extra_sources, self.operation);
                             let candidate = if let Some((index, count)) = refine_graphics {
                                 source_graphics_location_with_context(
-                                    &original,
+                                    &original_analysis,
                                     anchor,
-                                    index,
-                                    count,
+                                    (index, count),
                                     true,
                                     frame_slide,
-                                    extra_sources,
                                     tex::WordLocationMode::Strict,
-                                    None,
-                                    self.operation,
                                 )
                             } else if let Some((context, offset)) = self.word {
                                 let outcome = word_outcome(
                                     if map.generated.extension().is_some_and(|ext| ext == "vrb") {
-                                        source_word_location_in_frame_body_with_sources(
-                                            &original,
+                                        source_word_location_in_frame_body_with_analysis(
+                                            &original_analysis,
                                             anchor,
-                                            context,
-                                            offset,
-                                            extra_sources,
-                                            self.operation,
+                                            (context, offset),
                                         )
                                     } else {
-                                        source_word_location_with_sources(
-                                            &original,
+                                        source_word_location_with_analysis(
+                                            &original_analysis,
                                             anchor,
-                                            context,
-                                            offset,
+                                            (context, offset),
                                             self.radius,
-                                            extra_sources,
-                                            self.operation,
+                                            tex::WordLocationMode::Strict,
                                         )
                                     },
                                 );
@@ -1984,23 +1823,24 @@ impl InverseQuery<'_> {
                                 None
                             };
                             self.operation.check()?;
-                            if self.sources.warning(Path::new(&file)).is_none() {
-                                // The original frame's result replaces the host search's evidence.
-                                word_tied = original_tied;
-                                if let Some(candidate) = candidate {
-                                    target.file = file;
-                                    target.line = anchor;
-                                    source = original;
-                                    target_frame = source_frame_range(&source, target.line);
-                                    location = Some(candidate);
-                                }
+                            // The original frame's result replaces the host search's evidence.
+                            word_tied = original_tied;
+                            if let Some(candidate) = candidate {
+                                target.file = file;
+                                target.line = anchor;
+                                source = original;
+                                source_index = Rc::clone(&original_analysis.index);
+                                target_frame = tex::collected_lines(
+                                    &source,
+                                    target.line,
+                                    "frame",
+                                    &source_index.strict_ignored,
+                                );
+                                location = Some(candidate);
                             }
                         }
                         Err(error) => {
                             self.operation.check()?;
-                            if crate::source_snapshot::required_cache_error(&error) {
-                                return Err(error);
-                            }
                             warning = Some(format!(
                                 "line-only navigation: original fragile frame unavailable: {error}"
                             ));
@@ -2021,13 +1861,15 @@ impl InverseQuery<'_> {
                 && if location.is_some() {
                     target_frame.is_some()
                 } else {
-                    allows_metadata_fallback(
-                        &source,
-                        target.line,
-                        self.radius,
-                        self.point.y_from_top,
-                        self.point.page_height_pt,
-                    )
+                    target_frame.is_some()
+                        || allows_metadata_fallback_outside_frame(
+                            &source,
+                            &source_index.line_starts,
+                            target.line,
+                            self.radius,
+                            self.point.y_from_top,
+                            self.point.page_height_pt,
+                        )
                 }
             {
                 if self.metadata.is_none() {
@@ -2039,6 +1881,7 @@ impl InverseQuery<'_> {
                         offset,
                         &mut self.sources,
                         self.operation,
+                        scope,
                     )?);
                 }
                 if let Some((file, original, line, byte, score, arguments)) =
@@ -2052,41 +1895,48 @@ impl InverseQuery<'_> {
                             let prefix = text.get(..*byte).ok_or_else(|| {
                                 io::Error::other("source column is not a UTF-8 boundary")
                             })?;
-                            source_word_compiler_line(
+                            let metadata_index = scope.file_index(original, self.operation);
+                            source_word_compiler_line_with_index(
                                 original,
                                 *line,
                                 (prefix.chars().count() + 1) as u32,
+                                &metadata_index,
                             ) == anchor.line
                                 // A shared compiler line separates metadata from a tie only when
                                 // blanking its arguments leaves no located word or prose tie.
-                                && (!word_tied
-                                    || scoped_word_outcome(
-                                        &blank_source_words(original, arguments),
+                                && (!word_tied || {
+                                    let blanked = Rc::new(blank_source_words(original, arguments));
+                                    let blanked_analysis =
+                                        scope.get(&blanked, extra_sources, self.operation);
+                                    scoped_word_outcome(
+                                        &blanked_analysis,
                                         target.line,
                                         (context, offset),
                                         self.radius,
-                                        extra_sources,
                                         (fragile_body_proven, scope_proven),
-                                        self.operation,
-                                    ) == Ok(tex::WordOutcome::Absent))
+                                        tex::WordLocationMode::Strict,
+                                    ) == tex::WordOutcome::Absent
+                                })
                         }
                     } else {
                         false
                     }
                     && (location.is_none()
-                        || *score >= 6
-                            && metadata_beats_frame(
-                                &source,
+                        || *score >= 6 && {
+                            let frame_analysis = scope.get(&source, &[], self.operation);
+                            metadata_beats_frame(
+                                &frame_analysis,
                                 target.line,
                                 (context, offset),
                                 self.point.y_from_top,
                                 self.point.page_height_pt,
                                 *score,
-                                self.operation,
-                            ))
+                            )
+                        })
                 {
                     target.file = file.clone();
                     source = Rc::clone(original);
+                    source_index = scope.file_index(&source, self.operation);
                     location = Some((*line, *byte));
                 }
             }
@@ -2094,63 +1944,34 @@ impl InverseQuery<'_> {
             if location.is_none()
                 && !frame_owns_click
                 && self.sources.best_guess
-                && !spliced_preamble
-                    .as_deref()
-                    .is_some_and(|root| root.truncated)
                 && !generated
                 && warning.is_none()
             {
-                let mut guess_root = execution_root();
-                if let (Some(spliced), Some(root)) = (spliced_preamble.as_deref(), &mut guess_root)
-                {
-                    let file = self.sources.normalize(Path::new(&target.file))?;
-                    root.source = spliced.guess_source(&file);
-                }
-                let guess_source = guess_root.map(|root| root.source);
-                let guess_sources = guess_source.as_slice();
                 let candidate = if let Some((index, count)) = refine_graphics {
-                    Ok(source_graphics_location_with_context(
-                        &source,
+                    source_graphics_location_with_context(
+                        &analysis,
                         target.line,
-                        index,
-                        count,
+                        (index, count),
                         scope_proven,
                         frame_slide,
-                        guess_sources,
                         tex::WordLocationMode::Guess,
-                        guess_root,
-                        self.operation,
                     )
-                    .map(|(line, byte)| tex::UnverifiedWordLocation { line, byte }))
                 } else if let Some((context, offset)) = self.word {
-                    if scope_proven {
-                        tex::source_word_guess_with_sources(
-                            &source,
-                            target.line,
-                            context,
-                            offset,
-                            self.radius,
-                            guess_sources,
-                            self.operation,
-                        )
-                    } else {
-                        tex::source_word_guess_in_range_with_sources(
-                            &source,
-                            target.line,
-                            context,
-                            offset,
-                            target.line.saturating_sub(1) as usize..target.line as usize,
-                            false,
-                            guess_sources,
-                            self.operation,
-                        )
-                    }
+                    scoped_word_outcome(
+                        &analysis,
+                        target.line,
+                        (context, offset),
+                        self.radius,
+                        (false, scope_proven),
+                        tex::WordLocationMode::Guess,
+                    )
+                    .location()
                 } else {
-                    Ok(None)
+                    None
                 };
                 self.operation.check()?;
-                if let Ok(Some(candidate)) = candidate {
-                    location = Some((candidate.line, candidate.byte));
+                if let Some(candidate) = candidate {
+                    location = Some(candidate);
                 }
             }
             if let Some((line, byte)) = location {
@@ -2159,7 +1980,12 @@ impl InverseQuery<'_> {
                     .get(..byte)
                     .ok_or_else(|| io::Error::other("source column is not a UTF-8 boundary"))?;
                 let column_char = prefix.chars().count() + 1;
-                let compiler_line = source_word_compiler_line(&source, line, column_char as u32);
+                let compiler_line = source_word_compiler_line_with_index(
+                    &source,
+                    line,
+                    column_char as u32,
+                    &source_index,
+                );
                 if anchor.as_ref().is_some_and(|anchor| {
                     target.file == anchor.file
                         && (line == anchor.line
@@ -2191,43 +2017,26 @@ impl InverseQuery<'_> {
 }
 
 fn scoped_word_outcome(
-    source: &str,
+    analysis: &tex::SourceAnalysis<'_>,
     line: u32,
     (context, offset): (&str, usize),
     radius: u32,
-    extra_sources: &[&str],
     (fragile_body_proven, scope_proven): (bool, bool),
-    operation: &Operation,
-) -> Result<tex::WordOutcome, ()> {
+    mode: tex::WordLocationMode,
+) -> tex::WordOutcome {
     if fragile_body_proven {
-        source_word_location_in_frame_body_with_sources(
-            source,
-            line,
-            context,
-            offset,
-            extra_sources,
-            operation,
-        )
+        source_word_location_in_frame_body_with_analysis(analysis, line, (context, offset))
     } else if scope_proven {
-        source_word_location_with_sources(
-            source,
-            line,
-            context,
-            offset,
-            radius,
-            extra_sources,
-            operation,
-        )
+        source_word_location_with_analysis(analysis, line, (context, offset), radius, mode)
     } else {
-        source_word_location_in_range_with_sources(
-            source,
+        source_word_location_in_range_with_analysis(
+            analysis,
             line,
-            context,
-            offset,
+            (context, offset),
             line.saturating_sub(1) as usize..line as usize,
             false,
-            extra_sources,
-            operation,
+            mode,
+            None,
         )
     }
 }
@@ -2251,26 +2060,39 @@ fn blank_source_words(source: &str, spans: &[std::ops::Range<usize>]) -> String 
     blanked
 }
 
-fn source_word_compiler_line(source: &str, line: u32, column_char: u32) -> u32 {
-    frame_closing_line(source, line)
-        .or_else(|| tabularx_closing_line(source, line))
-        .or_else(|| {
-            // An enclosing collector, math body or run-in heading ships after inner wrappers.
-            collected_text_closing_line(source, line, column_char)
-                .max(tex::reference_argument_closing_line(
-                    source,
-                    line,
-                    column_char,
-                ))
-                .max(math::math_closing_line(source, line, column_char))
-                .max(tex::run_in_heading_compiler_line(source, line, column_char))
-                .max(tex::line_start_word_compiler_line(
-                    source,
-                    line,
-                    column_char,
-                ))
-        })
-        .unwrap_or(line)
+fn source_word_compiler_line_with_index(
+    source: &str,
+    line: u32,
+    column: u32,
+    index: &tex::SourceFileIndex,
+) -> u32 {
+    collected_closing_line(source, (line, column), index, |spans| {
+        // An enclosing collector, math body or run-in heading ships after inner wrappers.
+        [
+            tex::argument_closing_line_with_spans,
+            tex::run_in_heading_compiler_line_with_spans,
+            tex::line_start_word_compiler_line_with_spans,
+        ]
+        .into_iter()
+        .filter_map(|closing| closing(source, line, column, spans))
+        .max()
+    })
+    .unwrap_or(line)
+}
+
+/// Compiler line shipping a collected frame/`tabularx` body, else the latest of the
+/// enclosing display-math body and the `inner` collectors' closing lines.
+fn collected_closing_line(
+    source: &str,
+    (line, column): (u32, u32),
+    index: &tex::SourceFileIndex,
+    inner: impl FnOnce(&[Span]) -> Option<u32>,
+) -> Option<u32> {
+    tex::collected_environment_closing_line(source, line, &index.strict_ignored).or_else(|| {
+        let spans = &index.strict_spans;
+        let math = math::math_closing_line_with_spans(source, line, column, spans);
+        inner(spans).max(math)
+    })
 }
 
 fn validate_source_line(source: &str, line: u32) -> io::Result<&str> {
@@ -2310,16 +2132,14 @@ pub(crate) fn validate_forward_source_position(
     Ok(text)
 }
 
-fn allows_metadata_fallback(
+fn allows_metadata_fallback_outside_frame(
     source: &str,
+    line_starts: &tex::LineIndex,
     line: u32,
     radius: u32,
     y_from_top: f32,
     page_height_pt: f32,
 ) -> bool {
-    if source_frame_range(source, line).is_some() {
-        return true;
-    }
     if page_height_pt > 0.0
         && (y_from_top <= page_height_pt * 0.12 || y_from_top >= page_height_pt * 0.88)
     {
@@ -2327,9 +2147,8 @@ fn allows_metadata_fallback(
     }
     let start = line.saturating_sub(radius.saturating_add(1)) as usize;
     let end = (line as usize).saturating_add(radius as usize);
-    source
+    source[line_starts.row_start(start, source.len())..]
         .lines()
-        .skip(start)
         .take(end.saturating_sub(start))
         .any(|row| {
             let text = source_line_text(row);
@@ -2340,48 +2159,39 @@ fn allows_metadata_fallback(
 /// A frame title and the running document title may contain the same words.
 /// Preserve a local frame hit except when a footer has stronger metadata context.
 fn metadata_beats_frame(
-    source: &str,
+    analysis: &tex::SourceAnalysis<'_>,
     line: u32,
     (context, offset): (&str, usize),
     y_from_top: f32,
     page_height_pt: f32,
     metadata_score: isize,
-    operation: &Operation,
 ) -> bool {
-    let Some(frame) = source_frame_range(source, line) else {
+    let Some(frame) =
+        tex::collected_lines(analysis.source, line, "frame", &analysis.strict_ignored)
+    else {
         return false;
     };
     y_from_top >= page_height_pt / 2.0
-        && source_prose_scored_location(
-            source,
+        && source_prose_scored_location_with_analysis(
+            analysis,
             line,
-            context,
-            offset,
+            (context, offset),
             frame,
             true,
-            &nonprinting_source_ranges(source),
             None,
-            operation,
         )
         .is_some_and(|(_, _, local_score)| metadata_score >= local_score)
 }
 
 fn read_source(path: &Path) -> io::Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    read_source_file(file)
-}
-
-pub(crate) fn read_source_file(file: fs::File) -> io::Result<String> {
+    let file = crate::source_snapshot::open_regular(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            io::Error::other("source refinement requires a regular file")
+        } else {
+            e
+        }
+    })?;
     let mut bytes = Vec::new();
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other(
-            "source refinement requires a regular file",
-        ));
-    }
     file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > 2 * 1024 * 1024 {
         return Err(io::Error::new(
@@ -2510,21 +2320,19 @@ pub(crate) fn open_synctex_with_path_in(
 ) -> io::Result<(Box<dyn BufRead>, PathBuf)> {
     let mut last_not_found = None;
     for (candidate, _) in synctex_candidates(pdf, build_directory) {
-        match crate::source_snapshot::open_regular(&candidate, false) {
-            Ok(file) => return Ok((decode_synctex_file(file, 128 * 1024 * 1024 + 1)?, candidate)),
+        match crate::source_snapshot::open_regular(&candidate) {
+            Ok(file) => {
+                return Ok((
+                    decode_synctex_file(file, crate::parser::MAX_SYNCTEX_BYTES as u64 + 1)?,
+                    candidate,
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
             Err(error) => return Err(error),
         }
     }
     Err(last_not_found
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no SyncTeX companion file")))
-}
-
-pub(crate) fn open_synctex_in(
-    pdf: &Path,
-    build_directory: Option<&Path>,
-) -> io::Result<Box<dyn BufRead>> {
-    open_synctex_with_path_in(pdf, build_directory).map(|(reader, _)| reader)
 }
 
 fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
@@ -2536,7 +2344,6 @@ fn synctex_node_link(row: &str) -> Option<(u32, u32)> {
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn read_source_map_in(
     pdf: &Path,
     point: InversePoint,
@@ -2544,10 +2351,10 @@ fn read_source_map_in(
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
-    snapshot: Option<&SourceSnapshot>,
     build_directory: Option<&Path>,
 ) -> io::Result<SourceMap> {
     let (reader, sidecar_path) = open_synctex_with_path_in(pdf, build_directory)?;
+    let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
     source_map_from_reader_in(
         reader,
         pdf,
@@ -2556,8 +2363,7 @@ fn read_source_map_in(
         geometry_required,
         operation,
         input_cwd,
-        snapshot,
-        sidecar_path.parent(),
+        sidecar_dir.as_deref(),
     )
 }
 
@@ -2567,21 +2373,9 @@ fn source_map_from_reader(
     pdf: &Path,
     point: InversePoint,
     generated: &Path,
-    geometry_required: bool,
     operation: &Operation,
-    input_cwd: Option<&Path>,
 ) -> io::Result<SourceMap> {
-    source_map_from_reader_in(
-        reader,
-        pdf,
-        point,
-        generated,
-        geometry_required,
-        operation,
-        input_cwd,
-        None,
-        None,
-    )
+    source_map_from_reader_in(reader, pdf, point, generated, true, operation, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2593,10 +2387,9 @@ fn source_map_from_reader_in(
     geometry_required: bool,
     operation: &Operation,
     input_cwd: Option<&Path>,
-    snapshot: Option<&SourceSnapshot>,
     sidecar_dir: Option<&Path>,
 ) -> io::Result<SourceMap> {
-    let mut reader = reader.take(128 * 1024 * 1024 + 1);
+    let mut reader = reader.take(crate::parser::MAX_SYNCTEX_BYTES as u64 + 1);
     let mut inputs = std::collections::HashMap::new();
     let mut generated_tags = std::collections::HashSet::new();
     let mut row = String::new();
@@ -2624,6 +2417,13 @@ fn source_map_from_reader_in(
     let mut bytes_read = 0;
     let mut lines = 0usize;
     let mut last_v = -1.0;
+    let current_dir = if input_cwd.is_none() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)))
+    } else {
+        None
+    };
     loop {
         if lines & 1023 == 0 {
             operation.check()?;
@@ -2632,17 +2432,13 @@ fn source_map_from_reader_in(
         row.clear();
         let count = reader.read_line(&mut row)?;
         bytes_read += count;
-        if bytes_read >= 128 * 1024 * 1024 {
+        if bytes_read >= crate::parser::MAX_SYNCTEX_BYTES {
             return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
         }
         if count == 0 {
             break;
         }
-        let row = if input_cwd.is_some() {
-            row.trim_end_matches(['\r', '\n'])
-        } else {
-            row.trim_end()
-        };
+        let row = row.trim_end_matches(['\r', '\n']);
         if (geometry_required || input_cwd.is_some()) && row == "Postamble:" {
             postamble = true;
         } else if (geometry_required || input_cwd.is_some())
@@ -2650,6 +2446,7 @@ fn source_map_from_reader_in(
             && let Some(value) = row.strip_prefix("Count:")
         {
             value
+                .trim()
                 .parse::<u32>()
                 .map_err(|_| io::Error::other("SyncTeX postamble has invalid Count"))?;
             postamble_count = true;
@@ -2694,6 +2491,7 @@ fn source_map_from_reader_in(
         };
         if geometry_required && let Some(tag) = row.strip_prefix('<') {
             let tag = tag
+                .trim()
                 .parse::<u32>()
                 .ok()
                 .filter(|tag| *tag > 0)
@@ -2727,9 +2525,7 @@ fn source_map_from_reader_in(
                             "invalid SyncTeX input path",
                         ));
                     }
-                    if let Some(snapshot) = snapshot {
-                        snapshot.normalize(path)?
-                    } else if fs::symlink_metadata(&joined).is_err() {
+                    if fs::symlink_metadata(&joined).is_err() {
                         crate::source_snapshot::resolve_relative_input(
                             path,
                             None,
@@ -2741,9 +2537,6 @@ fn source_map_from_reader_in(
                         joined
                     }
                 } else {
-                    let current_dir = std::env::current_dir()
-                        .ok()
-                        .and_then(|dir| fs::canonicalize(&dir).ok().or(Some(dir)));
                     crate::source_snapshot::resolve_relative_input(
                         path,
                         current_dir.as_deref(),
@@ -2781,7 +2574,7 @@ fn source_map_from_reader_in(
                 ));
             }
         } else if let Some(page) = row.strip_prefix('{') {
-            let parsed_page = page.parse::<u32>().ok();
+            let parsed_page = page.trim().parse::<u32>().ok();
             in_page = parsed_page == Some(point.page);
             if in_page && page_complete {
                 return Err(io::Error::other(
@@ -2790,7 +2583,7 @@ fn source_map_from_reader_in(
             }
             active_sheet = parsed_page.map(|p| (p, None));
         } else if in_page && row.starts_with('}') {
-            if row[1..].parse::<u32>() != Ok(point.page) || !stack.is_empty() {
+            if row[1..].trim().parse::<u32>() != Ok(point.page) || !stack.is_empty() {
                 return Err(io::Error::other(
                     "SyncTeX source map has mismatched sheet bounds",
                 ));
@@ -2877,7 +2670,7 @@ fn source_map_from_reader_in(
         } else if let Some((_, sheet_origin)) = &mut active_sheet {
             if let Some(page) = row.strip_prefix('}') {
                 if let Some((p, Some(orig))) = active_sheet.take()
-                    && page.parse::<u32>() == Ok(p)
+                    && page.trim().parse::<u32>() == Ok(p)
                 {
                     sheet_origins.push((p, orig));
                 }
@@ -3022,10 +2815,11 @@ fn source_map_from_reader_in(
 /// Beamer reopens the same .vrb for successive fragile frames. The clicked
 /// sheet's enclosing source-map box identifies the original frame; the final
 /// generated file's contents cannot establish that identity.
-fn original_source_from_verbatim(
+fn original_source_from_verbatim_with_scope<'q>(
     map: &SourceMap,
     sources: &mut QuerySources<'_>,
-    operation: &Operation,
+    operation: &'q Operation,
+    scope: QueryAnalysisScope<'q>,
 ) -> io::Result<(String, Rc<String>, u32)> {
     let (original, line) = map.page_source.as_ref().ok_or_else(|| {
         io::Error::other("clicked sheet has no original generated-file provenance")
@@ -3035,26 +2829,42 @@ fn original_source_from_verbatim(
             "clicked sheet does not identify a fragile frame's closing line",
         ));
     }
-    let original = sources.normalize(original)?;
-    let source = sources.read(&original, operation)?;
-    validate_inverse_source_line(&source, *line, &original)?;
-    fragile_frame_range(&source, *line)
+    let (original, source) = read_original_source(original, *line, sources, operation)?;
+    let index = scope.file_index(&source, operation);
+    fragile_frame_range_with_index(&source, *line, &index)
         .filter(|frame| *line == frame.end as u32)
         .ok_or_else(|| {
             io::Error::other("clicked sheet does not identify a fragile frame's closing line")
         })?;
-    let file = original
-        .to_str()
-        .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
-        .to_owned();
-    Ok((file, source, *line))
+    Ok((original_source_file(original)?, source, *line))
 }
 
-fn original_source_from_generated(
+/// Reads a normalized original source whose `line` must be in range.
+fn read_original_source(
+    path: &Path,
+    line: u32,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<(PathBuf, Rc<String>)> {
+    let original = sources.normalize(path)?;
+    let source = sources.read(&original, operation)?;
+    validate_inverse_source_line(&source, line, &original)?;
+    Ok((original, source))
+}
+
+fn original_source_file(original: PathBuf) -> io::Result<String> {
+    original
+        .into_os_string()
+        .into_string()
+        .map_err(|_| io::Error::other("original fragile source path is not UTF-8"))
+}
+
+fn original_source_from_generated<'q>(
     map: &SourceMap,
     raw_line: u32,
     sources: &mut QuerySources<'_>,
-    operation: &Operation,
+    operation: &'q Operation,
+    scope: QueryAnalysisScope<'q>,
 ) -> io::Result<(String, Rc<String>, u32)> {
     let generated_norm = sources
         .normalize(&map.generated)
@@ -3068,15 +2878,16 @@ fn original_source_from_generated(
         if is_generated_or_sidecar_input(candidate) {
             continue;
         }
-        let original = sources.normalize(candidate)?;
-        let source = sources.read(&original, operation)?;
-        validate_inverse_source_line(&source, *line, &original)?;
-        if host_owns_generated_sidecar(&source, &original, &generated_norm, main_dir.as_deref()) {
-            let file = original
-                .to_str()
-                .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
-                .to_owned();
-            return Ok((file, source, *line));
+        let (original, source) = read_original_source(candidate, *line, sources, operation)?;
+        let index = scope.file_index(&source, operation);
+        if tex::host_owns_generated_sidecar_with_spans(
+            &source,
+            &original,
+            &generated_norm,
+            main_dir.as_deref(),
+            &index.strict_spans,
+        ) {
+            return Ok((original_source_file(original)?, source, *line));
         }
     }
     let (original, page_line) = map.page_source.as_ref().ok_or_else(|| {
@@ -3087,39 +2898,52 @@ fn original_source_from_generated(
     } else {
         (original, *page_line)
     };
-    let original = sources.normalize(target_path)?;
-    let source = sources.read(&original, operation)?;
-    validate_inverse_source_line(&source, line, &original)?;
-    let file = original
-        .to_str()
-        .ok_or_else(|| io::Error::other("original fragile source path is not UTF-8"))?
-        .to_owned();
-    Ok((file, source, line))
+    let (original, source) = read_original_source(target_path, line, sources, operation)?;
+    Ok((original_source_file(original)?, source, line))
 }
 
-fn fragile_frame_range(source: &str, line: u32) -> Option<std::ops::Range<usize>> {
-    source_frame_range(source, line).filter(|frame| is_fragile_frame(source, frame))
+fn fragile_frame_range_with_index(
+    source: &str,
+    line: u32,
+    index: &tex::SourceFileIndex,
+) -> Option<std::ops::Range<usize>> {
+    tex::collected_lines(source, line, "frame", &index.strict_ignored)
+        .filter(|frame| is_fragile_frame(source, &index.line_starts, frame))
 }
 
-fn is_fragile_frame(source: &str, frame: &std::ops::Range<usize>) -> bool {
-    let Some(mut at) = crate::tex::frame_header_after_begin(source, frame.start) else {
+fn is_fragile_frame(
+    source: &str,
+    line_starts: &tex::LineIndex,
+    frame: &std::ops::Range<usize>,
+) -> bool {
+    let Some(mut at) = crate::tex::frame_header_after_begin(
+        source,
+        line_starts.row_start(frame.start, source.len()),
+    ) else {
         return false;
     };
-    at = skip_source_space(source, at);
-    if source.as_bytes().get(at) == Some(&b'<') {
-        let Some(end) = source[at..].find('>') else {
-            return false;
-        };
-        at = skip_source_space(source, at + end + 1);
+    let mut saw_default_overlay = false;
+    let mut saw_options = false;
+    let mut fragile = false;
+    while let Some((header, end)) =
+        crate::tex::next_frame_option_group(source, at, &mut saw_default_overlay, &mut saw_options)
+    {
+        // A default-overlay group `[<...>]` holds no frame options.
+        if saw_options {
+            // A later assignment replaces an earlier one.
+            crate::tex::for_each_frame_option(
+                &source[header.start + 1..header.end - 1],
+                |key, value| {
+                    if key == "fragile" {
+                        fragile = value != Some("false");
+                    }
+                    false
+                },
+            );
+        }
+        at = end;
     }
-    let Some(end) = optional_argument_end(source, at) else {
-        return false;
-    };
-    let options = &source[at + 1..end - 1];
-    options.split(',').flat_map(str::lines).any(|option| {
-        let option = source_line_text(option).trim();
-        option == "fragile" || option.starts_with("fragile=")
-    })
+    fragile
 }
 
 fn input_candidates(
@@ -3175,6 +2999,31 @@ fn input_candidates(
         .collect()
 }
 
+/// The normalized main source of a preamble scan and the other compiled inputs, or `None`
+/// when the main source cannot be normalized or read.
+#[allow(clippy::type_complexity)]
+fn preamble_root(
+    main: &Path,
+    compiled_inputs: Option<&[PathBuf]>,
+    sources: &mut QuerySources<'_>,
+    operation: &Operation,
+) -> io::Result<Option<(PathBuf, Rc<String>, Option<Vec<PathBuf>>)>> {
+    operation.check()?;
+    let Ok(main) = sources.normalize(main) else {
+        return Ok(None);
+    };
+    let Ok(source) = sources.read(&main, operation) else {
+        return operation.check().map(|()| None);
+    };
+    let compiled = compiled_inputs.map(|inputs| {
+        let normalized = inputs
+            .iter()
+            .filter_map(|path| sources.normalize(path).ok());
+        normalized.filter(|path| path != &main).collect()
+    });
+    Ok(Some((main, source, compiled)))
+}
+
 fn preamble_sources(
     main: &Path,
     compiled_inputs: Option<&[PathBuf]>,
@@ -3182,71 +3031,48 @@ fn preamble_sources(
     sources: &mut QuerySources<'_>,
     operation: &Operation,
 ) -> io::Result<Vec<(PathBuf, Rc<String>)>> {
-    operation.check()?;
-    let Ok(main) = sources.normalize(main) else {
+    let Some((main, main_source, compiled)) =
+        preamble_root(main, compiled_inputs, sources, operation)?
+    else {
         return Ok(Vec::new());
     };
-    if sources.warning(&main).is_some() {
-        return Ok(Vec::new());
-    }
-    let main_source = match sources.read(&main, operation) {
-        Ok(source) => source,
-        Err(error) if crate::source_snapshot::required_cache_error(&error) => return Err(error),
-        Err(_) => {
-            operation.check()?;
-            return Ok(Vec::new());
+    let main_dir = main.parent().unwrap_or_else(|| Path::new("")).to_owned();
+    let mut imports = Vec::new();
+    for raw_row in main_source.split_inclusive('\n') {
+        let row = raw_row.trim_end_matches(['\r', '\n']);
+        let visible = source_line_text(row);
+        if visible.contains("\\begin{document}") {
+            break;
         }
-    };
-    let compiled: Option<Vec<PathBuf>> = compiled_inputs.map(|inputs| {
-        inputs
-            .iter()
-            .filter_map(|p| sources.normalize(p).ok())
-            .filter(|p| p != &main)
-            .collect()
-    });
-    let main_dir = main.parent().unwrap_or_else(|| Path::new(""));
-    let mut files = vec![(main.clone(), main_source)];
-    let inputs: Vec<_> = files[0]
-        .1
-        .lines()
-        .take_while(|row| !source_line_text(row).contains("\\begin{document}"))
-        .filter_map(|row| {
-            source_line_text(row)
-                .trim()
-                .strip_prefix("\\input{")
-                .and_then(|rest| rest.split_once('}'))
-                .map(|(name, _)| name.to_owned())
-        })
-        .take(8)
-        .collect();
-    for name in inputs {
+        if let Some(rest) = visible.trim().strip_prefix("\\input{")
+            && let Some((name, _)) = rest.split_once('}')
+        {
+            imports.push(name.to_owned());
+            if imports.len() >= 8 {
+                break;
+            }
+        }
+    }
+    let mut files = vec![(main, main_source)];
+    for name in imports {
         operation.check()?;
-        let clean_name = source_line_text(&name).trim();
+        let clean_name = source_line_text(&name).trim().to_owned();
         if clean_name.is_empty() || clean_name.contains('\\') {
             continue;
         }
-        let candidates = input_candidates(
-            clean_name,
-            "tex",
-            &[
-                Some(main_dir),
-                pdf_dir,
-                sources.sidecar_dir.as_deref(),
-                sources.snapshot.map(|s| s.cwd.as_path()),
-            ],
-            compiled.as_deref(),
-            sources,
-        );
-        let mut readable = Vec::with_capacity(candidates.len());
+        let bases = [
+            Some(&main_dir as &Path),
+            pdf_dir,
+            sources.sidecar_dir.as_deref(),
+        ];
+        let candidates = input_candidates(&clean_name, "tex", &bases, compiled.as_deref(), sources);
+        let mut readable = Vec::new();
         for cand in candidates {
-            if files.iter().any(|(known, _)| *known == cand) || sources.warning(&cand).is_some() {
+            if files.iter().any(|(known, _)| known == &cand) {
                 continue;
             }
             match sources.read(&cand, operation) {
                 Ok(source) => readable.push((cand, source)),
-                Err(error) if crate::source_snapshot::required_cache_error(&error) => {
-                    return Err(error);
-                }
                 Err(_) => operation.check()?,
             }
         }
@@ -3257,670 +3083,118 @@ fn preamble_sources(
     Ok(files)
 }
 
-struct SplicedSource {
-    source: String,
-    inputs: Vec<PathBuf>,
-    input_ends: Vec<Option<usize>>,
-    ambiguous_inputs: bool,
-    package_initialization: Vec<std::ops::Range<usize>>,
-    truncated: bool,
-    /// Normalized SyncTeX inputs: one entry per file opening, including reruns.
-    compiled: Option<Vec<PathBuf>>,
-}
-
-impl SplicedSource {
-    fn opaque() -> Self {
-        Self {
-            source: "\\csname **\\endcsname\n".to_owned(),
-            inputs: Vec::new(),
-            input_ends: Vec::new(),
-            ambiguous_inputs: true,
-            package_initialization: Vec::new(),
-            truncated: false,
-            compiled: None,
-        }
-    }
-
-    fn guess_source(&self, file: &Path) -> &str {
-        if !self.ambiguous_inputs {
-            let mut occurrences = self
-                .inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, path)| *path == file);
-            if let Some((index, _)) = occurrences.next()
-                && index > 0
-                && occurrences.next().is_none()
-                && let Some(end) = self.input_ends[index]
-                && match &self.compiled {
-                    // Every execution of the clicked file opens it, however it is spelled.
-                    Some(compiled) => compiled_once(compiled, file),
-                    None => !may_rerun_later(&self.source[end..], file),
-                }
-            {
-                return &self.source[..end];
-            }
-        }
-        &self.source
-    }
-}
-
-fn compiled_once(compiled: &[PathBuf], file: &Path) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    // Default macOS/Windows filesystems fold case and Unicode normalization.
-    let fold = |path: &Path| {
-        path.to_string_lossy()
-            .nfc()
-            .collect::<String>()
-            .to_lowercase()
-    };
-    let name = |path: &Path| path.file_name().map(|name| fold(Path::new(name)));
-    // Spellings may not resolve here (e.g. output-directory builds); count every
-    // opening of the same file name so none can hide a rerun.
-    let file_name = name(file);
-    compiled
-        .iter()
-        .filter(|path| name(path) == file_name)
-        .count()
-        == 1
-}
-
-/// Without compiled inputs, unfollowed commands (`\subfile`, `\import`, `\@input`, ...) may execute the
-/// clicked file again, directly or through another file, after later mutations.
-/// Any such loader, encoded token, or later mention of its name keeps full context.
-fn may_rerun_later(rest: &str, file: &Path) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    const LOADERS: [&str; 14] = [
-        "subfile",
-        "import",
-        "subimport",
-        "inputfrom",
-        "includefrom",
-        "subinputfrom",
-        "subincludefrom",
-        "InputIfFileExists",
-        "IfFileExists",
-        "@input",
-        "@@input",
-        "@iinput",
-        "includestandalone",
-        "loadsubfile",
-    ];
-    let Some(stem) = file.file_stem().and_then(|stem| stem.to_str()) else {
-        return true;
-    };
-    if rest.contains("^^")
-        || LOADERS
-            .iter()
-            .any(|name| rest.contains(&format!("\\{name}")))
-    {
-        return true;
-    }
-    // Default macOS/Windows filesystems fold case and Unicode normalization.
-    let fold = |text: &str| text.nfc().collect::<String>().to_lowercase();
-    let (rest, stem) = (fold(rest), fold(stem));
-    let word = |byte: Option<&u8>| byte.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
-    rest.match_indices(&stem).any(|(start, _)| {
-        !word(
-            start
-                .checked_sub(1)
-                .and_then(|before| rest.as_bytes().get(before)),
-        ) && !word(rest.as_bytes().get(start + stem.len()))
-    })
-}
-
-#[derive(Default)]
-struct SpliceState {
-    visited: Vec<PathBuf>,
-    ancestors: [usize; 9],
-    inputs: Vec<PathBuf>,
-    input_ends: Vec<Option<usize>>,
-    ambiguous_inputs: bool,
-    local_definitions: std::collections::BTreeSet<String>,
-    package_definitions: std::collections::BTreeSet<String>,
-    package_ranges: Vec<std::ops::Range<usize>>,
-    truncated: bool,
-    out: String,
-}
-
-fn macro_preamble_source(
+fn macro_preamble_source_with_scope<'q>(
     main: &Path,
     compiled_inputs: Option<&[PathBuf]>,
     pdf_dir: Option<&Path>,
     sources: &mut QuerySources<'_>,
-    operation: &Operation,
-) -> io::Result<Option<SplicedSource>> {
-    operation.check()?;
-    let Ok(main) = sources.normalize(main) else {
-        return Ok(Some(SplicedSource::opaque()));
+    operation: &'q Operation,
+    scope: QueryAnalysisScope<'q>,
+) -> io::Result<Option<String>> {
+    let Some((main, main_source, compiled)) =
+        preamble_root(main, compiled_inputs, sources, operation)?
+    else {
+        return Ok(None);
     };
-    if sources.warning(&main).is_some() {
-        return Ok(Some(SplicedSource::opaque()));
-    }
-    let main_source = match sources.read(&main, operation) {
-        Ok(source) => source,
-        Err(error) if crate::source_snapshot::required_cache_error(&error) => return Err(error),
-        Err(_) => {
-            operation.check()?;
-            return Ok(Some(SplicedSource::opaque()));
-        }
-    };
-    let mut unresolved = Vec::new();
-    let compiled: Option<Vec<PathBuf>> = compiled_inputs.map(|inputs| {
-        let mut compiled = Vec::new();
-        for path in inputs {
-            match sources.normalize(path) {
-                Ok(normalized) if normalized != main => compiled.push(normalized),
-                Ok(_) => {}
-                // Unresolvable spellings still record an opening; keep them for rerun counts.
-                Err(_) => unresolved.push(path.clone()),
-            }
-        }
-        compiled
-    });
     let main_dir = main.parent().unwrap_or_else(|| Path::new(""));
-    let mut state = SpliceState {
-        visited: vec![main.clone()],
-        out: String::with_capacity(main_source.len()),
-        ..Default::default()
-    };
+    let main_index = scope.file_index(&main_source, operation);
+    let mut visited = vec![main.clone()];
+    let mut out = String::with_capacity(main_source.len());
     let mut in_preamble = true;
     append_spliced_source(
-        &main,
-        &main_source,
+        (&main, &main_source, &main_index.strict_spans),
         main_dir,
         compiled.as_deref(),
         pdf_dir,
+        (0, false, &mut in_preamble),
+        &mut visited,
         sources,
-        operation,
-        &mut state,
-        0,
-        &mut in_preamble,
-        false,
-        false,
-        false,
-        true,
+        (operation, scope),
+        &mut out,
     )?;
-    Ok((!state.out.is_empty()).then_some(SplicedSource {
-        source: state.out,
-        inputs: state.inputs,
-        input_ends: state.input_ends,
-        ambiguous_inputs: state.ambiguous_inputs,
-        package_initialization: state.package_ranges,
-        truncated: state.truncated,
-        compiled: compiled.map(|mut compiled| {
-            compiled.extend(unresolved);
-            compiled
-        }),
-    }))
+    Ok((!out.is_empty()).then_some(out))
 }
 
-// An open input scope invalidates later package-origin classification, not source bytes.
+/// `spans` are the source's precomputed strict nonprinting spans; `scope` caches
+/// them for spliced children.
 #[allow(clippy::too_many_arguments)]
-fn append_spliced_source(
-    path: &Path,
-    source: &str,
+fn append_spliced_source<'q>(
+    (path, source, spans): (&Path, &str, &[Span]),
     main_dir: &Path,
     compiled: Option<&[PathBuf]>,
     pdf_dir: Option<&Path>,
+    (depth, poisoned_scope, in_preamble): (usize, bool, &mut bool),
+    visited: &mut Vec<PathBuf>,
     sources: &mut QuerySources<'_>,
-    operation: &Operation,
-    state: &mut SpliceState,
-    depth: usize,
-    in_preamble: &mut bool,
-    poisoned_scope: bool,
-    package_initialization: bool,
-    mut imported_scope_poisoned: bool,
-    transparent: bool,
-) -> io::Result<bool> {
+    (operation, scope): (&'q Operation, QueryAnalysisScope<'q>),
+    out: &mut String,
+) -> io::Result<()> {
     operation.check()?;
-    if depth >= state.ancestors.len() || state.visited.len() >= 32 {
-        state.truncated = true;
-        state.out.push_str("\\csname **\\endcsname\n");
-        return Ok(true);
+    if depth >= 8 || visited.len() >= 32 {
+        return Ok(());
     }
-    state.ancestors[depth] = state.visited.len() - 1;
-    let input_index = state.inputs.len();
-    state.inputs.push(path.to_owned());
-    state.input_ends.push(None);
-    let macros = math::macros_from_sources(&[source], operation);
-    operation.check()?;
-    if package_initialization {
-        for &name in macros.keys() {
-            if tex::known_formatting_switch(name) && !state.local_definitions.contains(name) {
-                state.local_definitions.insert(name.to_owned());
-            }
-            // Readable package signatures may be delimited or redefine kernel shapes.
-            if !state.package_definitions.contains(name) {
-                state.package_definitions.insert(name.to_owned());
-            }
-        }
-        let mut commands = source
-            .match_indices('\\')
-            .map(|(start, _)| math::command(source, start));
-        if commands.any(|(cmd, end)| {
-            matches!(
-                cmd,
-                "catcode"
-                    | "active"
-                    | "newunicodechar"
-                    | "DeclareUnicodeCharacter"
-                    | "defineshorthand"
-                    | "useshorthands"
-                    | "declare"
-                    | "initiate"
-                    | "MakeShortVerb"
-            ) || (math::is_macro_definition_command(cmd) && cmd != "csname")
-                && !defines_control_sequence(source, end)
-        }) {
-            state.package_definitions.insert("~".to_owned());
-        }
-        // Constructed or expl3 definitions are invisible to the signature table.
-        if [
-            "csname",
-            "ExplSyntax",
-            "ProvidesExpl",
-            "cs_new",
-            "cs_set",
-            "cs_gset",
-            "namedef",
-            "\\csdef",
-            "\\csgdef",
-            "\\csedef",
-            "\\csxdef",
-            "\\letcs",
-            "\\cslet",
-            "\\expandafter",
-        ]
-        .iter()
-        .any(|marker| source.contains(marker))
-        {
-            state.package_definitions.insert("**".to_owned());
-        }
+    if poisoned_scope {
+        out.push_str("{\n");
     }
-    // Rebound environment delimiters require preserving the raw imported text.
-    let raw_source = macros.contains_key("begin") && macros.contains_key("end");
-    let mut raw_preamble = *in_preamble;
-    let in_preamble = if raw_source {
-        &mut raw_preamble
-    } else {
-        in_preamble
-    };
-    let guess_macros = ((transparent && !raw_source) || (depth > 0 && !package_initialization))
-        .then(|| math::macros_from_sources_for_guess(&[source], operation));
-    operation.check()?;
-    let signatures = if raw_source {
-        &macros
-    } else {
-        guess_macros.as_ref().unwrap_or(&macros)
-    };
-    let declared_environments: std::collections::BTreeSet<_> =
-        if depth > 0 && !package_initialization {
-            tex::nonprinting_source_spans(source)
-                .filter_map(|(start, _, _)| {
-                    operation.check().ok()?;
-                    if source.as_bytes().get(start) != Some(&b'\\') {
-                        return None;
-                    }
-                    let (command, end) = math::command(source, start);
-                    tex::environment_definition_command(command).then(|| {
-                        tex::environment_definition(source, command, end)
-                            .map_or("**", |(name, _, _)| name)
-                    })
-                })
-                .collect()
-        } else {
-            Default::default()
-        };
-    // shortcut: prove only same-file leaf bodies; model local dependencies before widening.
-    let mut body_budget = source.len();
-    let benign_local_calls: std::collections::BTreeSet<_> = if depth > 0 && !package_initialization
-    {
-        guess_macros
-            .as_ref()
-            .unwrap_or(&macros)
-            .iter()
-            .filter_map(|(&name, definition)| {
-                let body = definition.as_ref()?.body?;
-                body_budget = body_budget.checked_sub(body.len())?;
-                if state.local_definitions.contains(name)
-                    || declared_environments.contains("**")
-                    || body.contains('^')
-                {
-                    return None;
-                }
-                body.match_indices('\\')
-                    .all(|(start, _)| {
-                        if operation.check().is_err() {
-                            return false;
-                        }
-                        let (command, _) = math::command(body, start);
-                        tex::known_formatting_switch(command)
-                            && !macros.contains_key(command)
-                            && !state.local_definitions.contains(command)
-                            && !declared_environments.contains(command)
-                    })
-                    .then_some(name)
-            })
-            .collect()
-    } else {
-        Default::default()
-    };
-    operation.check()?;
-    // shortcut: control-sequence bodies may consume extra tokens; keep full context until modeled.
-    let opaque_calls: Option<std::collections::BTreeSet<_>> =
-        (transparent && !raw_source).then(|| {
-            signatures
-                .iter()
-                .filter(|(_, definition)| {
-                    definition.is_none_or(|definition| {
-                        definition.body.is_none_or(|body| body.contains('\\'))
-                    })
-                })
-                .map(|(&name, _)| name)
-                .collect()
-        });
-    let mut local_environments = std::collections::BTreeSet::new();
-    let mut argument_end = 0;
-    let mut argument_budget = source.len();
-    let mut document_scope = false;
-    if poisoned_scope && !raw_source {
-        state.out.push_str("{\n");
-    }
-    let mut nonprinting = tex::nonprinting_source_spans(source).peekable();
+    let mut nonprinting = std::borrow::Cow::Borrowed(spans);
+    let mut next_span = 0usize;
     let mut brace_depth = 0usize;
     let mut group_depth = 0usize;
-    let mut if_stack: Vec<Option<bool>> = Vec::new();
-    let mut raw_inactive_depth = 0;
-    let mut unknown_depth = 0;
-    let mut uncertain_scope = false;
+    let mut conditionals = tex::ConditionalStack::default();
     let mut cursor = 0usize;
     let mut at = 0usize;
     while at < source.len() {
-        if raw_source {
-            operation.check()?;
-            if if_stack.last() == Some(&Some(false)) {
-                if raw_inactive_depth == 0 {
-                    raw_inactive_depth = if_stack.len();
-                }
-                // Only conditional delimiters affect scope inside an inactive branch.
-                match source.as_bytes()[at] {
-                    b'%' => {
-                        at += source[at..].find('\n').unwrap_or(source.len() - at);
-                    }
-                    b'\\' => {
-                        let (cmd, end) = math::command(source, at);
-                        at = end;
-                        if cmd == "fi" {
-                            if_stack.pop();
-                            if if_stack.len() < raw_inactive_depth {
-                                raw_inactive_depth = 0;
-                            }
-                            if if_stack.len() < unknown_depth {
-                                unknown_depth = 0;
-                            }
-                        } else if cmd == "else" {
-                            if if_stack.len() == raw_inactive_depth {
-                                *if_stack.last_mut().unwrap() = Some(true);
-                                raw_inactive_depth = 0;
-                            }
-                        } else if cmd.starts_with("if")
-                            && cmd != "iff"
-                            && (cmd != "ifthenelse" || macros.contains_key(cmd))
-                        {
-                            if_stack.push(Some(false));
-                        }
-                    }
-                    _ => at += source[at..].chars().next().unwrap().len_utf8(),
-                }
-                continue;
+        operation.check()?;
+        if conditionals.skipping() {
+            at = conditionals.skip_token(source, at, false);
+            if !conditionals.skipping() {
+                tex::resume_nonprinting_spans(source, at, &mut nonprinting, &mut next_span);
             }
+            continue;
         }
-        if if_stack.last() == Some(&Some(false)) {
-            state.out.push_str("\n\\csname **\\endcsname\n");
-            break;
+        while nonprinting
+            .get(next_span)
+            .is_some_and(|(_, span, _)| span.end <= at)
+        {
+            next_span += 1;
         }
+        let executing = !nonprinting
+            .get(next_span)
+            .is_some_and(|(_, span, _)| span.contains(&at));
         match source.as_bytes()[at] {
-            b'%' => {
-                at += source[at..].find('\n').unwrap_or(source.len() - at);
+            b'%' => at = tex::comment_end(source, at),
+            b'{' => {
+                brace_depth += 1;
+                at += 1;
             }
-            b'{' | b'}' => {
-                if unknown_depth > 0
-                    && !nonprinting
-                        .peek()
-                        .is_some_and(|(_, span, _)| span.contains(&at))
-                {
-                    uncertain_scope = true;
-                }
-                if source.as_bytes()[at] == b'{' {
-                    brace_depth += 1;
-                } else {
-                    brace_depth = brace_depth.saturating_sub(1);
-                }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
                 at += 1;
             }
             b'$' => {
-                if brace_depth == 0
-                    && group_depth == 0
-                    && if_stack.is_empty()
-                    && !nonprinting
-                        .peek()
-                        .is_some_and(|(_, span, _)| span.contains(&at))
-                {
+                if brace_depth == 0 && group_depth == 0 && conditionals.is_empty() && executing {
                     *in_preamble = false;
                 }
                 at += 1;
             }
             b'\\' => {
                 let cmd_start = at;
-                while nonprinting
-                    .peek()
-                    .is_some_and(|(_, span, _)| span.end <= cmd_start)
-                {
-                    nonprinting.next();
-                }
-                let (cmd, end, expanded_target) = math::definition_command(source, at);
+                let (cmd, end) = math::command(source, at);
                 at = end;
-                let executing = !nonprinting
-                    .peek()
-                    .is_some_and(|(_, span, _)| span.contains(&cmd_start));
                 if executing
-                    || nonprinting
-                        .peek()
-                        .is_some_and(|(start, _, _)| *start == cmd_start)
-                {
-                    let environment = if transparent || (depth > 0 && !package_initialization) {
-                        tex::environment_definition(source, cmd, at)
-                    } else {
-                        None
-                    };
-                    if transparent
-                        && tex::environment_definition_command(cmd)
-                        && environment.is_none_or(|(name, _, _)| name == "**")
-                    {
-                        argument_end = source.len();
-                    }
-                    if transparent && let Some((name, _, _)) = environment {
-                        local_environments.insert(name);
-                    }
-                    if depth > 0
-                        && !package_initialization
-                        && (math::is_macro_definition_command(cmd)
-                            || matches!(cmd, "let" | "futurelet")
-                            || tex::environment_definition_command(cmd))
-                    {
-                        // Imported signatures are not in this file's table; only their calls block.
-                        let name = if let Some((name, _, _)) = environment {
-                            name
-                        } else if tex::environment_definition_command(cmd) {
-                            "**"
-                        } else if matches!(cmd, "let" | "futurelet") {
-                            math::macro_alias(source, cmd, at, expanded_target).name
-                        } else {
-                            let target = skip_source_space(source, at);
-                            let target = target
-                                + usize::from(matches!(
-                                    source.as_bytes().get(target),
-                                    Some(b'*' | b'+')
-                                ));
-                            math::macro_target_name(source, target).map_or("**", |(name, _)| name)
-                        };
-                        if !state.local_definitions.contains(name) {
-                            state.local_definitions.insert(name.to_owned());
-                        }
-                        if environment.is_some() && name != "**" {
-                            state.local_definitions.insert(format!("end{name}"));
-                        }
-                    }
-                    if executing
-                        && depth > 0
-                        && !state.local_definitions.contains("**")
-                        && state.local_definitions.contains(cmd)
-                    {
-                        let mut benign = benign_local_calls.contains(cmd);
-                        if benign {
-                            let definition = guess_macros
-                                .as_ref()
-                                .unwrap_or(&macros)
-                                .get(cmd)
-                                .and_then(Option::as_ref)
-                                .unwrap();
-                            let mut end = at;
-                            for _ in 0..definition.arity {
-                                let Some((argument, next)) =
-                                    math::argument(source, end, source.len(), false)
-                                else {
-                                    benign = false;
-                                    break;
-                                };
-                                let Some(remaining) = argument_budget.checked_sub(next - end)
-                                else {
-                                    benign = false;
-                                    break;
-                                };
-                                argument_budget = remaining;
-                                end = next;
-                                if source[argument].contains(['\\', '^']) {
-                                    benign = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if !benign {
-                            // Unknown calls can install nested targets absent from the local table.
-                            state.local_definitions.insert("**".to_owned());
-                        }
-                    }
-                    if transparent && !raw_source && argument_end < source.len() {
-                        if expanded_target
-                            || matches!(
-                                cmd,
-                                "afterassignment"
-                                    | "aftergroup"
-                                    | "expandafter"
-                                    | "futurelet"
-                                    | "csname"
-                            )
-                            || executing
-                                && (state.local_definitions.contains(cmd)
-                                    || opaque_calls
-                                        .as_ref()
-                                        .is_some_and(|calls| calls.contains(cmd)))
-                        {
-                            argument_end = source.len();
-                        } else if executing && let Some(Some(definition)) = signatures.get(cmd) {
-                            let mut end = at;
-                            for _ in 0..definition.arity {
-                                let Some((_, next)) =
-                                    math::argument(source, end, source.len(), false)
-                                else {
-                                    end = source.len();
-                                    break;
-                                };
-                                // Bound overlapping scans; exhaustion only retains the full context.
-                                let Some(remaining) = argument_budget.checked_sub(next - end)
-                                else {
-                                    end = source.len();
-                                    break;
-                                };
-                                argument_budget = remaining;
-                                end = next;
-                            }
-                            argument_end = argument_end.max(end);
-                        } else if !signatures.contains_key(cmd)
-                            && (math::is_macro_definition_command(cmd)
-                                || matches!(cmd, "let" | "futurelet"))
-                        {
-                            // A redefined active character can consume later inputs unseen.
-                            if !defines_control_sequence(source, at) {
-                                argument_end = source.len();
-                            }
-                        } else if executing
-                            && !signatures.contains_key(cmd)
-                            && !tex::environment_definition_command(cmd)
-                            && !matches!(
-                                cmd,
-                                "input"
-                                    | "include"
-                                    | "usepackage"
-                                    | "RequirePackage"
-                                    | "documentclass"
-                                    | "begin"
-                                    | "end"
-                            )
-                        {
-                            // Without a local signature a call may take up to nine
-                            // undelimited arguments, so it can reorder a following input
-                            // and later tokens. Known kernel shapes bound their reach;
-                            // unbound package commands otherwise remain the warned policy.
-                            argument_end = if state.package_definitions.contains(cmd)
-                                || state.package_definitions.contains("**")
-                            {
-                                source.len()
-                            } else {
-                                argument_end.max(
-                                    unsigned_call_reach(source, cmd, at, &mut argument_budget)
-                                        .unwrap_or(source.len()),
-                                )
-                            };
-                        }
-                    }
-                }
-                if !macros.contains_key(cmd)
-                    && let Some(quoted_end) = math::quoted_token_end(source, cmd, at)
-                {
-                    // Stored token lists balance braces before quoted tokens execute.
-                    if executing
-                        || !matches!(
-                            source.as_bytes().get(skip_source_space(source, at)),
-                            Some(b'{' | b'}')
-                        )
-                    {
-                        at = quoted_end;
-                    }
-                    continue;
-                }
-                if executing
-                    && !macros.contains_key(cmd)
                     && let Some((opaque_end, _)) = math::opaque_command_end(source, cmd, at)
                 {
                     at = opaque_end;
                     continue;
                 }
+                if brace_depth == 0 && executing && conditionals.apply(cmd, false) {
+                    continue;
+                }
                 if executing && matches!(cmd, "(" | "[") {
-                    if brace_depth == 0 && group_depth == 0 && if_stack.is_empty() {
+                    if brace_depth == 0 && group_depth == 0 && conditionals.is_empty() {
                         *in_preamble = false;
                     }
                     continue;
-                }
-                if unknown_depth > 0
-                    && executing
-                    && matches!(
-                        cmd,
-                        "begingroup" | "bgroup" | "endgroup" | "egroup" | "begin" | "end"
-                    )
-                {
-                    uncertain_scope = true;
                 }
                 if executing && matches!(cmd, "begingroup" | "bgroup") {
                     group_depth += 1;
@@ -3931,29 +3205,9 @@ fn append_spliced_source(
                     continue;
                 }
                 if executing && cmd == "begin" {
-                    if let Some((env, next)) = math::group(source, skip_source_space(source, at)) {
-                        let name = &source[env.clone()];
-                        if local_environments.contains(name)
-                            || state.local_definitions.contains(name)
-                        {
-                            if depth > 0
-                                && !state.local_definitions.contains("**")
-                                && state.local_definitions.contains(name)
-                            {
-                                state.local_definitions.insert("**".to_owned());
-                            }
-                            argument_end = source.len();
-                        }
-                        if name == "document"
-                            && brace_depth == 0
-                            && group_depth == 0
-                            && if_stack.is_empty()
-                            && !signatures.contains_key("begin")
-                        {
-                            document_scope = true;
-                        }
+                    if let Some((env, next)) = math::group(source, at) {
                         if &source[env] == "document"
-                            || (brace_depth == 0 && group_depth == 0 && if_stack.is_empty())
+                            || (brace_depth == 0 && group_depth == 0 && conditionals.is_empty())
                         {
                             *in_preamble = false;
                         }
@@ -3964,91 +3218,28 @@ fn append_spliced_source(
                 }
                 if executing && cmd == "end" {
                     group_depth = group_depth.saturating_sub(1);
-                    if let Some((env, next)) = math::group(source, skip_source_space(source, at)) {
-                        let name = &source[env];
-                        if local_environments.contains(name)
-                            || state.local_definitions.contains(name)
-                        {
-                            if depth > 0
-                                && !state.local_definitions.contains("**")
-                                && state.local_definitions.contains(name)
-                            {
-                                state.local_definitions.insert("**".to_owned());
-                            }
-                            argument_end = source.len();
-                        }
-                        if name == "document" {
-                            document_scope = false;
-                        }
+                    if let Some((_, next)) = math::group(source, at) {
                         at = next;
                     }
                     continue;
                 }
-                if matches!(cmd, "csname" | "**") {
-                    continue;
-                }
-                if matches!(cmd, "let" | "futurelet") {
-                    if executing {
-                        at = math::macro_alias(source, cmd, at, expanded_target).nonprinting_end;
-                    }
-                    continue;
-                }
                 if math::is_macro_definition_command(cmd) {
-                    let mut next =
+                    let next =
                         at + usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-                    next = skip_source_space(source, next);
-                    if let Some(target_end) = math::macro_target_end(source, next) {
+                    if let Some((_, target_end)) = math::macro_target_name(source, next) {
                         at = target_end;
                     }
                     continue;
                 }
-                if brace_depth == 0 && executing {
-                    if cmd == "iffalse" {
-                        if_stack.push(Some(false));
-                        continue;
-                    }
-                    if cmd == "iftrue" {
-                        if_stack.push(Some(true));
-                        continue;
-                    }
-                    if cmd.starts_with("if")
-                        && cmd != "iff"
-                        && (cmd != "ifthenelse" || macros.contains_key(cmd))
-                    {
-                        if_stack.push(None);
-                        if unknown_depth == 0 {
-                            unknown_depth = if_stack.len();
-                        }
-                        continue;
-                    }
-                    if cmd == "else" {
-                        if let Some(last) = if_stack.last_mut() {
-                            *last = last.map(|b| !b);
-                        }
-                        continue;
-                    }
-                    if cmd == "fi" {
-                        if_stack.pop();
-                        if if_stack.len() < unknown_depth {
-                            unknown_depth = 0;
-                        }
-                        continue;
-                    }
-                }
                 if executing && matches!(cmd, "input" | "include" | "usepackage" | "RequirePackage")
                 {
                     let is_tex_input = matches!(cmd, "input" | "include");
-                    if raw_source && is_tex_input {
-                        // Raw local inputs remain unexpanded and cannot prove a closed scope.
-                        uncertain_scope = true;
-                        continue;
-                    }
-                    let mut imports: Vec<(&str, &str)> = Vec::new();
+                    let mut targets: Vec<(&str, &str)> = Vec::new();
                     if is_tex_input {
                         let arg_pos = skip_source_space(source, at);
                         if let Some((grp, next)) = math::group(source, arg_pos) {
                             at = next;
-                            imports.push((&source[grp], "tex"));
+                            targets.push((&source[grp], "tex"));
                         } else if cmd == "input" && arg_pos < source.len() {
                             let next = arg_pos
                                 + source[arg_pos..]
@@ -4060,7 +3251,7 @@ fn append_spliced_source(
                                     .count();
                             if next > arg_pos {
                                 at = next;
-                                imports.push((&source[arg_pos..next], "tex"));
+                                targets.push((&source[arg_pos..next], "tex"));
                             }
                         }
                     } else {
@@ -4068,172 +3259,69 @@ fn append_spliced_source(
                         while let Some(opt_end) = optional_argument_end(source, pos) {
                             pos = opt_end;
                         }
-                        if let Some((grp, mut next)) =
-                            math::group(source, skip_source_space(source, pos))
-                        {
+                        if let Some((grp, mut next)) = math::group(source, pos) {
                             while let Some(opt_end) = optional_argument_end(source, next) {
                                 next = opt_end;
                             }
                             at = next;
                             for pkg in source[grp].split(',') {
-                                imports.push((pkg, "sty"));
+                                targets.push((pkg, "sty"));
                             }
                         }
                     }
-                    if imports.is_empty() {
-                        if raw_source {
-                            uncertain_scope = true;
-                            continue;
-                        }
-                        if is_tex_input {
-                            state.ambiguous_inputs = true;
-                            state.out.push_str(&source[cursor..cmd_start]);
-                            state.out.push_str("\n\\csname **\\endcsname\n");
-                            cursor = at;
-                        }
+                    if targets.is_empty() {
                         continue;
                     }
-                    if !raw_source {
-                        let segment_start = state.out.len();
-                        state.out.push_str(&source[cursor..cmd_start]);
-                        if package_initialization
-                            && *in_preamble
-                            && !imported_scope_poisoned
-                            && !uncertain_scope
-                            && segment_start < state.out.len()
-                        {
-                            state.package_ranges.push(segment_start..state.out.len());
-                        }
-                        state.out.push('\n');
-                        cursor = at;
-                    }
+                    out.push_str(&source[cursor..cmd_start]);
+                    out.push('\n');
+                    cursor = at;
                     let child_poisoned = poisoned_scope
                         || !*in_preamble
                         || brace_depth > 0
                         || group_depth > 0
-                        || !if_stack.is_empty();
-                    for (raw_name, ext) in imports {
+                        || !conditionals.is_empty();
+                    for (raw_name, ext) in targets {
                         operation.check()?;
-                        if raw_source
-                            && !raw_name.trim_ascii().bytes().all(|byte| {
-                                byte.is_ascii_alphanumeric()
-                                    || matches!(byte, b'.' | b'_' | b'-' | b'/')
-                            })
-                        {
-                            // Encoded/active/commented filenames cannot prove an absent local load.
-                            uncertain_scope = true;
-                            continue;
-                        }
-                        let clean_name = source_line_text(raw_name).trim();
+                        let clean_name = source_line_text(raw_name).trim().to_owned();
                         if clean_name.is_empty() || clean_name.contains('\\') {
-                            if raw_source {
-                                uncertain_scope = true;
-                                continue;
-                            }
-                            if is_tex_input {
-                                state.ambiguous_inputs = true;
-                            }
-                            if ext == "tex" || clean_name.contains('\\') {
-                                state.out.push_str("\\csname **\\endcsname\n");
-                            }
                             continue;
                         }
-                        let candidates = input_candidates(
-                            clean_name,
-                            ext,
-                            &[
-                                Some(main_dir),
-                                path.parent(),
-                                pdf_dir,
-                                sources.sidecar_dir.as_deref(),
-                                sources.snapshot.map(|s| s.cwd.as_path()),
-                            ],
-                            compiled,
-                            sources,
-                        );
-                        let mut readable = Vec::with_capacity(candidates.len());
+                        let bases = [
+                            Some(main_dir),
+                            path.parent(),
+                            pdf_dir,
+                            sources.sidecar_dir.as_deref(),
+                        ];
+                        let candidates =
+                            input_candidates(&clean_name, ext, &bases, compiled, sources);
+                        let mut readable = Vec::new();
                         for cand in candidates {
                             match sources.read(&cand, operation) {
-                                Ok(child_src) => readable.push((cand, child_src)),
-                                Err(err) if crate::source_snapshot::required_cache_error(&err) => {
-                                    return Err(err);
-                                }
+                                Ok(source) => readable.push((cand, source)),
                                 Err(_) => operation.check()?,
                             }
                         }
-                        if raw_source {
-                            // Reuse normal package resolution without appending local package bytes.
-                            uncertain_scope |= !readable.is_empty();
-                            continue;
-                        }
                         if readable.is_empty() {
-                            if ext == "tex" {
-                                state.ambiguous_inputs = true;
-                                state.out.push_str("\\csname **\\endcsname\n");
-                            }
                             continue;
                         }
                         let ambiguous_cwd = readable.len() > 1;
-                        if ambiguous_cwd {
-                            state.ambiguous_inputs = true;
-                            state.out.push_str("\\csname **\\endcsname\n");
-                        }
                         for (resolved, child_src) in readable {
-                            if !is_tex_input && state.visited.contains(&resolved) {
+                            if visited.len() >= 32 || visited.contains(&resolved) {
                                 continue;
                             }
-                            // Repeated inputs execute again; only ancestors form a cycle.
-                            if state.visited.len() >= 32
-                                || state.ancestors[..=depth]
-                                    .iter()
-                                    .any(|&index| state.visited[index] == resolved)
-                            {
-                                state.truncated = true;
-                                state.out.push_str("\\csname **\\endcsname\n");
-                                continue;
-                            }
-                            state.visited.push(resolved.clone());
-                            let warn_poisoned = sources.warning(&resolved).is_some();
-                            if warn_poisoned {
-                                state.ambiguous_inputs = true;
-                                state.out.push_str("\\csname **\\endcsname\n");
-                            }
-                            let child_transparent = transparent
-                                && is_tex_input
-                                && resolved.extension().is_some_and(|ext| ext == "tex")
-                                && !raw_source
-                                && !imported_scope_poisoned
-                                && !uncertain_scope
-                                && !state.local_definitions.contains("**")
-                                && !ambiguous_cwd
-                                && !warn_poisoned
-                                && brace_depth == 0
-                                && group_depth == usize::from(document_scope)
-                                && if_stack.is_empty()
-                                && !state.package_definitions.contains("~")
-                                && cmd_start >= argument_end;
-                            let child_open_scope = append_spliced_source(
-                                &resolved,
-                                &child_src,
+                            visited.push(resolved.clone());
+                            let child_index = scope.file_index(&child_src, operation);
+                            append_spliced_source(
+                                (&resolved, &child_src, &child_index.strict_spans),
                                 main_dir,
                                 compiled,
                                 pdf_dir,
+                                (depth + 1, child_poisoned || ambiguous_cwd, in_preamble),
+                                visited,
                                 sources,
-                                operation,
-                                state,
-                                depth + 1,
-                                in_preamble,
-                                child_poisoned || ambiguous_cwd || warn_poisoned,
-                                !child_poisoned
-                                    && !imported_scope_poisoned
-                                    && !uncertain_scope
-                                    && !ambiguous_cwd
-                                    && !warn_poisoned
-                                    && (package_initialization || !is_tex_input),
-                                imported_scope_poisoned,
-                                child_transparent,
+                                (operation, scope),
+                                out,
                             )?;
-                            imported_scope_poisoned |= child_open_scope;
                         }
                     }
                 }
@@ -4248,102 +3336,27 @@ fn append_spliced_source(
             }
         }
     }
-    let segment_start = state.out.len();
-    state.out.push_str(&source[cursor..]);
-    if package_initialization
-        && (raw_source || *in_preamble)
-        && !imported_scope_poisoned
-        && !uncertain_scope
-        && segment_start < state.out.len()
-    {
-        state.package_ranges.push(segment_start..state.out.len());
+    out.push_str(&source[cursor..]);
+    out.push('\n');
+    if poisoned_scope {
+        out.push_str("}\n");
     }
-    state.out.push('\n');
-    if poisoned_scope && !raw_source {
-        state.out.push_str("}\n");
-    }
-    if transparent {
-        state.input_ends[input_index] = Some(state.out.len());
-    }
-    Ok(imported_scope_poisoned
-        || uncertain_scope
-        || brace_depth > 0
-        || group_depth > 0
-        || !if_stack.is_empty())
-}
-
-/// Whether a definition command at `at` names a control sequence, not an active character.
-fn defines_control_sequence(source: &str, at: usize) -> bool {
-    let mut target = skip_source_space(source, at);
-    if matches!(source.as_bytes().get(target), Some(b'*' | b'+')) {
-        target = skip_source_space(source, target + 1);
-    }
-    if source.as_bytes().get(target) == Some(&b'{') {
-        target = skip_source_space(source, target + 1);
-    }
-    source.as_bytes().get(target) == Some(&b'\\')
-}
-
-/// Source end of arguments an executed call without a local signature may take.
-/// Unknown calls reach nine undelimited arguments; delimited parameters of
-/// unreadable package commands are outside this bound.
-fn unsigned_call_reach(source: &str, cmd: &str, at: usize, budget: &mut usize) -> Option<usize> {
-    let arity = match cmd {
-        "par" | "relax" | "maketitle" | "tableofcontents" | "listoffigures" | "listoftables"
-        | "clearpage" | "cleardoublepage" | "newpage" | "frontmatter" | "mainmatter"
-        | "backmatter" | "appendix" | "noindent" | "centering" | "smallskip" | "medskip"
-        | "bigskip" | "makeatletter" | "makeatother" => return Some(at),
-        "part" | "chapter" | "section" | "subsection" | "subsubsection" | "paragraph"
-        | "subparagraph" => {
-            let mut end = skip_source_space(source, at);
-            if source.as_bytes().get(end) == Some(&b'*') {
-                end += 1;
-            }
-            let end = tex::optional_argument_boundary(source, end).unwrap_or(end);
-            let (_, end) = math::group(source, skip_source_space(source, end))?;
-            return Some(end);
-        }
-        "label" | "title" | "author" | "date" | "pagestyle" | "thispagestyle" => {
-            let (_, end) = math::group(source, skip_source_space(source, at))?;
-            return Some(end);
-        }
-        _ => 9,
-    };
-    let mut end = at;
-    for _ in 0..arity {
-        let Some((_, next)) = math::argument(source, end, source.len(), false) else {
-            return Some(source.len());
-        };
-        *budget = budget.checked_sub(next - end)?;
-        end = next;
-    }
-    Some(end)
+    Ok(())
 }
 
 /// Title pages and running headers can be produced from declarations far
 /// outside SyncTeX's reported frame. Search only literal document metadata,
 /// including direct preamble inputs, and require neighboring PDF words.
-#[cfg(test)]
-fn document_metadata_word_location(
-    main: &Path,
-    context: &str,
-    offset: usize,
-    sources: &mut QuerySources<'_>,
-    operation: &Operation,
-) -> io::Result<Option<MetadataLocation>> {
-    document_metadata_word_location_with_context(
-        main, None, None, context, offset, sources, operation,
-    )
-}
-
-fn document_metadata_word_location_with_context(
+#[allow(clippy::too_many_arguments)]
+fn document_metadata_word_location_with_context<'q>(
     main: &Path,
     compiled_inputs: Option<&[PathBuf]>,
     pdf_dir: Option<&Path>,
     context: &str,
     offset: usize,
     sources: &mut QuerySources<'_>,
-    operation: &Operation,
+    operation: &'q Operation,
+    scope: QueryAnalysisScope<'q>,
 ) -> io::Result<Option<MetadataLocation>> {
     let mut files = preamble_sources(main, compiled_inputs, pdf_dir, sources, operation)?;
     if files.is_empty() {
@@ -4354,7 +3367,7 @@ fn document_metadata_word_location_with_context(
     let mut tied = false;
     for (file_index, (_, source)) in files.iter().enumerate() {
         operation.check()?;
-        let hidden = nonprinting_source_ranges(source);
+        let analysis = scope.get(source, &[], operation);
         let mut start = 0;
         for raw_row in source.split_inclusive('\n') {
             operation.check()?;
@@ -4379,28 +3392,20 @@ fn document_metadata_word_location_with_context(
                         spans.push(opt_start..opt_end - 1);
                         arg_at = opt_end;
                     }
-                    if let Some((body, end)) =
-                        math::group(source, skip_source_space(source, arg_at))
-                    {
+                    if let Some((body, end)) = math::group(source, arg_at) {
                         spans.push(body.start..end);
                     }
                     let mut cmd_best: Option<(isize, u32, usize)> = None;
                     for span in &spans {
-                        let first = source[..span.start]
-                            .bytes()
-                            .filter(|ch| *ch == b'\n')
-                            .count();
-                        let last = source[..span.end].bytes().filter(|ch| *ch == b'\n').count();
-                        let candidate = source_prose_scored_location(
-                            source,
+                        let first = analysis.line_starts.row_of(span.start);
+                        let last = analysis.line_starts.row_of(span.end);
+                        let candidate = source_prose_scored_location_with_analysis(
+                            &analysis,
                             1,
-                            context,
-                            offset,
+                            (context, offset),
                             first..last + 1,
                             true,
-                            &hidden,
                             Some(span.clone()),
-                            operation,
                         );
                         operation.check()?;
                         let Some((line, byte, score)) = candidate else {
@@ -4534,47 +3539,4 @@ pub(crate) fn materialize_raw_candidates(
         }
     }
     results
-}
-
-pub(crate) fn parse_synctex_edit_candidates(stdout: &str) -> Vec<RawInverseCandidate> {
-    let mut input = None;
-    let mut active = false;
-    let mut raw = Vec::<RawInverseCandidate>::new();
-    for row in stdout.lines() {
-        if let Some(value) = row.strip_prefix("Input:") {
-            input = Some(value.trim());
-            active = false;
-        } else if let Some(value) = row.strip_prefix("Line:") {
-            active = false;
-            if let Some(file) = input.take()
-                && !file.is_empty()
-                && let Ok(line) = value.trim().parse::<u32>()
-                && line > 0
-            {
-                raw.push(RawInverseCandidate {
-                    file: file.to_owned(),
-                    line,
-                    compiler_column: None,
-                    graphics: None,
-                });
-                active = true;
-            }
-        } else if active && let Some(value) = row.strip_prefix("Column:") {
-            active = false;
-            if let Ok(column) = value.trim().parse::<usize>()
-                && column > 1
-                && let Some(last) = raw.last_mut()
-            {
-                last.compiler_column = Some(column);
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    raw.into_iter()
-        .filter(|cand| seen.insert((cand.file.clone(), cand.line, cand.compiler_column)))
-        .collect()
-}
-
-pub fn parse_synctex_edit(stdout: &str) -> Vec<SourceLocation> {
-    materialize_raw_candidates(parse_synctex_edit_candidates(stdout), None, None)
 }

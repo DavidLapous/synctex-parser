@@ -1,14 +1,23 @@
 //! Conservative lexical matching, not a TeX macro expander.
-use crate::symbols::{MathCommand, canonical, classify_command, negated_symbol};
+use crate::symbols::{
+    MathCommand, canonical, classify_command, is_math_alphabet_wrapper, is_text_font_wrapper,
+    negate_char, negated_symbol,
+};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MacroDef<'a> {
     pub(super) arity: u8,
     pub(super) used_params: u16,
-    pub(super) body_source: &'a str,
+    /// Bit `i` set: parameter `#i+1` is a bracketed optional argument a call
+    /// may omit. Such a replacement text is never expanded inline.
+    pub(crate) opt_params: u16,
+    /// Expandable replacement text; `None` when only the signature is trusted.
     pub(super) body: Option<&'a str>,
+    /// The replacement text invokes `\note` (directly or via another wrapper),
+    /// so words in a call's discarded arguments are note-owned, not absent.
+    pub(crate) calls_note: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -63,133 +72,26 @@ pub(super) fn command(source: &str, start: usize) -> (&str, usize) {
     (&source[after..end], end)
 }
 
-fn literal_csname(source: &str) -> Option<&str> {
-    // Only blanks skipped after the control word are absent from the name.
-    let name = source.trim_start_matches([' ', '\t', '\r', '\n']);
-    (!name.is_empty()
-        && !name.contains("^^")
-        && !name
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '\\' | '#' | '%' | '{' | '}')))
-    .then_some(name)
-}
-
-// Name-only scans must not repeatedly balance unresolved constructs.
-pub(super) fn static_command(source: &str, start: usize) -> (&str, usize) {
-    let (raw, end) = command(source, start);
-    if raw != "csname" {
-        return (raw, end);
-    }
-    let Some(close) = source[end..].find('\\').map(|at| end + at) else {
-        return (raw, end);
-    };
-    let Some(name) = literal_csname(&source[end..close]) else {
-        return (raw, end);
-    };
-    let (closing, closing_end) = command(source, close);
-    if closing == "endcsname" {
-        (name, closing_end)
-    } else {
-        (raw, end)
-    }
-}
-
-pub(super) fn control_sequence(source: &str, start: usize) -> (&str, usize) {
-    let (name, mut at) = command(source, start);
-    if name != "csname" {
-        return (name, at);
-    }
-    let begin = at;
-    let mut depth = 1;
-    while at < source.len() {
-        if matches!(source.as_bytes()[at], b'{' | b'}') {
-            return ("csname", begin);
-        }
-        if source.as_bytes()[at] == b'%' {
-            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
-            continue;
-        }
-        if source.as_bytes()[at] == b'\\' {
-            let (token, end) = command(source, at);
-            if matches!(token, "string" | "meaning" | "noexpand")
-                && source.as_bytes().get(super::skip_source_space(source, end)) == Some(&b'\\')
-                && let Some(next) = quoted_token_end(source, token, end)
-            {
-                at = next;
-                continue;
-            }
-            if token == "endcsname" {
-                depth -= 1;
-                if depth == 0 {
-                    return (literal_csname(&source[begin..at]).unwrap_or("csname"), end);
-                }
-            } else if token == "csname" {
-                depth += 1;
-            }
-            at = end;
-        } else {
-            at += source[at..].chars().next().unwrap().len_utf8();
-        }
-    }
-    ("csname", begin)
-}
-
 pub(super) fn group(source: &str, start: usize) -> Option<(Range<usize>, usize)> {
-    group_with_boundaries(source, start, None, None)
-}
-
-fn group_with_boundaries(
-    source: &str,
-    start: usize,
-    mut boundaries: Option<&mut BTreeMap<usize, usize>>,
-    operation: Option<&crate::Operation>,
-) -> Option<(Range<usize>, usize)> {
-    if operation.is_some_and(|operation| operation.check().is_err()) {
-        return None;
-    }
     let start = super::skip_source_space(source, start);
     if source.as_bytes().get(start) != Some(&b'{') {
         return None;
     }
-    // Byte addresses identify the same borrowed group across root/body slices.
-    let base = source.as_ptr() as usize;
-    if let Some(end) = boundaries
-        .as_ref()
-        .and_then(|groups| groups.get(&(base + start)))
-    {
-        let end = *end - base;
-        return (end <= source.len()).then_some((start + 1..end - 1, end));
-    }
-    let mut openings = Vec::new();
-    if boundaries.is_some() {
-        openings.push(base + start);
-    }
     let mut depth = 1;
     let mut i = start + 1;
     while i < source.len() {
-        if operation.is_some_and(|operation| operation.check().is_err()) {
-            return None;
-        }
         match source.as_bytes()[i] {
             b'\\' => {
                 i = command(source, i).1;
                 continue;
             }
             b'%' => {
-                i += source[i..].find('\n').unwrap_or(source.len() - i);
+                i = super::comment_end(source, i);
                 continue;
             }
-            b'{' => {
-                depth += 1;
-                if boundaries.is_some() {
-                    openings.push(base + i);
-                }
-            }
+            b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
-                if let Some(groups) = &mut boundaries {
-                    groups.insert(openings.pop().unwrap(), base + i + 1);
-                }
                 if depth == 0 {
                     return Some((start + 1..i, i + 1));
                 }
@@ -206,17 +108,6 @@ pub(super) fn argument(
     pos: usize,
     limit: usize,
     parameters: bool,
-) -> Option<(Range<usize>, usize)> {
-    argument_with_boundaries(source, pos, limit, parameters, None, None)
-}
-
-fn argument_with_boundaries(
-    source: &str,
-    pos: usize,
-    limit: usize,
-    parameters: bool,
-    boundaries: Option<&mut BTreeMap<usize, usize>>,
-    operation: Option<&crate::Operation>,
 ) -> Option<(Range<usize>, usize)> {
     let mut pos = pos;
     let mut newline = false;
@@ -235,8 +126,7 @@ fn argument_with_boundaries(
         }
     }
     match *source.as_bytes()[..limit].get(pos)? {
-        b'{' => group_with_boundaries(source, pos, boundaries, operation)
-            .filter(|(_, end)| *end <= limit),
+        b'{' => group(source, pos).filter(|(_, end)| *end <= limit),
         b'\\' => {
             let (_, end) = command(source, pos);
             (end <= limit).then_some((pos..end, end))
@@ -252,27 +142,26 @@ fn argument_with_boundaries(
     }
 }
 
-pub(super) fn quoted_token_end(source: &str, name: &str, at: usize) -> Option<usize> {
+pub(super) fn quoted_token_end(source: &str, name: &str, mut at: usize) -> Option<usize> {
     if !matches!(name, "string" | "meaning" | "noexpand") {
         return None;
     }
-    let mut at = at;
-    let mut newline = false;
-    while let Some(ch) = source[at..].chars().next() {
-        if ch == '%' {
-            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
-            newline = true;
-        } else if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            at += ch.len_utf8();
-            // A blank physical line supplies the quoted \par token.
-            if ch == '\n' {
-                if newline {
+    let mut at_line_start = false;
+    while at < source.len() {
+        match source.as_bytes()[at] {
+            b'%' => {
+                at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
+                at_line_start = true;
+            }
+            b' ' | b'\t' | b'\r' => at += 1,
+            b'\n' => {
+                at += 1;
+                if at_line_start {
                     return Some(at);
                 }
-                newline = true;
+                at_line_start = true;
             }
-        } else {
-            break;
+            _ => break,
         }
     }
     if source.as_bytes().get(at) == Some(&b'\\') {
@@ -307,6 +196,9 @@ pub(super) fn quoted_token_end(source: &str, name: &str, at: usize) -> Option<us
 /// Return the opaque command's end and whether its entire span is nonprinting.
 pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Option<(usize, bool)> {
     match name {
+        "string" | "meaning" | "noexpand" => {
+            quoted_token_end(source, name, at).map(|end| (end, false))
+        }
         "verb" => {
             at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
             let delimiter = source[at..].chars().next()?;
@@ -337,7 +229,7 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
             ))
         }
         "begin" => {
-            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            let (body, end) = group(source, at)?;
             let environment = &source[body];
             if !matches!(
                 environment.trim_end_matches('*'),
@@ -414,62 +306,7 @@ pub(super) fn opaque_command_end(source: &str, name: &str, mut at: usize) -> Opt
 }
 
 fn collected_formatting_command(name: &str) -> bool {
-    matches!(
-        name,
-        "text"
-            | "textbf"
-            | "textit"
-            | "textrm"
-            | "textsf"
-            | "texttt"
-            | "textup"
-            | "textnormal"
-            | "textsc"
-            | "textsl"
-            | "textmd"
-            | "textlf"
-            | "textulc"
-            | "emph"
-            | "bm"
-            | "boldsymbol"
-            | "mathcal"
-            | "mathbb"
-            | "mathbbm"
-            | "mathbbb"
-            | "mathds"
-            | "mathfrak"
-            | "mathscr"
-            | "mathrm"
-            | "mathbf"
-            | "mathbfit"
-            | "mathsf"
-            | "mathsfit"
-            | "mathbfsfit"
-            | "mathbfcal"
-            | "mathbfscr"
-            | "mathtt"
-            | "mathit"
-            | "mathnormal"
-            | "mathbold"
-            | "symrm"
-            | "symit"
-            | "symsf"
-            | "symtt"
-            | "symbb"
-            | "symcal"
-            | "symscr"
-            | "symfrak"
-            | "symnormal"
-            | "symbf"
-            | "symbfit"
-            | "symbfsfit"
-            | "symsfit"
-            | "symbfcal"
-            | "symbffrak"
-            | "symbfscr"
-            | "symbfsf"
-            | "symbftt"
-    )
+    is_text_font_wrapper(name) || is_math_alphabet_wrapper(name)
 }
 
 pub(super) fn collected_text_arguments(
@@ -479,7 +316,7 @@ pub(super) fn collected_text_arguments(
 ) -> Option<(Option<Range<usize>>, Range<usize>, usize)> {
     match name {
         name if collected_formatting_command(name) => {
-            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            let (body, end) = group(source, at)?;
             // Single-line formatting does not establish an exclusive search region.
             source[body.clone()]
                 .contains('\n')
@@ -490,17 +327,17 @@ pub(super) fn collected_text_arguments(
             if let Some(opt_end) = super::optional_argument_end(source, at) {
                 at = opt_end;
             }
-            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            let (body, end) = group(source, at)?;
             Some((None, body, end))
         }
         "captionof" => {
             at += usize::from(source.as_bytes().get(at) == Some(&b'*'));
-            let (_, end) = group(source, super::skip_source_space(source, at))?;
+            let (_, end) = group(source, at)?;
             at = end;
             if let Some(opt_end) = super::optional_argument_end(source, at) {
                 at = opt_end;
             }
-            let (body, end) = group(source, super::skip_source_space(source, at))?;
+            let (body, end) = group(source, at)?;
             Some((None, body, end))
         }
         "subcaptionbox" | "captionbox" => {
@@ -508,13 +345,13 @@ pub(super) fn collected_text_arguments(
             if let Some(opt_end) = super::optional_argument_end(source, at) {
                 at = opt_end;
             }
-            let (heading, mut at) = group(source, super::skip_source_space(source, at))?;
+            let (heading, mut at) = group(source, at)?;
             for _ in 0..2 {
                 if let Some(opt_end) = super::optional_argument_end(source, at) {
                     at = opt_end;
                 }
             }
-            let (contents, end) = group(source, super::skip_source_space(source, at))?;
+            let (contents, end) = group(source, at)?;
             Some((Some(heading), contents, end))
         }
         "subfloat" => {
@@ -528,19 +365,70 @@ pub(super) fn collected_text_arguments(
                     break;
                 }
             }
-            let (contents, end) = group(source, super::skip_source_space(source, at))?;
+            let (contents, end) = group(source, at)?;
             Some((opts.pop(), contents, end))
         }
+        "begin" | "item" => multiline_printed_header(source, name, at),
         _ => None,
     }
 }
 
+pub(super) fn printed_header_argument(source: &str, name: &str, at: usize) -> Option<Range<usize>> {
+    let at = match name {
+        "begin" => {
+            let (env, at) = group(source, at)?;
+            let env = source[env].trim();
+            if math_environment(env)
+                || super::classify_environment_header(env) == super::EnvHeaderKind::NoPrintedHeader
+            {
+                return None;
+            }
+            at
+        }
+        "item" => at,
+        _ => return None,
+    };
+    super::header_optional_argument(source, super::skip_overlay_arguments(source, at))
+}
+
+// TeX scans `[...]` whole; a single line does not establish an exclusive search region.
+fn multiline_printed_header(
+    source: &str,
+    name: &str,
+    at: usize,
+) -> Option<(Option<Range<usize>>, Range<usize>, usize)> {
+    let header = printed_header_argument(source, name, at)?;
+    let body = header.start + 1..header.end - 1;
+    source[body.clone()]
+        .contains('\n')
+        .then_some((None, body, header.end))
+}
+
+// Closing-line anchors alone are exclusive: inner material may ship on earlier lines.
+fn closing_anchor_collector(name: &str) -> bool {
+    collected_formatting_command(name) || matches!(name, "begin" | "item")
+}
+
 /// Find the outer collected printed argument owning this literal cursor byte.
-pub(super) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Range<usize>> {
+pub(super) fn collected_text_argument_at_with_spans(
+    source: &str,
+    byte: usize,
+    known_spans: &[crate::tex::Span],
+) -> Option<Range<usize>> {
+    collected_text_owner_at_with_spans(source, byte, known_spans)
+        .and_then(|(body, printed)| printed.then_some(body))
+}
+
+/// Find the outer collected argument around this byte and whether the byte itself prints.
+pub(super) fn collected_text_owner_at_with_spans(
+    source: &str,
+    byte: usize,
+    known_spans: &[crate::tex::Span],
+) -> Option<(Range<usize>, bool)> {
     if byte >= source.len() || !source.is_char_boundary(byte) {
         return None;
     }
-    let mut hidden = super::nonprinting_source_spans(source).peekable();
+    let mut hidden = known_spans.iter().peekable();
     let mut body = None;
     let mut at = 0;
     while at <= byte {
@@ -552,26 +440,24 @@ pub(super) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Ra
         {
             at = range.end;
             if byte < at {
-                return None;
+                return body.map(|body| (body, false));
             }
             continue;
         }
         match source.as_bytes()[at] {
             b'%' => {
-                at += source[at..].find('\n').unwrap_or(source.len() - at);
+                at = super::comment_end(source, at);
                 if byte < at {
-                    return None;
+                    return body.map(|body| (body, false));
                 }
             }
             b'\\' => {
                 let (name, end) = command(source, at);
                 at = end;
-                if let Some(end) = quoted_token_end(source, name, at)
-                    .or_else(|| opaque_command_end(source, name, at).map(|(end, _)| end))
-                {
+                if let Some((end, _)) = opaque_command_end(source, name, at) {
                     at = end;
                     if byte < at {
-                        return None;
+                        return body.map(|body| (body, false));
                     }
                 } else if let Some((first, second, end)) =
                     collected_text_arguments(source, name, at)
@@ -585,7 +471,7 @@ pub(super) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Ra
                     } else {
                         at = end;
                         if byte < at {
-                            return None;
+                            return body.map(|body| (body, false));
                         }
                     }
                 }
@@ -602,7 +488,83 @@ pub(super) fn collected_text_argument_at(source: &str, byte: usize) -> Option<Ra
             }
         }
     }
-    body
+    body.map(|body| (body, true))
+}
+
+/// Find the last printed header closing on `row` and whether its `[...]` spans multiple lines.
+pub(super) fn printed_header_bounds_in(
+    source: &str,
+    row: Range<usize>,
+    known_spans: &[crate::tex::Span],
+) -> Option<(Range<usize>, bool)> {
+    let limit = row.end.min(source.len());
+    if !source[row.start.min(limit)..limit].contains(']') {
+        return None;
+    }
+    let mut hidden = known_spans.iter().peekable();
+    let mut found = None;
+    let mut at = 0;
+    while at < limit {
+        while hidden.peek().is_some_and(|(_, range, _)| range.end <= at) {
+            hidden.next();
+        }
+        if let Some((start, range, _)) = hidden.peek()
+            && *start <= at
+        {
+            at = range.end;
+            continue;
+        }
+        match source.as_bytes()[at] {
+            b'%' => at += source[at..limit].find('\n').unwrap_or(limit - at),
+            b'\\' => {
+                let cmd_start = at;
+                let (name, end) = command(source, at);
+                at = end;
+                if let Some((end, _)) = opaque_command_end(source, name, at) {
+                    at = end;
+                } else if let Some(header) = printed_header_argument(source, name, at) {
+                    let close = header.end - 1;
+                    let mut after = super::skip_overlay_arguments(source, header.end);
+                    while let Some(next) = source[after.min(limit)..limit]
+                        .bytes()
+                        .position(|b| !matches!(b, b' ' | b'\t'))
+                        .map(|off| after + off)
+                    {
+                        if source.as_bytes()[next] == b'\\'
+                            && let ("label", cmd_end) = command(source, next)
+                            && let Some((_, grp_end)) = group(source, cmd_end)
+                            && grp_end <= limit
+                        {
+                            after = super::skip_overlay_arguments(source, grp_end);
+                        } else {
+                            break;
+                        }
+                    }
+                    if row.contains(&close) {
+                        let start = if header.start < row.start {
+                            row.start
+                        } else {
+                            cmd_start.max(row.start)
+                        };
+                        let multiline = source[header.start + 1..close].contains('\n');
+                        found = Some((start..after, multiline));
+                    }
+                    at = after;
+                }
+            }
+            _ => {
+                let next_special = source.as_bytes()[at..limit]
+                    .iter()
+                    .position(|b| matches!(*b, b'%' | b'\\'))
+                    .map_or(limit, |pos| at + pos);
+                let stop = hidden
+                    .peek()
+                    .map_or(next_special, |(start, _, _)| next_special.min(*start));
+                at = stop.max(at + source[at..].chars().next()?.len_utf8());
+            }
+        }
+    }
+    found
 }
 
 pub(super) fn math_environment(name: &str) -> bool {
@@ -636,16 +598,13 @@ pub(super) fn math_environment(name: &str) -> bool {
     )
 }
 
-/// Only closed, literal math regions qualify; escaped dollars and comments do not.
-pub(super) fn in_region(source: &str, byte: usize) -> bool {
-    regions(source, byte.saturating_add(1))
-        .into_iter()
-        .any(|range| range.contains(&byte))
-}
-
-pub(super) fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
+/// Closed, literal math regions; escaped dollars and comments do not qualify.
+pub(super) fn regions_with_spans(
+    source: &str,
+    known_spans: &[crate::tex::Span],
+) -> Vec<Range<usize>> {
     let mut result = Vec::new();
-    let mut hidden = super::nonprinting_source_spans(source).peekable();
+    let mut hidden = known_spans.iter().peekable();
     let mut open: Option<(&str, usize)> = None;
     let mut i = 0;
     while i < source.len() {
@@ -657,9 +616,6 @@ pub(super) fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
         };
         i += rel;
         if open.is_none() {
-            if i >= limit {
-                break;
-            }
             while hidden.peek().is_some_and(|(_, range, _)| range.end <= i) {
                 hidden.next();
             }
@@ -674,7 +630,7 @@ pub(super) fn regions(source: &str, limit: usize) -> Vec<Range<usize>> {
         let ch = source.as_bytes()[i] as char;
         i += 1;
         match ch {
-            '%' => i += source[i..].find('\n').unwrap_or(source.len() - i),
+            '%' => i = super::comment_end(source, i),
             '$' => {
                 let delimiter = if (open.is_none()
                     || open.is_some_and(|(expected, _)| expected == "$$"))
@@ -741,10 +697,13 @@ struct DisplayRegion<'a> {
     env: Option<(&'a str, usize)>,
 }
 
-fn display_regions(source: &str) -> impl Iterator<Item = DisplayRegion<'_>> {
+fn display_regions<'a>(
+    source: &'a str,
+    known_spans: &[crate::tex::Span],
+) -> impl Iterator<Item = DisplayRegion<'a>> {
     let mut counted_to = 0;
     let mut counted_lines = 0;
-    regions(source, source.len())
+    regions_with_spans(source, known_spans)
         .into_iter()
         .filter_map(move |range| {
             let (start, end, close_end, env) = if (source[counted_to..range.start].ends_with("\\[")
@@ -887,9 +846,13 @@ fn inner_halign_contains_line(
 
 /// Multi-line display and environment math can report its closing delimiter line
 /// for every interior token. Restrict inverse refinement to the full math region.
-pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
+pub(super) fn math_lines_with_spans(
+    source: &str,
+    line: u32,
+    known_spans: &[crate::tex::Span],
+) -> Option<Range<usize>> {
     let target = line.checked_sub(1)? as usize;
-    for region in display_regions(source) {
+    for region in display_regions(source, known_spans) {
         if (region.first..=region.last).contains(&target) {
             if region.first == region.last {
                 continue;
@@ -919,9 +882,14 @@ pub(super) fn math_lines(source: &str, line: u32) -> Option<Range<usize>> {
 
 /// Forward search inside multi-line display math maps lines without usable
 /// box records to the closing math line while preserving inner `\halign` rows.
-pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<u32> {
+pub(super) fn math_closing_line_with_spans(
+    source: &str,
+    line: u32,
+    column: u32,
+    known_spans: &[crate::tex::Span],
+) -> Option<u32> {
     let target = line.checked_sub(1)? as usize;
-    for region in display_regions(source) {
+    for region in display_regions(source, known_spans) {
         if (region.first..=region.last).contains(&target) {
             if region.first == region.last {
                 continue;
@@ -965,9 +933,7 @@ pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<
                         while let Some(opt_end) = super::optional_argument_end(source, next) {
                             next = opt_end;
                         }
-                        if let Some((_, grp_end)) =
-                            group(source, super::skip_source_space(source, next))
-                        {
+                        if let Some((_, grp_end)) = group(source, next) {
                             cursor = grp_end;
                             continue;
                         }
@@ -1003,9 +969,14 @@ pub(super) fn math_closing_line(source: &str, line: u32, column: u32) -> Option<
 }
 
 /// Find a collected argument's search scope, preserving enclosing scopes for formatting.
-pub(super) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usize>> {
+pub(super) fn collected_text_lines_with_spans(
+    source: &str,
+    line: u32,
+    known_spans: &[crate::tex::Span],
+    ignored: &[Range<usize>],
+) -> Option<Range<usize>> {
     let target = line.checked_sub(1)? as usize;
-    let mut hidden = super::nonprinting_source_spans(source).peekable();
+    let mut hidden = known_spans.iter().peekable();
     let mut i = 0;
     let mut counted_to = 0;
     let mut counted_lines = 0;
@@ -1021,13 +992,11 @@ pub(super) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usiz
         }
         let ch = source[i..].chars().next()?;
         if ch == '%' {
-            i += source[i..].find('\n').unwrap_or(source.len() - i);
+            i = super::comment_end(source, i);
         } else if ch == '\\' {
             let (name, end) = command(source, i);
             i = end;
-            if let Some(end) = quoted_token_end(source, name, i)
-                .or_else(|| opaque_command_end(source, name, i).map(|(end, _)| end))
-            {
+            if let Some((end, _)) = opaque_command_end(source, name, i) {
                 i = end;
             } else if let Some((first_printed, second_printed, end)) =
                 collected_text_arguments(source, name, i)
@@ -1039,7 +1008,7 @@ pub(super) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usiz
                         .filter(|c| *c == b'\n')
                         .count();
                 let last = first + source[start..end].bytes().filter(|c| *c == b'\n').count();
-                if collected_formatting_command(name) && (first..last).contains(&target) {
+                if closing_anchor_collector(name) && (first..last).contains(&target) {
                     // Nonclosing anchors retain ordinary proximity and nested collector discovery.
                     i = start;
                     continue;
@@ -1047,12 +1016,15 @@ pub(super) fn collected_text_lines(source: &str, line: u32) -> Option<Range<usiz
                 counted_to = end;
                 counted_lines = last;
                 if (first..=last).contains(&target) {
-                    if collected_formatting_command(name) {
+                    if closing_anchor_collector(name) {
                         // A trailing style wrapper must not hide the rest of a collected body.
-                        if let Some(enclosing) = super::source_frame_range(source, line)
-                            .or_else(|| super::source_tabularx_range(source, line))
-                            .or_else(|| math_lines(source, line))
-                            .filter(|scope| scope.start <= first && last < scope.end)
+                        if let Some(enclosing) =
+                            super::collected_lines(source, line, "frame", ignored)
+                                .or_else(|| {
+                                    super::collected_lines(source, line, "tabularx", ignored)
+                                })
+                                .or_else(|| math_lines_with_spans(source, line, known_spans))
+                                .filter(|scope| scope.start <= first && last < scope.end)
                         {
                             return Some(enclosing);
                         }
@@ -1179,6 +1151,8 @@ fn inline_context(source: &str, range: &Range<usize>, atoms: Vec<Atom>) -> Vec<A
 
 pub(super) fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, usize)> {
     at = super::skip_source_space(source, at);
+    // `\csname` and `\expandafter` targets are dynamic: no static macro is named.
+    let named = |name: &str| !name.is_empty() && !matches!(name, "csname" | "expandafter");
     if let Some((grp, next)) = group(source, at) {
         let target = &source[grp];
         let start = super::skip_source_space(target, 0);
@@ -1186,160 +1160,14 @@ pub(super) fn macro_target_name(source: &str, mut at: usize) -> Option<(&str, us
             return None;
         }
         let (name, end) = command(target, start);
-        (!name.is_empty()
-            && !matches!(name, "csname" | "expandafter")
-            && super::skip_source_space(target, end) == target.len())
-        .then_some((name, next))
+        (named(name) && super::skip_source_space(target, end) == target.len())
+            .then_some((name, next))
     } else if source.as_bytes().get(at) == Some(&b'\\') {
-        let (name, next) = control_sequence(source, at);
-        (!name.is_empty() && !matches!(name, "csname" | "expandafter")).then_some((name, next))
+        let (name, next) = command(source, at);
+        named(name).then_some((name, next))
     } else {
         None
     }
-}
-
-pub(super) fn macro_target_end(source: &str, mut at: usize) -> Option<usize> {
-    at = super::skip_source_space(source, at);
-    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-    at = super::skip_source_space(source, at);
-    while source.as_bytes().get(at) == Some(&b'\\') && command(source, at).0 == "expandafter" {
-        at = super::skip_source_space(source, command(source, at).1);
-        at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
-        at = super::skip_source_space(source, at);
-    }
-    if let Some((_, end)) = group(source, at) {
-        Some(end)
-    } else if source.as_bytes().get(at) == Some(&b'\\') {
-        Some(control_sequence(source, at).1)
-    } else {
-        None
-    }
-}
-
-/// Known mutation APIs invalidate their static target; unknown dispatch invalidates all targets.
-pub(super) fn macro_mutation_target<'a>(
-    source: &'a str,
-    command: &str,
-    at: usize,
-) -> Option<(&'a str, usize)> {
-    let command = command
-        .strip_prefix("protected@")
-        .filter(|name| {
-            matches!(
-                *name,
-                "eappto"
-                    | "xappto"
-                    | "epreto"
-                    | "xpreto"
-                    | "cseappto"
-                    | "csxappto"
-                    | "csepreto"
-                    | "csxpreto"
-            )
-        })
-        .unwrap_or(command);
-    let named = command.strip_prefix("cs");
-    if matches!(
-        named.unwrap_or(command),
-        "appto" | "eappto" | "gappto" | "xappto" | "preto" | "epreto" | "gpreto" | "xpreto"
-    ) || matches!(command, "patchcmd" | "apptocmd" | "pretocmd")
-    {
-        let at = if command == "patchcmd" {
-            let start = super::skip_source_space(source, at);
-            if source.as_bytes().get(start) == Some(&b'[') {
-                match super::optional_argument_boundary(source, start) {
-                    Ok(end) => end,
-                    Err(end) => return Some(("**", end)),
-                }
-            } else {
-                at
-            }
-        } else {
-            at
-        };
-        let raw_target = |at| {
-            if source.as_bytes().get(at) != Some(&b'\\') {
-                return ("**", at);
-            }
-            let (name, end) = self::command(source, at);
-            (
-                if matches!(name, "" | "csname" | "expandafter") {
-                    "**"
-                } else {
-                    name
-                },
-                end,
-            )
-        };
-        let at = super::skip_source_space(source, at);
-        if let Some((span, end)) = group(source, at) {
-            let name = if named.is_some() {
-                literal_csname(&source[span]).unwrap_or("**")
-            } else {
-                let (name, next) = raw_target(super::skip_source_space(source, span.start));
-                if super::skip_source_space(source, next) == span.end {
-                    name
-                } else {
-                    "**"
-                }
-            };
-            return Some((name, end));
-        }
-        return Some(if named.is_some() {
-            ("**", at)
-        } else {
-            raw_target(at)
-        });
-    }
-    if matches!(
-        command,
-        "AtBeginEnvironment"
-            | "AtEndEnvironment"
-            | "BeforeBeginEnvironment"
-            | "AfterEndEnvironment"
-    ) {
-        let start = super::skip_source_space(source, at);
-        let at = if source.as_bytes().get(start) == Some(&b'[') {
-            match super::optional_argument_boundary(source, start) {
-                Ok(end) => end,
-                Err(end) => return Some(("**", end)),
-            }
-        } else {
-            at
-        };
-        return Some(
-            group(source, at)
-                .map(|(span, end)| (literal_csname(&source[span]).unwrap_or("**"), end))
-                .unwrap_or(("**", at)),
-        );
-    }
-    if matches!(
-        command,
-        "AddToHook" | "AddToHookNext" | "AddToHookWithArguments" | "AddToHookNextWithArguments"
-    ) {
-        let Some((span, end)) = group(source, at) else {
-            return Some(("**", at));
-        };
-        let Some(hook) = literal_csname(&source[span]) else {
-            return Some(("**", end));
-        };
-        if let Some(target) = hook
-            .strip_prefix("cmd/")
-            .or_else(|| hook.strip_prefix("env/"))
-        {
-            return Some(
-                target
-                    .rsplit_once('/')
-                    .filter(|(name, phase)| !name.is_empty() && !phase.is_empty())
-                    .map_or(("**", end), |(name, _)| (name, end)),
-            );
-        }
-        if hook.starts_with("file/") {
-            return Some(("input", end));
-        }
-        return Some(("**", end));
-    }
-    None
 }
 
 pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
@@ -1364,204 +1192,180 @@ pub(crate) fn is_macro_definition_command(cmd: &str) -> bool {
             | "xdef"
             | "let"
             | "futurelet"
-            | "csname"
-            | "newif"
             | "pgfmathsetmacro"
             | "pgfmathtruncatemacro"
     )
 }
 
-pub(super) fn definition_command(source: &str, start: usize) -> (&str, usize, bool) {
-    let (name, end) = static_command(source, start);
-    if name == "csname" {
-        return (name, start + name.len() + 1, false);
-    }
-    if name == "expandafter" {
-        let next = super::skip_source_space(source, end);
-        if source.as_bytes().get(next) == Some(&b'\\') {
-            let (name, end) = command(source, next);
-            if is_macro_definition_command(name) && !matches!(name, "csname" | "newif") {
-                return (name, end, true);
-            }
-        }
-    }
-    (name, end, false)
-}
+pub(super) type MacroTable<'a> = BTreeMap<&'a str, Option<MacroDef<'a>>>;
 
-pub(super) struct MacroAlias<'a> {
-    pub name: &'a str,
-    pub value: Range<usize>,
-    pub nonprinting_end: usize,
-}
-
-fn alias_token(source: &str, mut at: usize, mut skip_blanks: bool) -> Option<(Range<usize>, bool)> {
-    while at < source.len() {
-        let ch = source[at..].chars().next()?;
-        if ch == '%' {
-            at += source[at..].find('\n').map_or(source.len() - at, |n| n + 1);
-            skip_blanks = true;
-        } else if ch.is_ascii_whitespace() {
-            let start = at;
-            at += source[at..]
-                .bytes()
-                .take_while(u8::is_ascii_whitespace)
-                .count();
-            if !skip_blanks {
-                return Some((start..at, true));
-            }
-        } else if ch == '\\' {
-            let (name, end) = command(source, at);
-            return Some((
-                at..end,
-                name.as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@'),
-            ));
-        } else {
-            return Some((at..at + ch.len_utf8(), false));
-        }
-    }
-    None
-}
-
-pub(super) fn macro_alias<'a>(
-    source: &'a str,
-    cmd: &str,
-    mut at: usize,
-    expanded_target: bool,
-) -> MacroAlias<'a> {
-    at = super::skip_source_space(source, at);
-    let mut expanded_value = false;
-    let (mut name, target_end) = if source.as_bytes().get(at) == Some(&b'\\') {
-        let (raw, end) = command(source, at);
-        if raw == "expandafter" {
-            let target = super::skip_source_space(source, end);
-            if expanded_target && source.as_bytes().get(target) == Some(&b'\\') {
-                let (name, end) = command(source, target);
-                if !matches!(name, "csname" | "expandafter") {
-                    expanded_value = true;
-                    (name, end)
-                } else {
-                    ("**", macro_target_end(source, at).unwrap_or(end))
-                }
-            } else {
-                ("**", macro_target_end(source, at).unwrap_or(end))
-            }
-        } else if raw == "csname" {
-            if expanded_target {
-                let (name, end) = control_sequence(source, at);
-                (if name == "csname" { "**" } else { name }, end)
-            } else {
-                ("**", end)
-            }
-        } else {
-            (raw, end)
-        }
-    } else {
-        (
-            "**",
-            at + source[at..].chars().next().map_or(0, char::len_utf8),
-        )
-    };
-    if cmd == "futurelet" {
-        // The consumed endcsname controls blanks, not the constructed identifier.
-        let skip_blanks = source.as_bytes()[..target_end]
-            .last()
-            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'@');
-        let value = alias_token(source, target_end, skip_blanks)
-            .and_then(|(first, skip)| alias_token(source, first.end, skip))
-            .map_or(target_end..target_end, |(value, _)| value);
-        return MacroAlias {
-            name,
-            value,
-            // Both lookahead tokens execute after the assignment.
-            nonprinting_end: target_end,
-        };
-    }
-    at = super::skip_source_space(source, target_end);
-    if source.as_bytes().get(at) == Some(&b'=') {
-        expanded_value = false;
-        at = super::skip_source_space(source, at + 1);
-    }
-    let value = if expanded_value && source.as_bytes().get(at) == Some(&b'\\') {
-        let (raw, _) = command(source, at);
-        let (value, end) = control_sequence(source, at);
-        if raw != "csname" || value == "csname" {
-            name = "**";
-        }
-        at..end
-    } else {
-        alias_token(source, at, true).map_or(at..at, |(value, _)| value)
-    };
-    MacroAlias {
-        name,
-        nonprinting_end: value.end,
-        value,
-    }
-}
-
-pub(super) fn environment_end_name<'a>(
-    table: &BTreeMap<&'a str, Option<MacroDef<'a>>>,
-    environment: &str,
-) -> Option<&'a str> {
-    table
-        .range("end"..)
-        .take_while(|(name, _)| name.starts_with("end"))
-        .find_map(|(&name, _)| (name.strip_prefix("end") == Some(environment)).then_some(name))
-}
-
-pub(crate) fn macros_from_sources<'a>(
-    sources: &[&'a str],
-    operation: &crate::Operation,
-) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
-    macros_from_sources_with_mode(sources, false, operation)
-}
-
-// Permissive definition hints; the native region decides whether a column is compatible.
-pub(super) fn macros_from_sources_for_guess<'a>(
-    sources: &[&'a str],
-    operation: &crate::Operation,
-) -> BTreeMap<&'a str, Option<MacroDef<'a>>> {
-    macros_from_sources_with_mode(sources, true, operation)
-}
-
-type MacroTable<'a> = BTreeMap<&'a str, Option<MacroDef<'a>>>;
-
-fn macros_from_sources_with_mode<'a>(
+pub(super) fn macros_from_sources_with_mode<'a>(
     sources: &[&'a str],
     guess: bool,
+    known_spans: &[(&'a str, &[crate::tex::Span])],
     operation: &crate::Operation,
 ) -> MacroTable<'a> {
-    let mut table = MacroTable::new();
-    for &source in sources {
-        let mut nonprinting = crate::tex::nonprinting_source_spans(source).peekable();
-        let mut in_preamble = true;
-        let mut brace_depth = 0usize;
-        let mut group_depth = 0usize;
-        let mut if_stack: Vec<Option<bool>> = Vec::new();
-        let mut at = 0usize;
-        while at < source.len() {
+    let (mut table, bodies) =
+        scan_macros(sources, guess, known_spans, operation, &Default::default());
+    // A wrapper may call a note macro defined after it (`\outer` -> `\inner`
+    // -> `\note`): propagate over every replacement text, then rescan.
+    let mut callers: std::collections::BTreeSet<&'a str> = table
+        .iter()
+        .filter(|(_, def)| def.as_ref().is_some_and(|def| def.calls_note))
+        .map(|(name, _)| *name)
+        .collect();
+    loop {
+        if operation.check().is_err() {
+            return table;
+        }
+        let before = callers.len();
+        for &(name, body, _) in &bodies {
+            if !callers.contains(name) && body_calls_note(body, &table, &callers) {
+                callers.insert(name);
+            }
+        }
+        if callers.len() == before {
+            break;
+        }
+    }
+    if bodies
+        .iter()
+        .any(|&(name, _, had_note)| !had_note && callers.contains(name))
+    {
+        table = scan_macros(sources, guess, known_spans, operation, &callers).0;
+    }
+    // Parameters a later-defined wrapper discards are not printed either.
+    while table
+        .values()
+        .flatten()
+        .any(|def| (0..def.arity).any(|idx| def.used_params & (1 << idx) == 0))
+    {
+        let mut changed = false;
+        for &(name, body, _) in &bodies {
             if operation.check().is_err() {
                 return table;
             }
+            let Some(Some(def)) = table.get(name).cloned().filter(|_| body.contains('\\')) else {
+                continue;
+            };
+            if def.used_params == 0 {
+                continue;
+            }
+            let used = printed_parameters(body, def.arity, &table, operation).0 & def.used_params;
+            if used != def.used_params {
+                table.insert(
+                    name,
+                    Some(MacroDef {
+                        used_params: used,
+                        ..def
+                    }),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    table
+}
+
+/// Record a (re)definition. Conflicting meanings stay unknown, except that a
+/// note-calling meaning keeps the widest signature with no argument printed.
+fn record_definition<'a>(table: &mut MacroTable<'a>, name: &'a str, def: Option<MacroDef<'a>>) {
+    let merged = match (table.get(name).cloned(), def) {
+        (None, def) => def,
+        (Some(Some(existing)), Some(def)) if existing == def && def.body.is_some() => return,
+        (Some(old), new) => {
+            let signature = |def: &Option<MacroDef<'_>>| {
+                def.as_ref()
+                    .map_or((0, 0), |def| (def.arity, def.opt_params))
+            };
+            let (arity, opt_params) = signature(&old).max(signature(&new));
+            let calls_note = [old, new].into_iter().flatten().any(|def| def.calls_note);
+            calls_note.then_some(MacroDef {
+                arity,
+                used_params: 0,
+                opt_params,
+                body: None,
+                calls_note,
+            })
+        }
+    };
+    table.insert(name, merged);
+}
+
+/// Scan standard LaTeX and xparse definitions, returning the table plus every
+/// `(name, replacement text, calls_note)` for forward note propagation.
+#[allow(clippy::type_complexity)]
+fn scan_macros<'a>(
+    sources: &[&'a str],
+    guess: bool,
+    known_spans: &[(&'a str, &[crate::tex::Span])],
+    operation: &crate::Operation,
+    forward: &std::collections::BTreeSet<&str>,
+) -> (MacroTable<'a>, Vec<(&'a str, &'a str, bool)>) {
+    let mut table = MacroTable::new();
+    let mut bodies = Vec::new();
+    for &source in sources {
+        let known = known_spans
+            .iter()
+            .find_map(|(s, spans)| std::ptr::eq(*s, source).then_some(*spans));
+        let mut masked: std::borrow::Cow<'_, [crate::tex::Span]> = match known {
+            Some(spans) => spans.into(),
+            None => super::nonprinting_source_spans(source)
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let mut next_mask = 0usize;
+        let current_nonprinting =
+            |masked: &[crate::tex::Span], next_mask: &mut usize, limit: usize| {
+                while masked
+                    .get(*next_mask)
+                    .is_some_and(|(_, span, _)| span.end <= limit)
+                {
+                    *next_mask += 1;
+                }
+                masked.get(*next_mask).cloned()
+            };
+        let mut in_preamble = true;
+        let mut brace_depth = 0usize;
+        let mut group_depth = 0usize;
+        let mut conditionals = super::ConditionalStack::default();
+        let mut at = 0usize;
+        while at < source.len() {
+            if operation.check().is_err() {
+                return (table, bodies);
+            }
+            if conditionals.skipping() {
+                let ifthenelse_opens = !guess || table.contains_key("ifthenelse");
+                at = conditionals.skip_token(source, at, ifthenelse_opens);
+                if !conditionals.skipping() {
+                    super::resume_nonprinting_spans(source, at, &mut masked, &mut next_mask);
+                }
+                continue;
+            }
             match source.as_bytes()[at] {
                 b'%' => {
-                    at += source[at..].find('\n').unwrap_or(source.len() - at);
+                    at = super::comment_end(source, at);
                 }
-                b'{' => {
-                    brace_depth += 1;
-                    at += 1;
-                }
-                b'}' => {
-                    brace_depth = brace_depth.saturating_sub(1);
+                b'{' | b'}' => {
+                    let reachable = !current_nonprinting(&masked, &mut next_mask, at)
+                        .is_some_and(|(_, span, _)| span.contains(&at));
+                    if reachable {
+                        if source.as_bytes()[at] == b'{' {
+                            brace_depth += 1;
+                        } else {
+                            brace_depth = brace_depth.saturating_sub(1);
+                        }
+                    }
                     at += 1;
                 }
                 b'$' => {
                     if brace_depth == 0
                         && group_depth == 0
-                        && if_stack.is_empty()
-                        && !nonprinting
-                            .peek()
+                        && conditionals.is_empty()
+                        && !current_nonprinting(&masked, &mut next_mask, at)
                             .is_some_and(|(_, span, _)| span.contains(&at))
                     {
                         in_preamble = false;
@@ -1570,31 +1374,12 @@ fn macros_from_sources_with_mode<'a>(
                 }
                 b'\\' => {
                     let start = at;
-                    while nonprinting
-                        .peek()
-                        .is_some_and(|(_, span, _)| span.end <= start)
-                    {
-                        nonprinting.next();
-                    }
-                    let (cmd, end, expanded_target) = definition_command(source, at);
+                    let current_span = current_nonprinting(&masked, &mut next_mask, start);
+                    let (cmd, end) = command(source, at);
                     at = end;
-                    let executing = !nonprinting
-                        .peek()
+                    let executing = !current_span
+                        .as_ref()
                         .is_some_and(|(_, span, _)| span.contains(&start));
-                    if !table.contains_key(cmd)
-                        && let Some(quoted_end) = quoted_token_end(source, cmd, at)
-                    {
-                        // Stored token lists balance braces before quoted tokens execute.
-                        if executing
-                            || !matches!(
-                                source.as_bytes().get(super::skip_source_space(source, at)),
-                                Some(b'{' | b'}')
-                            )
-                        {
-                            at = quoted_end;
-                        }
-                        continue;
-                    }
                     if executing
                         && !table.contains_key(cmd)
                         && let Some((opaque_end, _)) = opaque_command_end(source, cmd, at)
@@ -1602,8 +1387,14 @@ fn macros_from_sources_with_mode<'a>(
                         at = opaque_end;
                         continue;
                     }
+                    // Strict mode keeps an unknown `\ifthenelse` as an unbalanced conditional.
+                    if executing
+                        && conditionals.apply(cmd, !guess || table.contains_key("ifthenelse"))
+                    {
+                        continue;
+                    }
                     if executing && matches!(cmd, "(" | "[") {
-                        if brace_depth == 0 && group_depth == 0 && if_stack.is_empty() {
+                        if brace_depth == 0 && group_depth == 0 && conditionals.is_empty() {
                             in_preamble = false;
                         }
                         continue;
@@ -1616,32 +1407,10 @@ fn macros_from_sources_with_mode<'a>(
                         group_depth = group_depth.saturating_sub(1);
                         continue;
                     }
-                    if executing
-                        && cmd.starts_with("if")
-                        && cmd != "iff"
-                        && !(guess && cmd == "ifthenelse" && !table.contains_key(cmd))
-                    {
-                        if_stack.push(match cmd {
-                            "iftrue" => Some(true),
-                            "iffalse" => Some(false),
-                            _ => None,
-                        });
-                        continue;
-                    }
-                    if executing && cmd == "else" {
-                        if let Some(last) = if_stack.last_mut() {
-                            *last = last.map(|value| !value);
-                        }
-                        continue;
-                    }
-                    if executing && cmd == "fi" {
-                        if_stack.pop();
-                        continue;
-                    }
                     if executing && cmd == "begin" {
                         if let Some((env, next)) = group(source, at) {
                             if &source[env] == "document"
-                                || (brace_depth == 0 && group_depth == 0 && if_stack.is_empty())
+                                || (brace_depth == 0 && group_depth == 0 && conditionals.is_empty())
                             {
                                 in_preamble = false;
                             }
@@ -1657,76 +1426,38 @@ fn macros_from_sources_with_mode<'a>(
                         }
                         continue;
                     }
-                    if cmd == "csname" {
+                    let reachable = executing
+                        || current_span
+                            .as_ref()
+                            .is_some_and(|(head, _, _)| *head == start);
+                    // A definition inside text TeX never runs keeps earlier meanings.
+                    if !reachable || !is_macro_definition_command(cmd) {
                         continue;
                     }
-                    if cmd == "newif" {
-                        if let Some((name, _)) = macro_target_name(source, at) {
-                            table.insert(name, None);
-                        }
-                        at = macro_target_end(source, at).unwrap_or(at);
-                        continue;
-                    }
-                    if let Some((name, next)) = macro_mutation_target(source, cmd, at) {
-                        table.insert(name, None);
-                        at = next;
-                        continue;
-                    }
-                    if matches!(cmd, "let" | "futurelet") {
-                        let alias = macro_alias(source, cmd, at, expanded_target);
-                        table.insert(alias.name, None);
-                        // Stored assignment tokens cannot consume their enclosing group delimiters.
-                        if executing {
-                            at = alias.nonprinting_end;
-                        }
-                        continue;
-                    }
-                    if let Some((name, _, _)) = crate::tex::environment_definition(source, cmd, at)
-                    {
-                        if let Some(end_name) = environment_end_name(&table, name) {
-                            table.insert(end_name, None);
-                        }
-                        if let Some(entry) = table.get_mut(name) {
-                            *entry = None;
-                        }
-                        continue;
-                    }
-                    let top_level = (executing
-                        || nonprinting
-                            .peek()
-                            .is_some_and(|(head, _, _)| *head == start))
-                        && in_preamble
-                        && brace_depth == 0
-                        && group_depth == 0
-                        && if_stack.is_empty()
-                        && (expanded_target
-                            || !source[super::skip_source_space(source, at)..]
-                                .starts_with("\\csname"));
+                    // Untracked bindings only forget their target's meaning.
                     if matches!(
                         cmd,
-                        "edef"
-                            | "xdef"
-                            | "NewDocumentCommand"
-                            | "RenewDocumentCommand"
-                            | "ProvideDocumentCommand"
-                            | "DeclareDocumentCommand"
-                            | "NewExpandableDocumentCommand"
-                            | "RenewExpandableDocumentCommand"
-                            | "ProvideExpandableDocumentCommand"
-                            | "DeclareExpandableDocumentCommand"
-                            | "pgfmathsetmacro"
-                            | "pgfmathtruncatemacro"
+                        "let" | "futurelet" | "pgfmathsetmacro" | "pgfmathtruncatemacro"
                     ) {
-                        if let Some((name, _)) = macro_target_name(source, at) {
-                            table.insert(name, None);
+                        if let Some((name, next)) = macro_target_name(source, at) {
+                            record_definition(&mut table, name, None);
+                            at = next;
                         }
                         continue;
                     }
-                    let mut optional_default = None;
-                    let (name, arity) = if matches!(cmd, "def" | "gdef") {
-                        let Some((name, mut next)) = macro_target_name(source, at) else {
-                            continue;
-                        };
+                    let top_level = in_preamble
+                        && brace_depth == 0
+                        && group_depth == 0
+                        && conditionals.is_empty();
+                    // Bodies expanded at definition time or by xparse are never
+                    // expanded here; they keep only a signature.
+                    let expandable = !matches!(cmd, "edef" | "xdef") && !cmd.contains("Document");
+                    at += usize::from(matches!(source.as_bytes().get(at), Some(b'*' | b'+')));
+                    let target = super::skip_definition_overlay(source, at);
+                    let Some((name, mut next)) = macro_target_name(source, target) else {
+                        continue;
+                    };
+                    let signature = if matches!(cmd, "def" | "gdef" | "edef" | "xdef") {
                         let mut arity = Some(0u8);
                         loop {
                             next = super::skip_source_space(source, next);
@@ -1748,89 +1479,75 @@ fn macros_from_sources_with_mode<'a>(
                                 break;
                             }
                         }
-                        at = next;
-                        (name, arity)
+                        if arity.is_none() {
+                            // Delimited parameters: the replacement text still follows.
+                            next = super::macro_definition_body_start(source, cmd, next);
+                        }
+                        arity.map(|arity| (arity, 0u16))
                     } else if cmd == "DeclareMathOperator" {
-                        let Some((name, next)) = macro_target_name(source, at) else {
+                        Some((0u8, 0u16))
+                    } else if cmd.contains("DocumentCommand") {
+                        let Some((spec, end)) = group(source, next) else {
+                            record_definition(&mut table, name, None);
                             continue;
                         };
-                        at = next;
-                        (name, Some(0u8))
-                    } else if matches!(
-                        cmd,
-                        "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand"
-                    ) {
-                        let Some((name, mut next)) = macro_target_name(source, at) else {
-                            continue;
-                        };
-                        let mut arity = (cmd != "providecommand").then_some(0u8);
+                        next = end;
+                        spec_signature(&source[spec])
+                    } else {
+                        let mut signature = (cmd != "providecommand").then_some((0u8, 0u16));
                         if let Some(opt_end) = super::optional_argument_end(source, next) {
                             let opt = source
                                 [super::skip_source_space(source, next) + 1..opt_end - 1]
                                 .trim();
-                            arity = arity
+                            signature = signature
                                 .filter(|_| opt.len() == 1 && opt.as_bytes()[0].is_ascii_digit())
-                                .map(|_| opt.as_bytes()[0] - b'0');
+                                .map(|_| (opt.as_bytes()[0] - b'0', 0));
                             next = opt_end;
                             while let Some(extra_end) = super::optional_argument_end(source, next) {
-                                optional_default.get_or_insert(next);
-                                arity = None;
+                                // `[arity][default]`: the first parameter is optional.
+                                signature = signature
+                                    .filter(|&(arity, opt_params)| arity > 0 && opt_params == 0)
+                                    .map(|(arity, _)| (arity, 1));
                                 next = extra_end;
                             }
                         }
-                        at = next;
-                        (name, arity)
-                    } else {
-                        continue;
+                        signature
                     };
-                    let body_open = super::skip_source_space(source, at);
-                    let Some((body_range, _)) = group(source, body_open) else {
-                        table.insert(name, None);
-                        continue;
-                    };
-                    at = optional_default.unwrap_or(body_open);
-                    let Some(arity) = arity.filter(|_| top_level) else {
-                        table.insert(name, None);
+                    at = next;
+                    let Some((body_range, body_end)) = group(source, at) else {
+                        record_definition(&mut table, name, None);
                         continue;
                     };
                     let body = &source[body_range];
-                    let mut valid = !body.contains('$') && !body.contains("^^");
-                    let mut seen_params = 0u16;
-                    let mut used_params = 0u16;
-                    for (idx, _) in body.match_indices('#') {
-                        if crate::tex::has_unescaped_backslash_before(body, idx) {
-                            continue;
-                        }
-                        if let Some(d) = body
-                            .as_bytes()
-                            .get(idx + 1)
-                            .filter(|b| (b'1'..=b'0' + arity).contains(b))
-                            .map(|b| b - b'1')
-                        {
-                            used_params |= 1 << d;
-                            if (seen_params >> d) != 0 {
-                                valid = false;
-                            }
-                            seen_params |= 1 << d;
-                        } else {
-                            valid = false;
-                        }
-                    }
+                    // The replacement text is stored, not run.
+                    at = body_end;
+                    let calls_note = body_calls_note(body, &table, forward);
+                    bodies.push((name, body, calls_note));
+                    let expanded = top_level && expandable;
+                    let Some((arity, opt_params)) = signature.filter(|_| expanded || calls_note)
+                    else {
+                        let def = calls_note.then_some(MacroDef {
+                            arity: 0,
+                            used_params: 0,
+                            opt_params: 0,
+                            body: None,
+                            calls_note,
+                        });
+                        record_definition(&mut table, name, def);
+                        continue;
+                    };
+                    let (used_params, valid) = printed_parameters(body, arity, &table, operation);
+                    // A call may omit an optional argument: never expand it inline.
+                    let inline = expanded && opt_params == 0 && cmd != "providecommand";
                     let def = MacroDef {
                         arity,
                         used_params,
-                        body_source: body,
-                        body: valid.then_some(body),
+                        opt_params,
+                        body: (inline && valid && !body.contains('$') && !body.contains("^^"))
+                            .then_some(body),
+                        calls_note,
                     };
-                    match table.get(name) {
-                        Some(Some(existing)) if *existing == def && def.body.is_some() => {}
-                        Some(_) => {
-                            table.insert(name, None);
-                        }
-                        None => {
-                            table.insert(name, Some(def));
-                        }
-                    }
+                    record_definition(&mut table, name, Some(def));
                 }
                 _ => {
                     let rest = &source.as_bytes()[at + 1..];
@@ -1843,8 +1560,106 @@ fn macros_from_sources_with_mode<'a>(
             }
         }
     }
-    table.remove("**");
-    table
+    (table, bodies)
+}
+
+/// Whether `body` invokes `\note`, directly or through a note wrapper recorded
+/// so far or (in `forward`) defined later.
+fn body_calls_note(
+    body: &str,
+    table: &MacroTable<'_>,
+    forward: &std::collections::BTreeSet<&str>,
+) -> bool {
+    super::control_words(body, 0..body.len()).any(|(_, name, _)| {
+        forward.contains(name)
+            || match table.get(name) {
+                None => name == "note",
+                Some(def) => def.as_ref().is_some_and(|def| def.calls_note),
+            }
+    })
+}
+
+/// `(arity, opt_params)` of an xparse signature made only of mandatory
+/// `m`/`+m` and optional `o`/`+o`/`O{default}`/`+O{default}` arguments: bit
+/// `i` of `opt_params` marks parameter `#i+1` as a bracketed optional argument.
+pub(crate) fn spec_signature(spec: &str) -> Option<(u8, u16)> {
+    let bytes = spec.as_bytes();
+    let (mut arity, mut opt_params) = (0u8, 0u16);
+    let mut at = 0;
+    loop {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return Some((arity, opt_params));
+        }
+        if arity == 9 {
+            return None;
+        }
+        at += usize::from(bytes[at] == b'+');
+        match bytes.get(at)? {
+            b'm' => at += 1,
+            b'o' => {
+                opt_params |= 1 << arity;
+                at += 1;
+            }
+            b'O' => {
+                let (_, end) = group(spec, at + 1)?;
+                opt_params |= 1 << arity;
+                at = end;
+            }
+            _ => return None,
+        }
+        arity += 1;
+    }
+}
+
+/// Parameters `#1..#arity` printed outside arguments the replacement text
+/// discards, and whether each appears at most once with none out of range.
+pub(crate) fn printed_parameters(
+    body: &str,
+    arity: u8,
+    table: &MacroTable<'_>,
+    operation: &crate::Operation,
+) -> (u16, bool) {
+    let hidden =
+        crate::tex::discarded_macro_args(body, true, 0..body.len(), table, None, None, operation)
+            .map(|(hidden, _)| hidden)
+            .unwrap_or_default();
+    let mut valid = true;
+    let mut seen_params = 0u16;
+    let mut used_params = 0u16;
+    let mut line_offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let visible = crate::tex::source_line_text(line);
+        for (rel_idx, _) in visible.match_indices('#') {
+            if crate::tex::has_unescaped_backslash_before(visible, rel_idx) {
+                continue;
+            }
+            let idx = line_offset + rel_idx;
+            if let Some(d) = visible
+                .as_bytes()
+                .get(rel_idx + 1)
+                .filter(|b| (b'1'..=b'0' + arity).contains(b))
+                .map(|b| b - b'1')
+            {
+                if hidden.iter().any(|range| range.contains(&idx)) {
+                    continue;
+                }
+                used_params |= 1 << d;
+                // `#d` after `#d` or a later parameter would print argument text twice or out
+                // of source order; `MacroDef.body` inlines only when atoms keep source order.
+                if (seen_params >> d) != 0 {
+                    valid = false;
+                }
+                seen_params |= 1 << d;
+            } else {
+                valid = false;
+            }
+        }
+        line_offset += line.len();
+    }
+    (used_params, valid)
 }
 
 fn skip_tex_dimen(source: &str, mut pos: usize, limit: usize) -> Option<usize> {
@@ -1960,6 +1775,7 @@ fn atoms_with_macros<'a>(
                 }
             }
             '_' | '^' => {
+                // `^^` is a TeX character escape (`^^61` or `^^A`), not a script.
                 if ch == '^' && source[i..range.end].starts_with('^') {
                     i += 1;
                     let hex = source[i..range.end]
@@ -2067,7 +1883,11 @@ fn atoms_with_macros<'a>(
                     let (environment, mut end) =
                         group(source, i).filter(|(_, e)| *e <= range.end)?;
                     let environment = &source[environment];
-                    let base = environment.trim_end_matches('*');
+                    let base = if environment == "tabular*" {
+                        environment
+                    } else {
+                        environment.trim_end_matches('*')
+                    };
                     if (matches!(
                         base,
                         "aligned" | "gathered" | "lgathered" | "rgathered" | "multlined"
@@ -2139,9 +1959,10 @@ fn atoms_with_macros<'a>(
                     i = end;
                     continue;
                 }
-                let macro_entry = macros.get(name).copied();
+                let macro_entry = macros.get(name);
                 if let Some(macro_entry) = macro_entry {
                     if let Some(def) = macro_entry
+                        && def.opt_params == 0
                         && depth + 16 <= 64
                     {
                         let mut call_args = Vec::with_capacity(usize::from(def.arity));
@@ -2224,14 +2045,12 @@ fn atoms_with_macros<'a>(
                 }
                 if name == "not" {
                     let next = super::skip_source_space(source, i).min(range.end);
-                    let negated = if source[next..range.end].starts_with('=') {
-                        Some(('≠', next + 1))
-                    } else if source[next..range.end].starts_with('<') {
-                        Some(('≮', next + 1))
-                    } else if source[next..range.end].starts_with('>') {
-                        Some(('≯', next + 1))
-                    } else if source[next..range.end].starts_with('|') {
-                        Some(('∤', next + 1))
+                    let negated = if let Some(c) = source[next..range.end]
+                        .chars()
+                        .next()
+                        .filter(|c| matches!(c, '=' | '<' | '>' | '|'))
+                    {
+                        negate_char(c).map(|negated| (negated, next + 1))
                     } else if source[next..range.end].starts_with('\\') {
                         let (next_cmd, next_end) = command(source, next);
                         if macros.contains_key(next_cmd) {
@@ -2311,7 +2130,8 @@ fn atoms_with_macros<'a>(
                             append(&mut result, '\0', span);
                         }
                     }
-                    MathCommand::Sqrt => {
+                    kind @ (MathCommand::Sqrt | MathCommand::ExtensibleArrow(_)) => {
+                        // A root index or arrow label prints apart, between gap atoms.
                         if let Some(opt_end) =
                             super::optional_argument_end(source, i).filter(|e| *e <= range.end)
                         {
@@ -2330,29 +2150,12 @@ fn atoms_with_macros<'a>(
                             append(&mut result, '\0', span.clone());
                             i = opt_end;
                         }
-                        append(&mut result, '√', span);
-                    }
-                    MathCommand::ExtensibleArrow(arrow) => {
-                        if let Some(opt_end) =
-                            super::optional_argument_end(source, i).filter(|e| *e <= range.end)
-                        {
-                            let opt_start = super::skip_source_space(source, i) + 1;
-                            append(&mut result, '\0', span.clone());
-                            let sub = atoms_with_macros(
-                                source,
-                                opt_start..opt_end - 1,
-                                (macros, operation),
-                                depth + 1,
-                                span_override.clone(),
-                                args,
-                                has_unknown,
-                            )?;
-                            result.extend(sub);
-                            append(&mut result, '\0', span.clone());
-                            i = opt_end;
+                        if let MathCommand::ExtensibleArrow(arrow) = kind {
+                            append(&mut result, arrow, span.clone());
+                            append(&mut result, '\0', span);
+                        } else {
+                            append(&mut result, '√', span);
                         }
-                        append(&mut result, arrow, span.clone());
-                        append(&mut result, '\0', span);
                     }
                     MathCommand::Symbol(c) => append(&mut result, c, span),
                     MathCommand::MultiSymbol(chars) => {
@@ -2392,173 +2195,67 @@ fn private_use(c: char) -> bool {
 /// `\u{237f}`, `\mapsfromchar` `\u{23ae}`, `\lhook` `\u{297c}`, `\rhook`
 /// `\u{297d}`, `\dasharrow` shaft `\u{23af}`, stacked harpoons `\u{296a}`/`\u{296b}`)
 /// are dedicated non-symbol connector pieces that never occur as standalone math symbols.
+///
+/// Composites reduce on a stack of adjacent atoms, so a composite closes over an earlier
+/// one (`⎯`, `⎯`, `⎯`, `⇢` is one `⇢`) in a single in-place pass.
 fn collapse_pdf_composites(atoms: &mut Vec<Atom>) {
-    let negated = |c: char| match c {
-        '=' => Some('≠'),
-        '∈' => Some('∉'),
-        '∋' => Some('∌'),
-        '∃' => Some('∄'),
-        '≡' => Some('≢'),
-        '<' => Some('≮'),
-        '>' => Some('≯'),
-        '≤' | '≦' => Some('≰'),
-        '≥' | '≧' => Some('≱'),
-        '≺' => Some('⊀'),
-        '≻' => Some('⊁'),
-        '⪯' => Some('⋠'),
-        '⪰' => Some('⋡'),
-        '⊂' => Some('⊄'),
-        '⊃' => Some('⊅'),
-        '⊆' | '⫅' => Some('⊈'),
-        '⊇' | '⫆' => Some('⊉'),
-        '⊑' => Some('⋢'),
-        '⊒' => Some('⋣'),
-        '~' | '∼' => Some('≁'),
-        '≃' => Some('≄'),
-        '≈' => Some('≉'),
-        '≅' => Some('≇'),
-        '≍' => Some('≭'),
-        '⊢' => Some('⊬'),
-        '⊨' => Some('⊭'),
-        '⊩' => Some('⊮'),
-        '⊪' => Some('⊯'),
-        '◁' | '⊲' => Some('⋪'),
-        '▷' | '⊳' => Some('⋫'),
-        '⊴' => Some('⋬'),
-        '⊵' => Some('⋭'),
-        '|' => Some('∤'),
-        '‖' => Some('∦'),
-        '←' => Some('↚'),
-        '→' => Some('↛'),
-        '↔' => Some('↮'),
-        '⇐' => Some('⇍'),
-        '⇒' => Some('⇏'),
-        '⇔' => Some('⇎'),
+    let triple = |a, b, c| match (a, b, c) {
+        ('⍿', '-', '→') => Some('⟼'),
+        ('⍿', '=', '⇒') => Some('⟾'),
+        ('←', '-', '⎮') => Some('⟻'),
+        ('⇐', '=', '⎮') => Some('⟽'),
         _ => None,
     };
-    let mut i = 0;
-    while i + 1 < atoms.len() {
-        if atoms[i].span.end != atoms[i + 1].span.start {
-            i += 1;
-            continue;
-        }
-        if i + 2 < atoms.len() && atoms[i + 1].span.end == atoms[i + 2].span.start {
-            let triple = match (atoms[i].value, atoms[i + 1].value, atoms[i + 2].value) {
-                ('⍿', '-', '→') => Some('⟼'),
-                ('⍿', '=', '⇒') => Some('⟾'),
-                ('←', '-', '⎮') => Some('⟻'),
-                ('⇐', '=', '⎮') => Some('⟽'),
-                ('⎯', '⎯', '⇢') => Some('⇢'),
-                ('⇠', '⎯', '⎯') => Some('⇠'),
+    let pair = |a, b| match (a, b) {
+        ('\u{20d2}', c) | (c, '\u{0338}') => negate_char(c),
+        ('⍿', '→') => Some('↦'),
+        ('⍿', '⇒') => Some('⤇'),
+        ('←', '⎮') | ('⎮', '←') => Some('↤'),
+        ('⇐', '⎮') | ('⎮', '⇐') => Some('⤆'),
+        ('⎯', '⇢') => Some('⇢'),
+        ('⇠', '⎯') => Some('⇠'),
+        ('⥼', '→') => Some('↪'),
+        ('←', '⥽') => Some('↩'),
+        ('⥪', '⥫') | ('⥫', '⥪') => Some('⇌'),
+        _ => None,
+    };
+    let adjacent = |a: &Atom, b: &Atom| a.span.end == b.span.start;
+    // `atoms[..len]` is the reduced prefix; atoms between it and `read` are spent.
+    let mut len = 0;
+    for read in 0..atoms.len() {
+        atoms.swap(len, read);
+        len += 1;
+        loop {
+            let top = &atoms[..len];
+            let reduced = match top {
+                [.., a, b, c] if adjacent(a, b) && adjacent(b, c) => {
+                    triple(a.value, b.value, c.value).map(|value| (3, value))
+                }
                 _ => None,
-            };
-            if let Some(value) = triple {
-                let end = atoms[i + 2].span.end;
-                atoms[i].value = value;
-                atoms[i].span.end = end;
-                atoms[i].word_join = false;
-                atoms.drain(i + 1..=i + 2);
-                continue;
             }
+            .or_else(|| match top {
+                [.., a, b] if adjacent(a, b) => pair(a.value, b.value).map(|value| (2, value)),
+                _ => None,
+            });
+            let Some((width, value)) = reduced else {
+                break;
+            };
+            let end = atoms[len - 1].span.end;
+            len -= width - 1;
+            let merged = &mut atoms[len - 1];
+            merged.value = value;
+            merged.span.end = end;
+            merged.word_join = false;
         }
-        let pair = match (atoms[i].value, atoms[i + 1].value) {
-            ('\u{20d2}', c) | (c, '\u{0338}') => negated(c),
-            ('⍿', '→') => Some('↦'),
-            ('⍿', '⇒') => Some('⤇'),
-            ('←', '⎮') | ('⎮', '←') => Some('↤'),
-            ('⇐', '⎮') | ('⎮', '⇐') => Some('⤆'),
-            ('⎯', '⇢') => Some('⇢'),
-            ('⇠', '⎯') => Some('⇠'),
-            ('⥼', '→') => Some('↪'),
-            ('←', '⥽') => Some('↩'),
-            ('⥪', '⥫') | ('⥫', '⥪') => Some('⇌'),
-            _ => None,
-        };
-        if let Some(value) = pair {
-            let end = atoms[i + 1].span.end;
-            atoms[i].value = value;
-            atoms[i].span.end = end;
-            atoms[i].word_join = false;
-            atoms.remove(i + 1);
-            continue;
-        }
-        i += 1;
     }
+    atoms.truncate(len);
 }
 
-#[cfg(test)]
-pub(super) fn source_location(
-    source: &str,
-    line: u32,
-    lines: Range<usize>,
-    within_frame: bool,
-    context: &str,
-    offset: usize,
-    prose: Option<(u32, usize, isize)>,
-) -> Option<(u32, usize)> {
-    let starts: Vec<_> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-    let limit = if let Some((row, _, _)) = prose {
-        (*starts.get(lines.end).unwrap_or(&source.len()))
-            .max(*starts.get(row as usize).unwrap_or(&source.len()))
-    } else {
-        *starts.get(lines.end).unwrap_or(&source.len())
-    };
-    source_location_with_context_mode(
-        source,
-        line,
-        lines,
-        within_frame,
-        context,
-        offset,
-        prose.map_or(crate::tex::ProseRank::Absent, |(row, byte, score)| {
-            crate::tex::ProseRank::Unique(row, byte, score)
-        }),
-        regions(source, limit),
-        &[],
-        &[],
-        &[],
-        &[],
-        crate::tex::WordLocationMode::Strict,
-        &crate::Operation::default(),
-        None,
-    )
-    .ok()
-    .flatten()
-}
+/// Atoms of the PDF `context`, the atom under `offset`, and the atoms of the PDF word
+/// around it (only the selected atom unless it is alphanumeric).
+type PdfWord = (Vec<Atom>, usize, Range<usize>);
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn source_location_with_context_mode(
-    source: &str,
-    line: u32,
-    lines: Range<usize>,
-    within_frame: bool,
-    context: &str,
-    offset: usize,
-    prose: crate::tex::ProseRank,
-    regions: Vec<Range<usize>>,
-    extra_sources: &[&str],
-    foreach_loops: &[crate::tex::ForeachLoop<'_>],
-    opaque: &[Range<usize>],
-    literal_owners: &[Range<usize>],
-    mode: crate::tex::WordLocationMode,
-    operation: &crate::Operation,
-    execution_scope: Option<&Range<usize>>,
-) -> Result<Option<(u32, usize)>, ()> {
-    operation.check().map_err(|_| ())?;
-    let starts: Vec<_> = std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-    let (prose, tied_score) = match prose {
-        crate::tex::ProseRank::Absent => (None, None),
-        crate::tex::ProseRank::Unique(row, byte, score) => (Some((row, byte, score)), None),
-        crate::tex::ProseRank::Tied(score) => (None, Some(score)),
-    };
-    let prose = prose.filter(|(row, byte, _)| {
-        let index = starts[*row as usize - 1] + byte;
-        !regions.iter().any(|range| range.contains(&index))
-    });
+fn pdf_context_word(context: &str, offset: usize) -> Option<PdfWord> {
     let mut pdf = Vec::new();
     for (i, c) in context.char_indices() {
         let join = pdf
@@ -2567,14 +2264,7 @@ pub(super) fn source_location_with_context_mode(
         append_joined(&mut pdf, c, i..i + c.len_utf8(), join);
     }
     collapse_pdf_composites(&mut pdf);
-    let Some(selected) = pdf.iter().position(|atom| atom.span.contains(&offset)) else {
-        return Ok(prose.map(|(row, byte, _)| (row, byte)));
-    };
-    if matches!(pdf[selected].value, '\0'..='\x03') || private_use(pdf[selected].value) {
-        return Ok(None);
-    }
-    // A letter inside an ordinary PDF word must match that entire word, not a
-    // nearby single-letter variable with the same spelling.
+    let selected = pdf.iter().position(|atom| atom.span.contains(&offset))?;
     let mut word = selected..selected + 1;
     if pdf[selected].value.is_alphanumeric() {
         while word.start > 0 && pdf[word.start].word_join {
@@ -2584,6 +2274,128 @@ pub(super) fn source_location_with_context_mode(
             word.end += 1;
         }
     }
+    Some((pdf, selected, word))
+}
+
+/// Gap and private-use glyphs carry no identity a source atom could match.
+fn unmatchable_pdf_atom(value: char) -> bool {
+    matches!(value, '\0'..='\x03') || private_use(value)
+}
+
+/// Start of the source `atoms` spelling the PDF word when `atoms[index]` stands for its
+/// selected atom; `None` when they differ or sit inside a longer source word.
+fn source_word_start(
+    atoms: &[Atom],
+    index: usize,
+    (pdf, selected, word): &PdfWord,
+) -> Option<usize> {
+    let begin = index.checked_sub(selected - word.start)?;
+    let candidate = atoms.get(begin..begin + word.len())?;
+    if !candidate
+        .iter()
+        .zip(&pdf[word.clone()])
+        .all(|(a, b)| a.value == b.value)
+    {
+        return None;
+    }
+    // A PDF word cannot be a substring of a longer source word.
+    let inside_longer_word = pdf[*selected].value.is_alphanumeric()
+        && (atoms[begin].word_join
+            || atoms
+                .get(begin + word.len())
+                .is_some_and(|next| next.word_join));
+    (!inside_longer_word).then_some(begin)
+}
+
+/// Whether a formula in `text` (note-owned TeX) renders the clicked PDF word.
+/// Rendered math (`α`) never equals its source spelling (`\alpha`), so
+/// note-owned formulas are compared as atoms rather than as source words.
+pub(super) fn text_math_renders_word(
+    text: &str,
+    macros: &MacroTable<'_>,
+    operation: &crate::Operation,
+    (context, offset): (&str, usize),
+) -> bool {
+    let Some(pdf_word) = pdf_context_word(context, offset) else {
+        return false;
+    };
+    let value = pdf_word.0[pdf_word.1].value;
+    if unmatchable_pdf_atom(value) {
+        return false;
+    }
+    let spans: Vec<_> = super::nonprinting_source_spans(text).collect();
+    for range in regions_with_spans(text, &spans) {
+        let mut unknown = false;
+        let Some(atoms) =
+            atoms_with_macros(text, range, (macros, operation), 0, None, &[], &mut unknown)
+        else {
+            // Unreadable note math cannot be ruled out.
+            return true;
+        };
+        if unknown {
+            // Neither can note math through an unexpanded command.
+            return true;
+        }
+        if (0..atoms.len()).any(|index| {
+            atoms[index].value == value && source_word_start(&atoms, index, &pdf_word).is_some()
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `body` invokes `\note`, directly or through a recorded wrapper.
+pub(crate) fn calls_note(body: &str, table: &MacroTable<'_>) -> bool {
+    body_calls_note(body, table, &std::collections::BTreeSet::new())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MathOutcome {
+    Located(u32, usize),
+    Absent,
+    Opaque,
+}
+
+pub(super) fn source_location_with_context_mode(
+    analysis: &crate::tex::SourceAnalysis<'_>,
+    scope: &crate::tex::WordRangeScope<'_>,
+    within_frame: bool,
+    (context, offset): (&str, usize),
+    prose: crate::tex::ProseRank,
+    regions: &[Range<usize>],
+    mode: crate::tex::WordLocationMode,
+) -> MathOutcome {
+    let source = analysis.source;
+    let starts = &analysis.line_starts;
+    let operation = analysis.operation;
+    let line = scope.line;
+    let lines = &scope.lines;
+    let foreach_loops = scope.foreach_loops;
+    let execution_scope = scope.execution_scope;
+    if operation.check().is_err() {
+        return MathOutcome::Opaque;
+    }
+    let (prose, tied_score) = match prose {
+        crate::tex::ProseRank::Absent => (None, None),
+        crate::tex::ProseRank::Unique(row, byte, score) => (Some((row, byte, score)), None),
+        crate::tex::ProseRank::Tied(score) => (None, Some(score)),
+        crate::tex::ProseRank::Opaque => return MathOutcome::Opaque,
+    };
+    let prose = prose.filter(|(row, byte, _)| {
+        !crate::tex::contains_byte(regions, starts[*row as usize - 1] + byte)
+    });
+    // A letter inside an ordinary PDF word must match that entire word, not a
+    // nearby single-letter variable with the same spelling.
+    let Some(pdf_word) = pdf_context_word(context, offset) else {
+        return prose.map_or(MathOutcome::Absent, |(row, byte, _)| {
+            MathOutcome::Located(row, byte)
+        });
+    };
+    let (pdf, selected, word) = (&pdf_word.0, pdf_word.1, &pdf_word.2);
+    if unmatchable_pdf_atom(pdf[selected].value) {
+        return MathOutcome::Absent;
+    }
     let scope_start = execution_scope.map_or_else(
         || *starts.get(lines.start).unwrap_or(&source.len()),
         |scope| scope.start,
@@ -2592,31 +2404,34 @@ pub(super) fn source_location_with_context_mode(
         || *starts.get(lines.end).unwrap_or(&source.len()),
         |scope| scope.end,
     );
-    let active_regions: Vec<_> = regions
-        .into_iter()
-        .filter(|range| range.start < scope_end && range.end > scope_start)
-        .collect();
+    let start_idx = regions.partition_point(|range| range.end <= scope_start);
+    let end_idx = regions.partition_point(|range| range.start < scope_end);
+    let active_regions = &regions[start_idx..end_idx.max(start_idx)];
     if active_regions.is_empty() {
-        return Ok(prose.map(|(row, byte, _)| (row, byte)));
+        return prose.map_or(MathOutcome::Absent, |(row, byte, _)| {
+            MathOutcome::Located(row, byte)
+        });
     }
-    let mut macro_sources = Vec::with_capacity(extra_sources.len() + 1);
-    macro_sources.extend_from_slice(extra_sources);
-    macro_sources.push(source);
-    let macros = mode.macros(&macro_sources, operation);
+    let macros = analysis.macros(mode);
     let mut best = None;
     let mut tied = false;
     let mut any_unknown = false;
     let mut line_unknown = false;
     let line_start = *starts.get(line as usize - 1).unwrap_or(&source.len());
     let line_end = *starts.get(line as usize).unwrap_or(&source.len());
+    // Loop bindings shadow nothing, so one table copy serves every pass: each binding is
+    // inserted for its pass and removed afterwards.
+    let mut local_macros = None;
     for range in active_regions {
-        operation.check().map_err(|_| ())?;
+        if operation.check().is_err() {
+            return MathOutcome::Opaque;
+        }
         if execution_scope.is_some() && (range.start < scope_start || range.end > scope_end) {
             // A compiler-proven body never borrows a formula crossing its header boundary.
-            return Err(());
+            return MathOutcome::Opaque;
         }
-        let Some(bindings) = crate::tex::foreach_bindings_for_range(foreach_loops, &range) else {
-            return Ok(None);
+        let Some(bindings) = crate::tex::foreach_bindings_for_range(foreach_loops, range) else {
+            return MathOutcome::Absent;
         };
         let mut region_unknown = false;
         let mut passes = Vec::with_capacity(bindings.len().max(1));
@@ -2624,43 +2439,48 @@ pub(super) fn source_location_with_context_mode(
             let Some(atoms) = atoms_with_macros(
                 source,
                 range.clone(),
-                (&macros, operation),
+                (macros, operation),
                 0,
                 None,
                 &[],
                 &mut region_unknown,
             ) else {
-                return Ok(None);
+                return MathOutcome::Absent;
             };
             passes.push(atoms);
         } else {
+            let local_macros = local_macros.get_or_insert_with(|| macros.clone());
             for binding in &bindings {
-                let mut local_macros = macros.clone();
                 for &(var, val) in binding {
                     if macros.contains_key(var) {
-                        return Ok(None);
+                        return MathOutcome::Absent;
                     }
                     local_macros.insert(
                         var,
                         Some(MacroDef {
                             arity: 0,
-                            body_source: val,
                             body: Some(val),
                             used_params: 0,
+                            opt_params: 0,
+                            calls_note: false,
                         }),
                     );
                 }
                 let mut pass_unknown = false;
-                let Some(atoms) = atoms_with_macros(
+                let atoms = atoms_with_macros(
                     source,
                     range.clone(),
-                    (&local_macros, operation),
+                    (local_macros, operation),
                     0,
                     None,
                     &[],
                     &mut pass_unknown,
-                ) else {
-                    return Ok(None);
+                );
+                for &(var, _) in binding {
+                    local_macros.remove(var);
+                }
+                let Some(atoms) = atoms else {
+                    return MathOutcome::Absent;
                 };
                 passes.push(atoms);
                 region_unknown |= pass_unknown;
@@ -2671,7 +2491,7 @@ pub(super) fn source_location_with_context_mode(
             line_unknown |= region_unknown;
         }
         for atoms in passes {
-            let mut atoms = inline_context(source, &range, atoms);
+            let mut atoms = inline_context(source, range, atoms);
             if let Some(scope) = execution_scope {
                 atoms.retain(|atom| scope.start <= atom.span.start && atom.span.end <= scope.end);
             }
@@ -2686,38 +2506,9 @@ pub(super) fn source_location_with_context_mode(
                 if !lines.contains(&(row - 1)) {
                     continue;
                 }
-                let Some(begin) = index.checked_sub(selected - word.start) else {
+                let Some(begin) = source_word_start(&atoms, index, &pdf_word) else {
                     continue;
                 };
-                if atoms
-                    .get(begin..begin + word.len())
-                    .is_none_or(|source_word| {
-                        !source_word
-                            .iter()
-                            .zip(&pdf[word.clone()])
-                            .all(|(a, b)| a.value == b.value)
-                    })
-                {
-                    continue;
-                }
-                // A PDF word cannot be a substring of a longer source word.
-                if pdf[selected].value.is_alphanumeric()
-                    && (atoms[begin].word_join
-                        || atoms
-                            .get(begin + word.len())
-                            .is_some_and(|next| next.word_join))
-                {
-                    continue;
-                }
-                if opaque.iter().any(|range| range.contains(&atom.span.start))
-                    && !literal_owners.iter().any(|owner| {
-                        atoms[begin..begin + word.len()].iter().all(|atom| {
-                            owner.start <= atom.span.start && atom.span.end <= owner.end
-                        })
-                    })
-                {
-                    return Err(());
-                }
                 // Stop at the first mismatch and at this expression's boundary.
                 // Context from a different formula must not break an ambiguity tie.
                 let joined = |slice: &[Atom], prev: usize, direction: isize| {
@@ -2727,7 +2518,23 @@ pub(super) fn source_location_with_context_mode(
                         slice.get(prev + 1).is_some_and(|next| next.word_join)
                     }
                 };
-                let score_with = |atoms: &[Atom], begin: usize| {
+                let score_with = |segments: &[&[Atom]], begin: usize| {
+                    let get_atom = |mut idx: usize| -> Option<&Atom> {
+                        for seg in segments {
+                            if let Some(atom) = seg.get(idx) {
+                                return Some(atom);
+                            }
+                            idx -= seg.len();
+                        }
+                        None
+                    };
+                    let joined_src = |prev: usize, direction: isize| {
+                        if direction < 0 {
+                            get_atom(prev).is_some_and(|atom| atom.word_join)
+                        } else {
+                            get_atom(prev + 1).is_some_and(|next| next.word_join)
+                        }
+                    };
                     let mut score = 0;
                     let mut lexical_score = 0;
                     let mut contradictions = 0usize;
@@ -2753,20 +2560,21 @@ pub(super) fn source_location_with_context_mode(
                                 let prev_pdf = pdf_edge
                                     .checked_add_signed(direction * (distance - 1))
                                     .unwrap();
-                                let join_a = joined(atoms, prev_src, direction);
-                                let join_b = joined(&pdf, prev_pdf, direction);
+                                let join_a = joined_src(prev_src, direction);
+                                let join_b = joined(pdf, prev_pdf, direction);
                                 if !join_a && !join_b {
                                     committed = (score, lexical_score);
                                     word_start = distance;
                                 }
-                                join_a && (join_b || range.contains(&atoms[prev_src].span.start))
+                                join_a
+                                    && (join_b
+                                        || get_atom(prev_src)
+                                            .is_some_and(|a| range.contains(&a.span.start)))
                             } else {
                                 false
                             };
                             match (
-                                source_edge
-                                    .checked_add_signed(delta)
-                                    .and_then(|i| atoms.get(i)),
+                                source_edge.checked_add_signed(delta).and_then(&get_atom),
                                 pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
                             ) {
                                 (Some(a), Some(b))
@@ -2774,7 +2582,7 @@ pub(super) fn source_location_with_context_mode(
                                         && a.value == b.value
                                         && (!in_word
                                             || joined(
-                                                &pdf,
+                                                pdf,
                                                 pdf_edge
                                                     .checked_add_signed(direction * (distance - 1))
                                                     .unwrap(),
@@ -2804,7 +2612,8 @@ pub(super) fn source_location_with_context_mode(
                     }
                     (score, lexical_score, contradictions)
                 };
-                let (mut score, mut lexical_score, mut contradictions) = score_with(&atoms, begin);
+                let (mut score, mut lexical_score, mut contradictions) =
+                    score_with(&[&atoms], begin);
                 if !pdf[selected].value.is_alphanumeric()
                     && atoms
                         .get(begin + word.len())
@@ -2840,21 +2649,13 @@ pub(super) fn source_location_with_context_mode(
                             &atoms[z2 + 1..z3],
                             &atoms[z3 + 1..],
                         );
-                        for (left, right) in [
-                            ([before, &[][..]], [s1, s2, after]),
-                            ([before, &[][..]], [s2, s1, after]),
-                            ([before, s1], [&[][..], s2, after]),
-                            ([before, s2], [&[][..], s1, after]),
+                        for (segments, candidate_begin) in [
+                            ([before, op, s1, s2, after], before.len()),
+                            ([before, op, s2, s1, after], before.len()),
+                            ([before, s1, op, s2, after], before.len() + s1.len()),
+                            ([before, s2, op, s1, after], before.len() + s2.len()),
                         ] {
-                            let candidate_begin = left[0].len() + left[1].len();
-                            let seq: Vec<Atom> = left
-                                .into_iter()
-                                .chain([op])
-                                .chain(right)
-                                .flatten()
-                                .cloned()
-                                .collect();
-                            let (s, l, c) = score_with(&seq, candidate_begin);
+                            let (s, l, c) = score_with(&segments, candidate_begin);
                             if (s, l > 0, std::cmp::Reverse(c), l)
                                 > (
                                     score,
@@ -2912,10 +2713,12 @@ pub(super) fn source_location_with_context_mode(
         && prose.is_some_and(|(_, _, score)| score >= 6)
         && best.is_some_and(|((_, has_lexical, _, _, _), _)| !has_lexical);
     if prose_evidence {
-        return Ok(prose.map(|(row, byte, _)| (row, byte)));
+        return prose.map_or(MathOutcome::Absent, |(row, byte, _)| {
+            MathOutcome::Located(row, byte)
+        });
     }
     if prose.is_some() && best.is_some() {
-        return Ok(None);
+        return MathOutcome::Absent;
     }
     // Tied prose competes with a formula just as unique prose does above, unless
     // no tied occurrence has evidence and an uncontradicted formula has lexical evidence.
@@ -2925,40 +2728,103 @@ pub(super) fn source_location_with_context_mode(
                 score > 0 && has_lexical && contradictions.0 == 0
             })
     });
-    Ok(prose
+    prose
         .map(|(row, byte, _)| (row, byte))
-        .or(mathematical.filter(|_| math_beats_tie)))
+        .or(mathematical.filter(|_| math_beats_tie))
+        .map_or(MathOutcome::Absent, |(row, byte)| {
+            MathOutcome::Located(row, byte)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{collected_text_argument_at, collected_text_lines};
+    use crate::tex::{ProseRank, SourceAnalysis, WordLocationMode, WordRangeScope};
+
+    /// Strict math refinement of the PDF word at `offset` within `lines`, given its unique
+    /// prose `(row, byte, score)` candidate.
+    fn source_location(
+        source: &str,
+        line: u32,
+        lines: Range<usize>,
+        within_frame: bool,
+        context: &str,
+        offset: usize,
+        prose: Option<(u32, usize, isize)>,
+    ) -> Option<(u32, usize)> {
+        let operation = crate::Operation::default();
+        let analysis = SourceAnalysis::new(source, &[], &operation);
+        let end = |row: usize| *analysis.line_starts.get(row).unwrap_or(&source.len());
+        let limit = prose.map_or(end(lines.end), |(row, ..)| {
+            end(lines.end).max(end(row as usize))
+        });
+        let scope = WordRangeScope {
+            line,
+            lines,
+            foreach_loops: &[],
+            execution_scope: None,
+        };
+        let prose = prose.map_or(ProseRank::Absent, |(row, byte, score)| {
+            ProseRank::Unique(row, byte, score)
+        });
+        let all_math = analysis.math_regions();
+        let regions = &all_math[..all_math.partition_point(|r| r.start < limit)];
+        match source_location_with_context_mode(
+            &analysis,
+            &scope,
+            within_frame,
+            (context, offset),
+            prose,
+            regions,
+            WordLocationMode::Strict,
+        ) {
+            MathOutcome::Located(row, byte) => Some((row, byte)),
+            MathOutcome::Absent | MathOutcome::Opaque => None,
+        }
+    }
 
     #[test]
-    fn indexed_group_boundaries_preserve_lexing_and_borrowed_slice_limits() {
-        let source = "{α\\{literal% }\n{β} tail}";
-        let mut boundaries = BTreeMap::new();
+    fn pdf_composites_collapse_chained_pieces_in_one_pass() {
+        let collapse = |text: &str| {
+            let mut atoms = Vec::new();
+            for (i, c) in text.char_indices() {
+                append(&mut atoms, c, i..i + c.len_utf8());
+            }
+            collapse_pdf_composites(&mut atoms);
+            atoms
+                .iter()
+                .map(|atom| (atom.value, atom.span.clone()))
+                .collect::<Vec<_>>()
+        };
+        let dashed = "x ⎯⎯⎯⇢ y";
+        let shaft = dashed.find('⎯').unwrap();
         assert_eq!(
-            group_with_boundaries(source, 0, Some(&mut boundaries), None),
-            group(source, 0),
+            collapse(dashed),
+            [
+                ('x', 0..1),
+                ('⇢', shaft..dashed.find(" y").unwrap()),
+                ('y', dashed.len() - 1..dashed.len())
+            ]
         );
-        assert_eq!(boundaries.len(), 2);
-        let inner = source.find("{β}").unwrap();
-        let slice = &source[inner..inner + "{β}".len()];
-        assert_eq!(
-            group_with_boundaries(slice, 0, Some(&mut boundaries), None),
-            Some((1..3, 4)),
-        );
-        assert_eq!(
-            group_with_boundaries(&slice[..slice.len() - 1], 0, Some(&mut boundaries), None),
-            None,
-        );
-        let operation = crate::Operation::default();
-        operation.cancel();
-        assert_eq!(
-            group_with_boundaries(source, 0, Some(&mut boundaries), Some(&operation)),
-            None,
-        );
+        let back = "⇠⎯⎯⎯";
+        assert_eq!(collapse(back), [('⇠', 0..back.len())]);
+        // Separated pieces stay apart; a negation overlay still folds into its relation.
+        assert_eq!(collapse("⎯ ⇢"), [('⎯', 0..3), ('⇢', 4..7)]);
+        assert_eq!(collapse("=\u{0338}<"), [('≠', 0..3), ('<', 3..4)]);
+        assert_eq!(collapse("⍿-→"), [('⟼', 0.."⍿-→".len())]);
+    }
+
+    /// [`source_location`] without a prose candidate.
+    fn loc(
+        source: &str,
+        line: u32,
+        lines: Range<usize>,
+        within: bool,
+        context: &str,
+        offset: usize,
+    ) -> Option<(u32, usize)> {
+        source_location(source, line, lines, within, context, offset, None)
     }
 
     #[test]
@@ -3036,12 +2902,12 @@ mod tests {
         let source = "\\$ ignored % $not math$\n$one$ \\(two\\) \\[three\\] $$four$$ \\begin{align*}five\\end{align*}\n\\verb|$hidden$| \\begin{verbatim}$hidden$\\end{verbatim} $unterminated";
         for word in ["one", "two", "three", "four", "five"] {
             assert_eq!(
-                source_location(source, 2, 0..4, false, word, 0, None),
+                loc(source, 2, 0..4, false, word, 0),
                 Some((2, source.lines().nth(1).unwrap().find(word).unwrap()))
             );
         }
         for word in ["ignored", "hidden", "unterminated"] {
-            assert_eq!(source_location(source, 2, 0..4, false, word, 0, None), None);
+            assert_eq!(loc(source, 2, 0..4, false, word, 0), None);
         }
     }
 
@@ -3053,14 +2919,11 @@ mod tests {
             (r"\begin{alignat}{2}x&=y\end{alignat}", "2"),
             (r"$\begin{array}{c}x\end{array}$", "c"),
         ] {
-            assert_eq!(
-                source_location(source, 1, 0..1, false, glyph, 0, None),
-                None
-            );
+            assert_eq!(loc(source, 1, 0..1, false, glyph, 0), None);
         }
         let source = r"\begin{alignat}{2}\alpha&=\beta\end{alignat}";
         assert_eq!(
-            source_location(source, 1, 0..1, false, "α=β", 0, None),
+            loc(source, 1, 0..1, false, "α=β", 0),
             Some((1, source.find(r"\alpha").unwrap()))
         );
     }
@@ -3075,14 +2938,13 @@ mod tests {
             ("𝛼⟼ℋ+𝐯", "𝐯", "v"),
         ] {
             assert_eq!(
-                source_location(
+                loc(
                     source,
                     1,
                     0..1,
                     false,
                     context,
-                    context.find(selected).unwrap(),
-                    None
+                    context.find(selected).unwrap()
                 ),
                 Some((1, source.find(needle).unwrap()))
             );
@@ -3090,14 +2952,13 @@ mod tests {
         let matrix = "\\begin{align*}\\dot f(t)&=\\begin{pmatrix}\\cos\\alpha_1(t)\\\\\\sin\\alpha_2(t)\\end{pmatrix}\\end{align*}";
         let context = "f(t)=cosα1(t) sinα2(t)";
         assert_eq!(
-            source_location(
+            loc(
                 matrix,
                 1,
                 0..1,
                 false,
                 context,
-                context.find("sin").unwrap(),
-                None
+                context.find("sin").unwrap()
             ),
             Some((1, matrix.find("\\sin").unwrap()))
         );
@@ -3106,23 +2967,14 @@ mod tests {
     #[test]
     fn unknown_commands_insert_gap_atoms_without_poisoning_known_tokens() {
         let source = "$x\\longmapsto y+\\custom{z}$\n$x\\longmapsto y$";
-        assert_eq!(source_location(source, 2, 0..2, true, "x⟼y", 1, None), None);
+        assert_eq!(loc(source, 2, 0..2, true, "x⟼y", 1), None);
         let source = "$x\\longmapsto\\custom y$\n$x\\longmapsto h$";
-        assert_eq!(
-            source_location(source, 2, 0..2, true, "x⟼y", 1, None),
-            Some((1, 2))
-        );
-        assert_eq!(
-            source_location(source, 2, 0..2, true, "x⟼h", 1, None),
-            Some((2, 2))
-        );
+        assert_eq!(loc(source, 2, 0..2, true, "x⟼y", 1), Some((1, 2)));
+        assert_eq!(loc(source, 2, 0..2, true, "x⟼h", 1), Some((2, 2)));
         let source = "$\\alpha\\custom{z}$\n$\\beta$";
-        assert_eq!(source_location(source, 2, 0..2, true, "β", 0, None), None);
+        assert_eq!(loc(source, 2, 0..2, true, "β", 0), None);
         let source = "$\\alpha\\custom{z}$\n$\\beta+1$";
-        assert_eq!(
-            source_location(source, 2, 0..2, true, "β+1", 0, None),
-            Some((2, 1))
-        );
+        assert_eq!(loc(source, 2, 0..2, true, "β+1", 0), Some((2, 1)));
         let source = "$\\custom{z}$\nA. Box in 2020";
         assert_eq!(
             source_location(source, 2, 0..2, true, "A. Box", 0, Some((2, 0, 3))),
@@ -3150,33 +3002,29 @@ mod tests {
         ] {
             let line_count = bad_source.lines().count();
             assert_eq!(
-                source_location(bad_source, 1, 0..line_count, true, context, 0, None),
+                loc(bad_source, 1, 0..line_count, true, context, 0),
                 None,
                 "{bad_source}"
             );
         }
+        assert_eq!(loc("$x\\kern1pty$", 1, 0..1, false, "xy", 1), Some((1, 10)));
         assert_eq!(
-            source_location("$x\\kern1pty$", 1, 0..1, false, "xy", 1, None),
-            Some((1, 10))
-        );
-        assert_eq!(
-            source_location("$x\\kern1truept y$", 1, 0..1, false, "xy", 1, None),
+            loc("$x\\kern1truept y$", 1, 0..1, false, "xy", 1),
             Some((1, 15))
         );
         assert_eq!(
-            source_location("$A_\\custom$\n$x$", 2, 0..2, false, "x", 0, None),
+            loc("$A_\\custom$\n$x$", 2, 0..2, false, "x", 0),
             Some((2, 1))
         );
         let shared_suffix = "\\emph{sample} $M$:\n\\item a local state $M_x = y$";
         assert_eq!(
-            source_location(
+            loc(
                 shared_suffix,
                 1,
                 0..2,
                 true,
                 "sample M: a local state",
-                "sample ".len(),
-                None,
+                "sample ".len()
             ),
             Some((1, 15))
         );
@@ -3185,26 +3033,14 @@ mod tests {
     #[test]
     fn duplicate_equations_unknown_commands_and_private_glyphs() {
         let source = "$\\alpha\\leq\\beta$\n$\\gamma\\geq\\delta$\n$\\alpha\\leq\\beta$";
+        assert_eq!(loc(source, 3, 0..3, true, "α≤β γ≥δ α≤β", 0), None);
         assert_eq!(
-            source_location(source, 3, 0..3, true, "α≤β γ≥δ α≤β", 0, None),
-            None
-        );
-        assert_eq!(
-            source_location("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0, None),
+            loc("$\\custom{x}+y$", 1, 0..1, false, "x+y", 0),
             Some((1, 9))
         );
-        assert_eq!(
-            source_location("$\\mathcal H$", 1, 0..1, false, "\u{e234}", 0, None),
-            None
-        );
-        assert_eq!(
-            source_location("$x$", 1, 0..1, false, "example", 1, None),
-            None
-        );
-        assert_eq!(
-            source_location("$X+x$", 1, 0..1, false, "𝑋+𝑥", 0, None),
-            Some((1, 1))
-        );
+        assert_eq!(loc("$\\mathcal H$", 1, 0..1, false, "\u{e234}", 0), None);
+        assert_eq!(loc("$x$", 1, 0..1, false, "example", 1), None);
+        assert_eq!(loc("$X+x$", 1, 0..1, false, "𝑋+𝑥", 0), Some((1, 1)));
     }
 
     #[test]
@@ -3215,15 +3051,12 @@ mod tests {
             ("$\\alpha_a^b$\n$\\alpha_b^a$", "α\r\nba\r\nα\r\nab", 0),
         ] {
             assert_eq!(
-                source_location(source, 1, 0..2, false, context, offset, None),
+                loc(source, 1, 0..2, false, context, offset),
                 None,
                 "{source}"
             );
         }
-        assert_eq!(
-            source_location("$x.y$", 1, 0..1, false, "x.y", 1, None),
-            Some((1, 2))
-        );
+        assert_eq!(loc("$x.y$", 1, 0..1, false, "x.y", 1), Some((1, 2)));
     }
 
     #[test]
@@ -3240,7 +3073,7 @@ mod tests {
         let context = "similarly, if q* ∈ Bn≤k scales Ωk,";
         let offset = context.find("Ωk").unwrap();
         assert_eq!(
-            source_location(source, 6, 1..8, false, context, offset, None),
+            loc(source, 6, 1..8, false, context, offset),
             Some((6, source.lines().nth(5).unwrap().find("\\Omega_k").unwrap()))
         );
     }
@@ -3264,170 +3097,75 @@ caption}";
 
     #[test]
     fn text_math_modifiers_greek_variants_and_standard_symbols_match() {
-        for wrapper in [
-            "text",
-            "texttt",
-            "textnormal",
-            "textit",
-            "textbf",
-            "textrm",
-            "textsf",
-            "textup",
-            "textsc",
-            "textsl",
-            "textmd",
-            "mathrm",
-            "mathit",
-            "mathbf",
-            "mathsf",
-            "mathtt",
-            "mathcal",
-            "mathbb",
-            "mathfrak",
-            "mathscr",
-            "mathnormal",
-            "symrm",
-            "symit",
-            "symbf",
-            "symsf",
-            "symtt",
-            "symbb",
-            "symcal",
-            "symscr",
-            "symfrak",
-            "symnormal",
-        ] {
+        let wrappers = "text texttt textnormal textit textbf textrm textsf textup textsc textsl \
+                        textmd mathrm mathit mathbf mathsf mathtt mathcal mathbb mathfrak mathscr \
+                        mathnormal symrm symit symbf symsf symtt symbb symcal symscr symfrak symnormal";
+        for wrapper in wrappers.split_whitespace() {
             let source = format!("$\\{wrapper}{{K}}+y$");
             assert_eq!(
-                source_location(&source, 1, 0..1, false, "K+y", 0, None),
+                loc(&source, 1, 0..1, false, "K+y", 0),
                 Some((1, source.find("{K}").unwrap() + 1)),
                 "{wrapper}"
             );
         }
-
-        let greek = "$\\varkappa+\\varepsilon+\\varphi+\\vartheta+\\varrho+\\varpi+\\varsigma+\\varGamma+\\varDelta+\\varOmega$";
-        let greek_pdf = "ϰ+ϵ+ϕ+ϑ+ϱ+ϖ+ς+Γ+∆+Ω";
-        for (needle, tex) in [
-            ("ϰ", "\\varkappa"),
-            ("ϵ", "\\varepsilon"),
-            ("ϕ", "\\varphi"),
-            ("ϑ", "\\vartheta"),
-            ("ϱ", "\\varrho"),
-            ("ϖ", "\\varpi"),
-            ("ς", "\\varsigma"),
-            ("Γ", "\\varGamma"),
-            ("∆", "\\varDelta"),
-            ("Ω", "\\varOmega"),
+        // Each `(source, pdf, "needle tex …")` maps a PDF needle to its TeX token.
+        for (source, pdf, pairs) in [
+            (
+                "$\\varkappa+\\varepsilon+\\varphi+\\vartheta+\\varrho+\\varpi+\\varsigma+\\varGamma+\\varDelta+\\varOmega$",
+                "ϰ+ϵ+ϕ+ϑ+ϱ+ϖ+ς+Γ+∆+Ω",
+                "ϰ \\varkappa ϵ \\varepsilon ϕ \\varphi ϑ \\vartheta ϱ \\varrho ϖ \\varpi ς \\varsigma \
+                 Γ \\varGamma ∆ \\varDelta Ω \\varOmega",
+            ),
+            (
+                "$a\\le b\\ge c\\ni d\\owns e\\bigotimes f\\frown g\\smallsetminus h\\neg p\\not\\in S\\not=0\\dots\\ast\\|v\\|\\mid w$",
+                "a≤b≥c∋d∋e⨂f⌢g∖h¬p∉S≠0⋯*‖v‖|w",
+                "≤ \\le ≥ \\ge ⨂ \\bigotimes ⌢ \\frown ∖ \\smallsetminus ¬ \\neg ∉ \\not\\in \
+                 ≠ \\not= ⋯ \\dots * \\ast |w \\mid",
+            ),
+            (
+                "$x\\sin\\theta + \\Pr(A) + \\gcd(m,n)$",
+                "x sin θ + Pr(A) + gcd(m,n)",
+                "x x sin \\sin θ \\theta Pr \\Pr gcd \\gcd",
+            ),
         ] {
-            assert_eq!(
-                source_location(
-                    greek,
-                    1,
-                    0..1,
-                    false,
-                    greek_pdf,
-                    greek_pdf.find(needle).unwrap(),
-                    None,
-                ),
-                Some((1, greek.find(tex).unwrap())),
-                "{tex}"
-            );
+            let pairs: Vec<&str> = pairs.split_whitespace().collect();
+            for pair in pairs.chunks(2) {
+                let (needle, tex) = (pair[0], pair[1]);
+                let found = loc(source, 1, 0..1, false, pdf, pdf.find(needle).unwrap());
+                assert_eq!(found, Some((1, source.find(tex).unwrap())), "{tex}");
+            }
         }
-
-        let symbols = "$a\\le b\\ge c\\ni d\\owns e\\bigotimes f\\frown g\\smallsetminus h\\neg p\\not\\in S\\not=0\\dots\\ast\\|v\\|\\mid w$";
-        let symbols_pdf = "a≤b≥c∋d∋e⨂f⌢g∖h¬p∉S≠0⋯*‖v‖|w";
-        for (needle, tex) in [
-            ("≤", "\\le"),
-            ("≥", "\\ge"),
-            ("⨂", "\\bigotimes"),
-            ("⌢", "\\frown"),
-            ("∖", "\\smallsetminus"),
-            ("¬", "\\neg"),
-            ("∉", "\\not\\in"),
-            ("≠", "\\not="),
-            ("⋯", "\\dots"),
-            ("*", "\\ast"),
-            ("|w", "\\mid"),
-        ] {
-            assert_eq!(
-                source_location(
-                    symbols,
-                    1,
-                    0..1,
-                    false,
-                    symbols_pdf,
-                    symbols_pdf.find(needle).unwrap(),
-                    None,
-                ),
-                Some((1, symbols.find(tex).unwrap())),
-                "{tex}"
-            );
-        }
-
-        let trig = "$x\\sin\\theta + \\Pr(A) + \\gcd(m,n)$";
-        let trig_pdf = "x sin θ + Pr(A) + gcd(m,n)";
-        for (needle, tex) in [
-            ("x", "x"),
-            ("sin", "\\sin"),
-            ("θ", "\\theta"),
-            ("Pr", "\\Pr"),
-            ("gcd", "\\gcd"),
-        ] {
-            assert_eq!(
-                source_location(
-                    trig,
-                    1,
-                    0..1,
-                    false,
-                    trig_pdf,
-                    trig_pdf.find(needle).unwrap(),
-                    None,
-                ),
-                Some((1, trig.find(tex).unwrap())),
-                "{tex}"
-            );
-        }
-        assert_eq!(
-            source_location("$\\sin x$", 1, 0..1, false, "s", 0, None),
-            None
-        );
+        assert_eq!(loc("$\\sin x$", 1, 0..1, false, "s", 0), None);
 
         let liminf_frame = "$\\liminf x$\n$\\lim x$";
         assert_eq!(
-            source_location(liminf_frame, 1, 0..2, true, "lim inf x", 0, None),
+            loc(liminf_frame, 1, 0..2, true, "lim inf x", 0),
             Some((1, 1))
         );
         assert_eq!(
-            source_location(liminf_frame, 1, 0..2, true, "lim inf x", 4, None),
+            loc(liminf_frame, 1, 0..2, true, "lim inf x", 4),
             Some((1, 1))
         );
 
         let redefined_not = "\\renewcommand{\\in}{=}\n$a\\not\\in b$\n$a\\not=b$";
+        assert_eq!(loc(redefined_not, 2, 1..3, true, "a≠b", 0), None);
         assert_eq!(
-            source_location(redefined_not, 2, 1..3, true, "a≠b", 0, None),
-            None
-        );
-        assert_eq!(
-            source_location(
+            loc(
                 "$a\\not<b\\not>c\\not\\leq d\\not\\geq e$",
                 1,
                 0..1,
                 false,
                 "a≮b≯c≰d≱e",
-                "a≮b≯c".len(),
-                None,
+                "a≮b≯c".len()
             ),
             Some((1, 14))
         );
         let not_ll = "Frame prose\n$x\\not\\ll y + z$\n$\\hspace{0.5\\textwidth}w$";
         assert_eq!(
-            source_location(not_ll, 2, 0..3, true, "x/≪y + z", "x/".len(), None),
+            loc(not_ll, 2, 0..3, true, "x/≪y + z", "x/".len()),
             Some((2, 6))
         );
-        assert_eq!(
-            source_location(not_ll, 3, 0..3, true, "w", 0, None),
-            Some((3, 23))
-        );
+        assert_eq!(loc(not_ll, 3, 0..3, true, "w", 0), Some((3, 23)));
         assert_eq!(
             source_location(not_ll, 3, 0..3, true, "prose", 0, Some((1, 6, 5))),
             Some((1, 6))
@@ -3438,115 +3176,45 @@ caption}";
     fn big_operators_with_simultaneous_limits_resolve_in_inline_and_display_orders() {
         let display =
             "\\[\n  A = \\bigoplus_{i=1}^n U_i\n\\]\n\\[\n  B = \\bigoplus_{k=1}^m V_k\n\\]";
-        let visual_ctx = "A = ⊕n\r\ni=1 Ui B = ⊕m\r\nk=1 Vk";
-        let first_op = visual_ctx.find('⊕').unwrap();
-        let second_op = visual_ctx.rfind('⊕').unwrap();
-        assert_eq!(
-            source_location(display, 2, 0..6, true, visual_ctx, first_op, None),
-            Some((2, 6))
-        );
-        assert_eq!(
-            source_location(display, 5, 0..6, true, visual_ctx, second_op, None),
-            Some((5, 6))
-        );
-
-        let stream_ctx = "A = n ⊕ i=1 Ui B = m ⊕ k=1 Vk";
-        assert_eq!(
-            source_location(
-                display,
-                2,
-                0..6,
-                true,
-                stream_ctx,
-                stream_ctx.find('⊕').unwrap(),
-                None
-            ),
-            Some((2, 6))
-        );
-        assert_eq!(
-            source_location(
-                display,
-                5,
-                0..6,
-                true,
-                stream_ctx,
-                stream_ctx.rfind('⊕').unwrap(),
-                None
-            ),
-            Some((5, 6))
-        );
-
+        let visual = "A = ⊕n\r\ni=1 Ui B = ⊕m\r\nk=1 Vk";
+        let stream = "A = n ⊕ i=1 Ui B = m ⊕ k=1 Vk";
         let inline = "Consider $\\bigoplus_{i=1}^n V_i$ and $\\bigoplus$.";
         let inline_ctx = "Consider ⊕n\r\ni=1 Vi and ⊕.";
-        assert_eq!(
-            source_location(
-                inline,
-                1,
-                0..1,
-                false,
-                inline_ctx,
-                inline_ctx.find('⊕').unwrap(),
-                None
-            ),
-            Some((1, 10))
-        );
-        assert_eq!(
-            source_location(
-                inline,
-                1,
-                0..1,
-                false,
-                inline_ctx,
-                inline_ctx.rfind('⊕').unwrap(),
-                None
-            ),
-            Some((1, 38))
-        );
-
         let nested = "\\[\n  A = \\bigoplus_{i=1}^{n_j^k} U_i\n\\]\n\\[\n  B = \\bigoplus_{i=1}^{m_j^k} V_i\n\\]";
-        let nested_ctx = "A = ⊕njk i=1 Ui B = ⊕mjk i=1 Vi";
-        assert_eq!(
-            source_location(
+        let refs = "\\[\n  \\bigoplus\\ref{a}x\\ref{b}y\\ref{c}z\n\\]\n\\[\n  \\bigoplus x y\n\\]";
+        let isolated = "\\[\\bigoplus\\]\n\\ensuremath{\\oplus}";
+        // `(source, line, lines, context, last ⊕, expected)`.
+        for (source, line, lines, ctx, last, expected) in [
+            (display, 2, 0..6, visual, false, Some((2, 6))),
+            (display, 5, 0..6, visual, true, Some((5, 6))),
+            (display, 2, 0..6, stream, false, Some((2, 6))),
+            (display, 5, 0..6, stream, true, Some((5, 6))),
+            (inline, 1, 0..1, inline_ctx, false, Some((1, 10))),
+            (inline, 1, 0..1, inline_ctx, true, Some((1, 38))),
+            (
                 nested,
                 5,
                 0..6,
+                "A = ⊕njk i=1 Ui B = ⊕mjk i=1 Vi",
                 true,
-                nested_ctx,
-                nested_ctx.rfind('⊕').unwrap(),
-                None
+                Some((5, 6)),
             ),
-            Some((5, 6))
-        );
-
-        let refs = "\\[\n  \\bigoplus\\ref{a}x\\ref{b}y\\ref{c}z\n\\]\n\\[\n  \\bigoplus x y\n\\]";
-        let refs_ctx = "⊕1x2y3z ⊕xy";
-        assert_eq!(
-            source_location(
-                refs,
-                5,
-                0..6,
-                true,
-                refs_ctx,
-                refs_ctx.rfind('⊕').unwrap(),
-                None
-            ),
-            Some((5, 2))
-        );
-
-        let isolated = "\\[\\bigoplus\\]\n\\ensuremath{\\oplus}";
-        let isolated_ctx = "⊕ ⊕";
-        assert_eq!(
-            source_location(
-                isolated,
-                2,
-                0..2,
-                true,
-                isolated_ctx,
-                isolated_ctx.rfind('⊕').unwrap(),
-                None
-            ),
-            None
-        );
+            (refs, 5, 0..6, "⊕1x2y3z ⊕xy", true, Some((5, 2))),
+            (isolated, 2, 0..2, "⊕ ⊕", true, None),
+        ] {
+            let offset = if last {
+                ctx.rfind('⊕')
+            } else {
+                ctx.find('⊕')
+            }
+            .unwrap();
+            let within = source != inline;
+            assert_eq!(
+                loc(source, line, lines, within, ctx, offset),
+                expected,
+                "{source}"
+            );
+        }
 
         let composites = "\\[\n  A \\mapsto B \\longmapsto C \\hookleftarrow D \\hookrightarrow E \\dashrightarrow F \\dashleftarrow G \\rightleftharpoons H \\notin I \\nleqslant J\n\\]\n\\[\n  X \\mapsto Y \\longmapsto Z \\hookleftarrow W \\hookrightarrow K \\dashrightarrow U \\dashleftarrow V \\rightleftharpoons T \\notin S \\nleqslant R\n\\]";
         let composites_ctx = "A \u{237f}\u{2192} B \u{237f}-\u{2192} C \u{2190}\u{297d} D \u{297c}\u{2192} E \u{23af}\u{23af}\u{21e2} F \u{21e0}\u{23af}\u{23af} G \u{296a}\u{296b} H \u{20d2}\u{220a} I \u{2a7d}\u{0338} J X \u{237f}\u{2192} Y \u{237f}-\u{2192} Z \u{2190}\u{297d} W \u{297c}\u{2192} K \u{23af}\u{23af}\u{21e2} U \u{21e0}\u{23af}\u{23af} V \u{296a}\u{296b} T \u{2208}\u{0338} S \u{2264}\u{0338} R";
@@ -3564,191 +3232,105 @@ caption}";
         ] {
             let offset = composites_ctx.find(needle).unwrap();
             assert_eq!(
-                source_location(composites, 5, 0..6, true, composites_ctx, offset, None),
+                loc(composites, 5, 0..6, true, composites_ctx, offset),
                 Some((5, col)),
                 "failed for {needle}"
             );
         }
 
         let non_collapsing = "\\[\n  f \\mapsto \\rightarrow g \\quad \\rightharpoonup\\leftharpoondown \\quad a = \\not= b \\quad x \\notin \\notin y\n\\]";
-        let non_collapsing_ctx = "f\u{237f}\u{2192}\u{2192}g \u{21c0}\u{21bd} a=\u{20d2}=b x\u{2208}\u{0338}\u{2208}\u{0338}y";
-        assert_eq!(
-            source_location(
-                non_collapsing,
-                2,
-                0..3,
-                true,
-                non_collapsing_ctx,
-                non_collapsing_ctx.rfind('\u{2192}').unwrap(),
-                None
-            ),
-            Some((2, 12))
-        );
-        assert_eq!(
-            source_location(
-                non_collapsing,
-                2,
-                0..3,
-                true,
-                non_collapsing_ctx,
-                non_collapsing_ctx.find('\u{21bd}').unwrap(),
-                None
-            ),
-            Some((2, 47))
-        );
-        assert_eq!(
-            source_location(
-                non_collapsing,
-                2,
-                0..3,
-                true,
-                non_collapsing_ctx,
-                non_collapsing_ctx.find('=').unwrap(),
-                None
-            ),
-            Some((2, 72))
-        );
-        assert_eq!(
-            source_location(
-                non_collapsing,
-                2,
-                0..3,
-                true,
-                non_collapsing_ctx,
-                non_collapsing_ctx.rfind('\u{2208}').unwrap(),
-                None
-            ),
-            Some((2, 97))
-        );
+        let ctx = "f\u{237f}\u{2192}\u{2192}g \u{21c0}\u{21bd} a=\u{20d2}=b x\u{2208}\u{0338}\u{2208}\u{0338}y";
+        for (offset, col) in [
+            (ctx.rfind('\u{2192}'), 12),
+            (ctx.find('\u{21bd}'), 47),
+            (ctx.find('='), 72),
+            (ctx.rfind('\u{2208}'), 97),
+        ] {
+            let found = loc(non_collapsing, 2, 0..3, true, ctx, offset.unwrap());
+            assert_eq!(found, Some((2, col)), "{col}");
+        }
 
         let stmary = "\\[\n  \\llbracket x \\rrbracket \\sslash y \\interleave z \\trianglelefteqslant w\n\\]\n\\[\n  \\llbracket a \\rrbracket \\sslash b \\interleave c \\trianglelefteqslant d\n\\]";
-        let stmary_ctx = "⟦x⟧ ⫽ y ⫴ z ⊴ w ⟦a⟧ ⫽ b ⫴ c ⊴ d";
-        assert_eq!(
-            source_location(
-                stmary,
-                5,
-                0..6,
-                true,
-                stmary_ctx,
-                stmary_ctx.rfind('⫴').unwrap(),
-                None
-            ),
-            Some((5, 36))
-        );
+        let ctx = "⟦x⟧ ⫽ y ⫴ z ⊴ w ⟦a⟧ ⫽ b ⫴ c ⊴ d";
+        let found = loc(stmary, 5, 0..6, true, ctx, ctx.rfind('⫴').unwrap());
+        assert_eq!(found, Some((5, 36)));
 
         let variants = "\\[\n  \\vartheta + 7 + \\lgroup x \\rgroup + a = b + \\not\\rightarrow c + u \\coloneqq v + p \\bbslash q \\setminus r + m \\Mapsto n \\Longmapsto k\n\\]";
-        let variants_ctx = "\u{1D6DD} + \u{1D7DF} + ⟮x⦘ + a\u{0338}=b + \u{20d2}→ c + u ≔ v + p ⧵ q \\ r + m \u{237f}⇒ n \u{237f}=⇒ k";
+        let ctx = "\u{1D6DD} + \u{1D7DF} + ⟮x⦘ + a\u{0338}=b + \u{20d2}→ c + u ≔ v + p ⧵ q \\ r + m \u{237f}⇒ n \u{237f}=⇒ k";
+        for (needle, col) in [
+            ("\u{1D6DD}", 2),
+            ("\u{1D7DF}", 14),
+            ("⦘", 28),
+            ("=", 40),
+            ("→ c", 46),
+            ("≔", 68),
+            ("⧵", 84),
+            ("\\ r", 95),
+            ("\u{237f}⇒ n", 111),
+            ("\u{237f}=⇒ k", 121),
+        ] {
+            let found = loc(variants, 2, 0..3, true, ctx, ctx.find(needle).unwrap());
+            assert_eq!(found, Some((2, col)), "{needle}");
+        }
+        let chained = "$A \\dashrightarrow B \\dashleftarrow C$";
+        let chained_ctx = "A \u{23af}\u{23af}\u{23af}\u{21e2} B \u{21e0}\u{23af}\u{23af}\u{23af} C";
         assert_eq!(
-            source_location(variants, 2, 0..3, true, variants_ctx, 0, None),
-            Some((2, 2))
+            loc(
+                chained,
+                1,
+                0..1,
+                true,
+                chained_ctx,
+                chained_ctx.find('\u{21e2}').unwrap()
+            ),
+            Some((1, 3))
         );
         assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
+            loc(
+                chained,
+                1,
+                0..1,
                 true,
-                variants_ctx,
-                variants_ctx.find('\u{1D7DF}').unwrap(),
-                None
+                chained_ctx,
+                chained_ctx.rfind('\u{23af}').unwrap()
             ),
-            Some((2, 14))
+            Some((1, 21))
+        );
+        for delim in ["lvert", "rvert", "lVert", "rVert", "bigparallel"] {
+            assert_eq!(crate::symbols::negated_symbol(delim), None, "{delim}");
+        }
+        assert_eq!(crate::symbols::negated_symbol("mid"), Some('∤'));
+        assert_eq!(crate::symbols::negated_symbol("parallel"), Some('∦'));
+        let foreach_src = "\\newcommand{\\idx}{9}\\newcommand{\\pair}{\\alpha}\n\
+                           $\\foreach \\idx/\\pair in {1/\\beta, 2/\\gamma}{x_{\\idx}\\pair} + x_{\\idx}\\pair$";
+        let foreach_ctx = "x1βx2γ + x9α";
+        assert_eq!(
+            loc(
+                foreach_src,
+                2,
+                0..2,
+                true,
+                foreach_ctx,
+                foreach_ctx.find('9').unwrap(),
+            ),
+            Some((
+                2,
+                foreach_src.lines().nth(1).unwrap().rfind("\\idx").unwrap()
+            ))
         );
         assert_eq!(
-            source_location(
-                variants,
+            loc(
+                foreach_src,
                 2,
-                0..3,
+                0..2,
                 true,
-                variants_ctx,
-                variants_ctx.find('⦘').unwrap(),
-                None
+                foreach_ctx,
+                foreach_ctx.find('α').unwrap(),
             ),
-            Some((2, 28))
-        );
-        assert_eq!(
-            source_location(
-                variants,
+            Some((
                 2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find('=').unwrap(),
-                None
-            ),
-            Some((2, 40))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find("→ c").unwrap(),
-                None
-            ),
-            Some((2, 46))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find('≔').unwrap(),
-                None
-            ),
-            Some((2, 68))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find('⧵').unwrap(),
-                None
-            ),
-            Some((2, 84))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find("\\ r").unwrap(),
-                None
-            ),
-            Some((2, 95))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find("\u{237f}⇒ n").unwrap(),
-                None
-            ),
-            Some((2, 111))
-        );
-        assert_eq!(
-            source_location(
-                variants,
-                2,
-                0..3,
-                true,
-                variants_ctx,
-                variants_ctx.find("\u{237f}=⇒ k").unwrap(),
-                None
-            ),
-            Some((2, 121))
+                foreach_src.lines().nth(1).unwrap().rfind("\\pair").unwrap()
+            ))
         );
     }
 }

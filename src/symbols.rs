@@ -73,47 +73,61 @@ pub(crate) fn canonical(value: char) -> impl Iterator<Item = char> {
         .map(move |c| preserved.unwrap_or(c))
 }
 
+/// Negated form of a canonical relation glyph, as TeX's `\not` overlay or a PDF
+/// negation piece (`\u{20d2}` prefix, `\u{0338}` overlay) renders it.
+pub(crate) fn negate_char(c: char) -> Option<char> {
+    Some(match c {
+        '=' => '≠',
+        '∈' => '∉',
+        '∋' => '∌',
+        '∃' => '∄',
+        '≡' => '≢',
+        '<' => '≮',
+        '>' => '≯',
+        '≤' | '≦' => '≰',
+        '≥' | '≧' => '≱',
+        '≺' => '⊀',
+        '≻' => '⊁',
+        '⪯' => '⋠',
+        '⪰' => '⋡',
+        '⊂' => '⊄',
+        '⊃' => '⊅',
+        '⊆' | '⫅' => '⊈',
+        '⊇' | '⫆' => '⊉',
+        '⊑' => '⋢',
+        '⊒' => '⋣',
+        '~' | '∼' => '≁',
+        '≃' => '≄',
+        '≈' => '≉',
+        '≅' => '≇',
+        '≍' => '≭',
+        '⊢' => '⊬',
+        '⊨' => '⊭',
+        '⊩' => '⊮',
+        '⊪' => '⊯',
+        '◁' | '⊲' => '⋪',
+        '▷' | '⊳' => '⋫',
+        '⊴' => '⋬',
+        '⊵' => '⋭',
+        '|' => '∤',
+        '‖' => '∦',
+        '←' => '↚',
+        '→' => '↛',
+        '↔' => '↮',
+        '⇐' => '⇍',
+        '⇒' => '⇏',
+        '⇔' => '⇎',
+        _ => return None,
+    })
+}
+
+/// Negated glyph of the relation command `name` under a `\not` prefix.
 pub(crate) fn negated_symbol(name: &str) -> Option<char> {
-    match name {
-        "in" => Some('∉'),
-        "owns" | "ni" => Some('∌'),
-        "exists" => Some('∄'),
-        "equiv" => Some('≢'),
-        "le" | "leq" | "leqslant" | "leqq" => Some('≰'),
-        "ge" | "geq" | "geqslant" | "geqq" => Some('≱'),
-        "lt" => Some('≮'),
-        "gt" => Some('≯'),
-        "subset" => Some('⊄'),
-        "supset" => Some('⊅'),
-        "subseteq" | "subseteqq" => Some('⊈'),
-        "supseteq" | "supseteqq" => Some('⊉'),
-        "sqsubseteq" => Some('⋢'),
-        "sqsupseteq" => Some('⋣'),
-        "sim" => Some('≁'),
-        "simeq" => Some('≄'),
-        "approx" => Some('≉'),
-        "cong" => Some('≇'),
-        "asymp" => Some('≭'),
-        "prec" => Some('⊀'),
-        "succ" => Some('⊁'),
-        "preceq" => Some('⋠'),
-        "succeq" => Some('⋡'),
-        "triangleleft" | "lhd" | "vartriangleleft" => Some('⋪'),
-        "triangleright" | "rhd" | "vartriangleright" => Some('⋫'),
-        "trianglelefteq" | "unlhd" | "trianglelefteqslant" => Some('⋬'),
-        "trianglerighteq" | "unrhd" | "trianglerighteqslant" => Some('⋭'),
-        "vdash" => Some('⊬'),
-        "models" | "vDash" => Some('⊭'),
-        "Vdash" => Some('⊮'),
-        "Vvdash" => Some('⊯'),
-        "mid" | "vert" | "shortmid" => Some('∤'),
-        "parallel" | "Vert" | "|" | "shortparallel" => Some('∦'),
-        "leftarrow" | "gets" | "shortleftarrow" => Some('↚'),
-        "rightarrow" | "to" | "shortrightarrow" => Some('↛'),
-        "leftrightarrow" => Some('↮'),
-        "Leftarrow" | "Longleftarrow" | "impliedby" => Some('⇍'),
-        "Rightarrow" | "Longrightarrow" | "implies" => Some('⇏'),
-        "Leftrightarrow" | "Longleftrightarrow" | "iff" => Some('⇎'),
+    if matches!(name, "lvert" | "rvert" | "lVert" | "rVert" | "bigparallel") {
+        return None;
+    }
+    match classify_command(name) {
+        MathCommand::Symbol(value) => negate_char(value),
         _ => None,
     }
 }
@@ -145,20 +159,51 @@ pub(crate) enum MathCommand<'a> {
     Unknown,
 }
 
-pub(crate) fn classify_command(name: &str) -> MathCommand<'_> {
-    match name {
-        // Font/style wrappers, switches, accents, fractions, binomials, and spacing no-ops
+/// Text-font wrappers whose one argument prints in another font.
+#[rustfmt::skip]
+pub(crate) fn is_text_font_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "text" | "textbf" | "textit" | "textrm" | "textsf" | "texttt" | "textup" | "textnormal"
+        | "textsc" | "textsl" | "textmd" | "textlf" | "textulc" | "emph"
+    )
+}
+
+/// Math-alphabet and bold-math wrappers whose one argument keeps its glyph identity.
+#[rustfmt::skip]
+pub(crate) fn is_math_alphabet_wrapper(name: &str) -> bool {
+    matches!(
+        name,
         "mathcal" | "mathbb" | "mathbbm" | "mathbbb" | "mathds" | "mathfrak" | "mathscr"
         | "mathrm" | "mathbf" | "mathbfit" | "mathsf" | "mathsfit" | "mathbfsfit" | "mathbfcal"
         | "mathbfscr" | "mathtt" | "mathit" | "mathnormal" | "mathbold" | "symrm" | "symit"
         | "symsf" | "symtt" | "symbb" | "symcal" | "symscr" | "symfrak" | "symnormal" | "symbf"
         | "symbfit" | "symbfsfit" | "symsfit" | "symbfcal" | "symbffrak" | "symbfscr"
-        | "symbfsf" | "symbftt" | "text" | "textbf" | "textit" | "textrm" | "textsf" | "texttt"
-        | "textup" | "textnormal" | "textsc" | "textsl" | "textmd" | "textlf" | "textulc"
-        | "normalfont" | "rmfamily" | "sffamily" | "ttfamily" | "bfseries" | "mdseries"
-        | "lfseries" | "itshape" | "slshape" | "scshape" | "upshape" | "rm" | "bf" | "it"
-        | "sl" | "sf" | "tt" | "sc" | "cal" | "mit" | "oldstylenums" | "emph" | "bm"
-        | "boldsymbol" | "boxed" | "displaystyle" | "textstyle" | "scriptstyle"
+        | "symbfsf" | "symbftt" | "bm" | "boldsymbol"
+    )
+}
+
+/// Declarative font switches, which change the font of what follows.
+#[rustfmt::skip]
+pub(crate) fn is_font_switch(name: &str) -> bool {
+    matches!(
+        name,
+        "normalfont" | "rmfamily" | "sffamily" | "ttfamily" | "bfseries" | "mdseries" | "lfseries"
+        | "itshape" | "slshape" | "scshape" | "upshape" | "rm" | "bf" | "it" | "sl" | "sf" | "tt"
+        | "sc"
+    )
+}
+
+pub(crate) fn classify_command(name: &str) -> MathCommand<'_> {
+    match name {
+        // Font/style wrappers, switches, accents, fractions, binomials, and spacing no-ops
+        _ if is_text_font_wrapper(name)
+            || is_math_alphabet_wrapper(name)
+            || is_font_switch(name) =>
+        {
+            MathCommand::Transparent
+        }
+        "cal" | "mit" | "oldstylenums" | "boxed" | "displaystyle" | "textstyle" | "scriptstyle"
         | "scriptscriptstyle" | "limits" | "nolimits" | "mathrel" | "mathbin" | "mathord"
         | "mathop" | "mathopen" | "mathclose" | "mathpunct" | "mathinner" | "quad" | "qquad"
         | "enspace" | "thinspace" | "medspace" | "thickspace" | "negthinspace" | "negmedspace"
@@ -189,7 +234,9 @@ pub(crate) fn classify_command(name: &str) -> MathCommand<'_> {
             emit_gap: false,
             trailing_opt: true,
         },
-        "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref" | "cite" | "citep" | "citet" => {
+        _ if crate::tex::is_direct_reference_command(name)
+            || matches!(name, "cite" | "citep" | "citet") =>
+        {
             MathCommand::DiscardArg {
                 emit_gap: true,
                 trailing_opt: false,

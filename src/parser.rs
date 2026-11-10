@@ -22,7 +22,6 @@ struct ForwardNode {
     depth_v: i64,
     mean_line: i64,
     weight: i64,
-    friend_weight: usize,
 }
 
 impl ForwardNode {
@@ -57,40 +56,11 @@ impl ForwardNode {
             depth_v: depth,
             mean_line: line,
             weight: 1,
-            friend_weight: 0,
         }
     }
 
     fn contain_point(&mut self, ph: i64, pv: i64) {
-        if self.kind != b'(' {
-            return;
-        }
-        if self.width_v < 0 {
-            let max_h = self.h_v;
-            let min_h = max_h.saturating_add(self.width_v);
-            if ph < min_h {
-                self.width_v = ph.saturating_sub(max_h);
-            } else if ph > max_h {
-                self.h_v = ph;
-                self.width_v = min_h.saturating_sub(ph);
-            }
-        } else {
-            let min_h = self.h_v;
-            let max_h = min_h.saturating_add(self.width_v);
-            if ph < min_h {
-                self.h_v = ph;
-                self.width_v = max_h.saturating_sub(ph);
-            } else if ph > max_h {
-                self.width_v = ph.saturating_sub(min_h);
-            }
-        }
-        let min_v = self.v_v.saturating_sub(self.height_v);
-        let max_v = self.v_v.saturating_add(self.depth_v);
-        if pv < min_v {
-            self.height_v = self.v_v.saturating_sub(pv);
-        } else if pv > max_v {
-            self.depth_v = pv.saturating_sub(self.v_v);
-        }
+        self.contain_box([ph, ph, pv, pv]);
     }
 
     fn contain_box(&mut self, bounds: [i64; 4]) {
@@ -181,7 +151,7 @@ fn parse_synctex_int_prefix(text: &str) -> Option<(i64, &str)> {
 const MAX_PROXY_DEPTH: usize = MAX_BOX_DEPTH;
 pub(crate) const MAX_BOX_DEPTH: usize = 512;
 const MAX_FORWARD_NODES: usize = 4_000_000;
-const MAX_SYNCTEX_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_SYNCTEX_BYTES: usize = 128 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 fn clone_synctex_proxy_subtree(
@@ -254,8 +224,9 @@ fn clone_synctex_proxy_subtree(
     Ok(index)
 }
 
-fn read_remaining_rows(
+pub(crate) fn read_remaining_rows(
     reader: &mut impl BufRead,
+    already_read: usize,
     operation: Option<&Operation>,
 ) -> io::Result<Vec<u8>> {
     let mut rows = Vec::new();
@@ -272,6 +243,9 @@ fn read_remaining_rows(
             return Ok(rows);
         }
         rows.extend_from_slice(chunk);
+        if already_read.saturating_add(rows.len()) >= MAX_SYNCTEX_BYTES {
+            return Err(io::Error::other("SyncTeX source map exceeds 128 MiB"));
+        }
         let consumed = chunk.len();
         reader.consume(consumed);
     }
@@ -330,11 +304,6 @@ pub(crate) struct ParsedSynctex {
     y_off: f64,
     bound: i64,
     fix_cross_file_tags: bool,
-}
-
-#[cfg(test)]
-pub(crate) fn parse_synctex_document(reader: impl BufRead) -> io::Result<ParsedSynctex> {
-    parse_synctex_document_with_options(reader, false, None, None)
 }
 
 pub(crate) fn synctex_unit_scale(unit: &str) -> Option<f64> {
@@ -1084,7 +1053,8 @@ pub(crate) fn parse_synctex_document_with_options(
                             let mut defined = forms.contains_key(&ftag);
                             if !defined {
                                 if later_forms.is_none() {
-                                    let rows = read_remaining_rows(&mut reader, operation)?;
+                                    let rows =
+                                        read_remaining_rows(&mut reader, bytes_read, operation)?;
                                     later_forms = Some(forms_defined_in(&rows, &forms, operation)?);
                                     buffered_rows = Some(io::Cursor::new(rows));
                                 }
@@ -1241,40 +1211,31 @@ pub(crate) fn parse_synctex_document_with_options(
 pub fn forward_candidates(
     pdf: &Path,
     file: &Path,
-    snapshot: Option<&SourceSnapshot>,
     view_line: u32,
 ) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_with_page_hint(pdf, file, snapshot, view_line, None)
+    let build_directory = crate::resolve_build_directory(None);
+    forward_candidates_resolved(pdf, file, view_line, None, build_directory.as_deref())
 }
 
-pub fn forward_candidates_with_page_hint(
+pub(crate) fn forward_candidates_resolved(
     pdf: &Path,
     file: &Path,
-    snapshot: Option<&SourceSnapshot>,
-    view_line: u32,
-    page_hint: Option<u32>,
-) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_in(pdf, file, snapshot, view_line, page_hint, None)
-}
-
-pub fn forward_candidates_in(
-    pdf: &Path,
-    file: &Path,
-    snapshot: Option<&SourceSnapshot>,
     view_line: u32,
     page_hint: Option<u32>,
     build_directory: Option<&Path>,
 ) -> io::Result<Vec<ForwardCandidate>> {
     let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory)?;
-    forward_candidates_from_reader_with_page_hint_in(
+    let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
+    forward_candidates_from_reader_in(
         reader,
-        pdf,
-        file,
-        snapshot,
-        view_line,
-        true,
-        page_hint,
-        sidecar_path.parent(),
+        ForwardLookup {
+            pdf,
+            file,
+            view_line,
+            fix_readahead: true,
+            page_hint,
+            sidecar_dir: sidecar_dir.as_deref(),
+        },
     )
 }
 
@@ -1282,63 +1243,43 @@ pub fn forward_candidates_from_reader(
     reader: impl BufRead,
     pdf: &Path,
     file: &Path,
-    snapshot: Option<&SourceSnapshot>,
     view_line: u32,
 ) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_from_reader_with_options(reader, pdf, file, snapshot, view_line, true)
-}
-
-pub fn forward_candidates_from_reader_with_options(
-    reader: impl BufRead,
-    pdf: &Path,
-    file: &Path,
-    snapshot: Option<&SourceSnapshot>,
-    view_line: u32,
-    fix_readahead: bool,
-) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_from_reader_with_page_hint(
+    forward_candidates_from_reader_in(
         reader,
-        pdf,
-        file,
-        snapshot,
-        view_line,
-        fix_readahead,
-        None,
+        ForwardLookup {
+            pdf,
+            file,
+            view_line,
+            fix_readahead: true,
+            page_hint: None,
+            sidecar_dir: None,
+        },
     )
 }
 
-pub fn forward_candidates_from_reader_with_page_hint(
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardLookup<'a> {
+    pub(crate) pdf: &'a Path,
+    pub(crate) file: &'a Path,
+    pub(crate) view_line: u32,
+    pub(crate) fix_readahead: bool,
+    pub(crate) page_hint: Option<u32>,
+    pub(crate) sidecar_dir: Option<&'a Path>,
+}
+
+pub(crate) fn forward_candidates_from_reader_in(
     reader: impl BufRead,
-    pdf: &Path,
-    file: &Path,
-    snapshot: Option<&SourceSnapshot>,
-    view_line: u32,
-    fix_readahead: bool,
-    page_hint: Option<u32>,
+    lookup: ForwardLookup<'_>,
 ) -> io::Result<Vec<ForwardCandidate>> {
-    forward_candidates_from_reader_with_page_hint_in(
-        reader,
+    let ForwardLookup {
         pdf,
         file,
-        snapshot,
         view_line,
         fix_readahead,
         page_hint,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
-    reader: impl BufRead,
-    pdf: &Path,
-    file: &Path,
-    snapshot: Option<&SourceSnapshot>,
-    view_line: u32,
-    fix_readahead: bool,
-    page_hint: Option<u32>,
-    sidecar_dir: Option<&Path>,
-) -> io::Result<Vec<ForwardCandidate>> {
+        sidecar_dir,
+    } = lookup;
     let pdf_dir = pdf.parent().unwrap_or(Path::new("."));
     let current_dir = std::env::current_dir()
         .ok()
@@ -1346,7 +1287,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
     let ParsedSynctex {
         inputs,
         max_lines,
-        mut nodes,
+        nodes,
         friends,
         sheets,
         unit,
@@ -1360,12 +1301,10 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
     let mut input_tag = None::<u32>;
     for (tag, raw_path) in inputs.iter().rev() {
         let raw = Path::new(raw_path);
-        let normalized = match snapshot {
-            Some(snapshot) => snapshot.normalize(raw).ok(),
-            None if raw.is_absolute() => {
-                Some(fs::canonicalize(raw).unwrap_or_else(|_| raw.to_owned()))
-            }
-            None => crate::source_snapshot::resolve_relative_input(
+        let normalized = if raw.is_absolute() {
+            Some(fs::canonicalize(raw).unwrap_or_else(|_| raw.to_owned()))
+        } else {
+            crate::source_snapshot::resolve_relative_input(
                 raw,
                 current_dir.as_deref(),
                 Some(pdf_dir),
@@ -1375,7 +1314,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
                 crate::source_snapshot::normalize_absolute(raw, pdf_dir)
                     .ok()
                     .map(|path| fs::canonicalize(&path).unwrap_or(path))
-            }),
+            })
         };
         if normalized.as_deref() == Some(file) {
             matching_tags.insert(*tag);
@@ -1385,7 +1324,6 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
         }
     }
     if input_tag.is_none()
-        && snapshot.is_none()
         && let Some(name) = file.file_name()
     {
         let mut matched_path = None::<&str>;
@@ -1466,7 +1404,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
         idx
     };
 
-    let display_query = |nodes: &mut [ForwardNode],
+    let display_query = |nodes: &[ForwardNode],
                          tag: u32,
                          query_line: u32|
      -> Vec<ForwardCandidate> {
@@ -1504,16 +1442,15 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
                     }
                     if !pages.is_empty() {
                         let mut sorted_pages = Vec::with_capacity(pages.len());
+                        let mut parent_weights = std::collections::HashMap::<usize, usize>::new();
                         for (p_num, page_nodes) in pages {
-                            for &n_idx in &page_nodes {
-                                if let Some(p_idx) = nodes[n_idx].parent {
-                                    nodes[p_idx].friend_weight = usize::MAX;
-                                }
-                            }
+                            parent_weights.clear();
                             let mut weighted = Vec::with_capacity(page_nodes.len());
                             for n_idx in page_nodes {
                                 if let Some(p_idx) = nodes[n_idx].parent {
-                                    let w = if nodes[p_idx].friend_weight == usize::MAX {
+                                    let w = if let Some(&cached) = parent_weights.get(&p_idx) {
+                                        cached
+                                    } else {
                                         let count = nodes[p_idx]
                                             .children
                                             .iter()
@@ -1523,11 +1460,9 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
                                             .count();
                                         let has_weight_slot = nodes[p_idx].kind == b'('
                                             && nodes[p_idx].target.is_none();
-                                        nodes[p_idx].friend_weight =
-                                            if has_weight_slot { 0 } else { count };
+                                        parent_weights
+                                            .insert(p_idx, if has_weight_slot { 0 } else { count });
                                         count
-                                    } else {
-                                        nodes[p_idx].friend_weight
                                     };
                                     weighted.push((w, n_idx));
                                 } else {
@@ -1632,7 +1567,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
         Vec::new()
     };
 
-    let mut candidates = display_query(&mut nodes, input_tag, view_line);
+    let mut candidates = display_query(&nodes, input_tag, view_line);
     if fix_readahead
         && let Ok(first) = best_guess_forward_candidate(&candidates)
         && let Some((next_page, target_line)) = resolve_readahead_sheet_in_memory(
@@ -1649,7 +1584,7 @@ pub(crate) fn forward_candidates_from_reader_with_page_hint_in(
             .filter(|candidate| candidate.page >= next_page)
             .collect();
         if best_guess_forward_candidate(&overflow).is_err() {
-            overflow = display_query(&mut nodes, input_tag, target_line)
+            overflow = display_query(&nodes, input_tag, target_line)
                 .into_iter()
                 .filter(|candidate| candidate.page >= next_page)
                 .collect();
@@ -2028,38 +1963,17 @@ fn sheet_graphics_boxes(
 }
 
 pub fn inverse_candidates(pdf: &Path, point: InversePoint) -> io::Result<Vec<SourceLocation>> {
-    inverse_candidates_in(pdf, point, None)
-}
-
-pub fn inverse_candidates_in(
-    pdf: &Path,
-    point: InversePoint,
-    build_directory: Option<&Path>,
-) -> io::Result<Vec<SourceLocation>> {
+    let build_directory = crate::resolve_build_directory(None);
     validate_inverse_point(point)?;
-    let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory)?;
+    let (reader, sidecar_path) = crate::open_synctex_with_path_in(pdf, build_directory.as_deref())?;
     let parsed = parse_synctex_document_with_options(reader, true, Some(point.page), None)?;
     let raw = inverse_candidates_in_doc(&parsed, point)?;
+    let sidecar_dir = crate::source_snapshot::canonical_sidecar_dir(&sidecar_path);
     Ok(crate::materialize_raw_candidates(
         raw,
         Some(pdf),
-        sidecar_path.parent(),
+        sidecar_dir.as_deref(),
     ))
-}
-
-pub(crate) fn inverse_raw_candidates_in(
-    pdf: &Path,
-    point: InversePoint,
-    build_directory: Option<&Path>,
-    operation: Option<&Operation>,
-) -> io::Result<Vec<RawInverseCandidate>> {
-    validate_inverse_point(point)?;
-    if let Some(op) = operation {
-        op.check()?;
-    }
-    let reader = crate::open_synctex_in(pdf, build_directory)?;
-    let parsed = parse_synctex_document_with_options(reader, true, Some(point.page), operation)?;
-    inverse_candidates_in_doc(&parsed, point)
 }
 
 pub fn inverse_candidates_from_reader(
@@ -2069,7 +1983,7 @@ pub fn inverse_candidates_from_reader(
     inverse_candidates_from_reader_with_options(reader, point, false)
 }
 
-pub fn inverse_candidates_from_reader_with_options(
+pub(crate) fn inverse_candidates_from_reader_with_options(
     reader: impl BufRead,
     point: InversePoint,
     fix_cross_file_tags: bool,
@@ -2404,99 +2318,54 @@ pub(crate) fn inverse_candidates_in_doc(
         best
     }
 
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn get_closest_children_in_box_v2(
-        nodes: &[ForwardNode],
-        idx: usize,
-        h_ordered_distance: &impl Fn(usize) -> i64,
-        point_in_box: &impl Fn(usize) -> bool,
-        point_node_distance: &impl Fn(usize) -> i64,
-        data_tag: &impl Fn(usize) -> u32,
-        data_line: &impl Fn(usize) -> i64,
-        data_col: &impl Fn(usize) -> i64,
-    ) -> (Option<(usize, i64)>, Option<(usize, i64)>) {
-        if nodes[idx].children.is_empty() || nodes[idx].kind != b'(' {
-            return (None, None);
+    let closer_or_earlier = |cur: Option<(usize, i64)>, d: i64, ch: usize| match cur {
+        None => true,
+        Some((n, nd)) => {
+            d < nd
+                || (d == nd
+                    && data_tag(n) == data_tag(ch)
+                    && (data_line(n), data_col(n)) > (data_line(ch), data_col(ch)))
         }
-        let mut l = None::<(usize, i64)>;
-        let mut r = None::<(usize, i64)>;
-        for &ch in &nodes[idx].children {
-            let d = h_ordered_distance(ch);
-            if d > 0 {
-                let replace = match r {
-                    None => true,
-                    Some((rn, rd)) => {
-                        d < rd
-                            || (d == rd
-                                && data_tag(rn) == data_tag(ch)
-                                && (data_line(rn) > data_line(ch)
-                                    || (data_line(rn) == data_line(ch)
-                                        && data_col(rn) > data_col(ch))))
+    };
+    let descend_child = |cur: (usize, i64)| {
+        let mut cur =
+            deepest_container_v3(nodes, cur.0, &point_in_box, &point_node_distance).unwrap_or(cur);
+        if matches!(nodes[cur.0].kind, b'[' | b'(' | b'v' | b'h')
+            && let (Some(cn), _) = closest_deep_child_v2(nodes, cur.0, &point_node_distance)
+        {
+            cur.0 = cn;
+        }
+        cur
+    };
+    let get_closest_children_in_box = |mut idx: usize| {
+        'hbox: loop {
+            if nodes[idx].children.is_empty() || nodes[idx].kind != b'(' {
+                return (None, None);
+            }
+            let mut l = None::<(usize, i64)>;
+            let mut r = None::<(usize, i64)>;
+            for &ch in &nodes[idx].children {
+                let d = h_ordered_distance(ch);
+                if d > 0 {
+                    if closer_or_earlier(r, d, ch) {
+                        r = Some((ch, d));
                     }
-                };
-                if replace {
-                    r = Some((ch, d));
-                }
-            } else if d == 0 {
-                if !nodes[ch].children.is_empty() {
-                    return get_closest_children_in_box_v2(
-                        nodes,
-                        ch,
-                        h_ordered_distance,
-                        point_in_box,
-                        point_node_distance,
-                        data_tag,
-                        data_line,
-                        data_col,
-                    );
-                }
-                l = Some((ch, 0));
-            } else {
-                let d = d.saturating_neg();
-                let replace = match l {
-                    None => true,
-                    Some((ln, ld)) => {
-                        d < ld
-                            || (d == ld
-                                && data_tag(ln) == data_tag(ch)
-                                && (data_line(ln) > data_line(ch)
-                                    || (data_line(ln) == data_line(ch)
-                                        && data_col(ln) > data_col(ch))))
+                } else if d == 0 {
+                    if !nodes[ch].children.is_empty() {
+                        idx = ch;
+                        continue 'hbox;
                     }
-                };
-                if replace {
-                    l = Some((ch, d));
+                    l = Some((ch, 0));
+                } else {
+                    let d = d.saturating_neg();
+                    if closer_or_earlier(l, d, ch) {
+                        l = Some((ch, d));
+                    }
                 }
             }
+            return (l.map(descend_child), r.map(descend_child));
         }
-        if let Some(mut cur_l) = l {
-            if let Some(nd) =
-                deepest_container_v3(nodes, cur_l.0, point_in_box, point_node_distance)
-            {
-                cur_l = nd;
-            }
-            if matches!(nodes[cur_l.0].kind, b'[' | b'(' | b'v' | b'h')
-                && let (Some(cn), _) = closest_deep_child_v2(nodes, cur_l.0, point_node_distance)
-            {
-                cur_l.0 = cn;
-            }
-            l = Some(cur_l);
-        }
-        if let Some(mut cur_r) = r {
-            if let Some(nd) =
-                deepest_container_v3(nodes, cur_r.0, point_in_box, point_node_distance)
-            {
-                cur_r = nd;
-            }
-            if matches!(nodes[cur_r.0].kind, b'[' | b'(' | b'v' | b'h')
-                && let (Some(cn), _) = closest_deep_child_v2(nodes, cur_r.0, point_node_distance)
-            {
-                cur_r.0 = cn;
-            }
-            r = Some(cur_r);
-        }
-        (l, r)
-    }
+    };
 
     let mut container = None::<usize>;
     let mut hbox_iter = sheet.hboxes.iter().rev().copied();
@@ -2517,16 +2386,7 @@ pub(crate) fn inverse_candidates_in_doc(
     }
 
     let (nds_l, nds_r) = if let Some(c_idx) = container {
-        get_closest_children_in_box_v2(
-            nodes,
-            c_idx,
-            &h_ordered_distance,
-            &point_in_box,
-            &point_node_distance,
-            &data_tag,
-            &data_line,
-            &data_col,
-        )
+        get_closest_children_in_box(c_idx)
     } else if let Some(&root_child) = nodes[sheet.root].children.last() {
         let (cn, cd) = closest_deep_child_v2(nodes, root_child, &point_node_distance);
         (cn.map(|n| (n, cd)), None)

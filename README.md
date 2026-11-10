@@ -6,7 +6,7 @@ Diff with original [synctex](https://github.com/jlaurens/synctex).
  - Only handles the reading of synctex data for forward/backward synctex.
  - Heuristics to have word-precise backward, i.e., better column support for synctex.
  - Can dig into frames, equations, tabular, title, captions, etc. and forward back fragile beamer slides. This is based on heuristics, and have to be implemented per functions. open an issue / pr if something is missing there. 
- - Session cache support, and awarness on the pdf hash for best guesses.
+ - Session cache support and optional best-guess fallback.
 
 ## Quick Start
 
@@ -39,7 +39,6 @@ fn main() -> std::io::Result<()> {
         Some(("theorem", 2)), // optional clicked PDF word + 0-based UTF-8 byte offset
         12,
         &op,
-        None,
         false, // strict mode (set true for additional best_guess fallback)
         Some(&mut cache),
     )?;
