@@ -1,6 +1,6 @@
 [package]
 name = "synctex-parser"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Pure-Rust SyncTeX parser and forward/inverse query engine with LaTeX/Beamer heuristics"
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/synctex-parser"
 readme = "README.md"
 keywords = ["synctex", "latex", "tex", "beamer", "pdf"]
 categories = ["parsing", "text-processing"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**", "Cargo.toml", "/README.md", "LICENSE"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]

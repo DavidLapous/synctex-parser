@@ -14,7 +14,7 @@ Add `synctex-parser` to your crate (`cargo add synctex-parser`) or `Cargo.toml`:
 
 ```toml
 [dependencies]
-synctex-parser = "0.1"
+synctex-parser = "0.1.2"
 ```
 
 ```rust,no_run
