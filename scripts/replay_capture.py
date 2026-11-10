@@ -4,6 +4,9 @@ Capture always executes producers, including repeated requests. Repeated exact
 requests must agree; replay is a lookup, not an ordered execution transcript.
 Replay completion requires consuming every captured unique request.
 Hashes detect corruption, not malicious rewriting of the entire capture.
+Oracle stdout/stderr and JSON reports contain unredacted document words and
+paths. Store them only in owner-only paths (0700 directories / 0600 files),
+just like --capture directories and their contents.
 """
 
 import hashlib
@@ -54,6 +57,7 @@ class ReplayCapture:
         else:
             # Never reuse or overwrite even an empty existing directory.
             self.directory.mkdir(mode=0o700)
+            os.chmod(self.directory, 0o700)
             self._checkpoint(False)
 
     def _atomic_json(self, path, value):
@@ -61,6 +65,7 @@ class ReplayCapture:
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=self.directory)
         try:
             with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())

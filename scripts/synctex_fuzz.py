@@ -34,6 +34,10 @@ By default every eligible painted word on every page is probed. --pages and
 --words provide seed-deterministic quick caps; --pages 0 disables inverse
 probes and --words 0 means all words on each selected page. Repeat --page to
 probe exact one-based pages (for example, --page 27 --page 28).
+
+Oracle stdout/stderr and JSON reports contain unredacted document words and
+paths. Store them only in owner-only paths (0700 directories / 0600 files),
+just like --capture directories and their contents.
 """
 
 import argparse

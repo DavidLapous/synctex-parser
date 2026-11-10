@@ -324,10 +324,18 @@ sys.stdout.write(str(count))
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
     def test_capture_files_and_directory_are_owner_only(self):
-        self.capture()
-        self.assertEqual(self.directory.stat().st_mode & 0o077, 0)
-        for path in self.directory.iterdir():
-            self.assertEqual(path.stat().st_mode & 0o077, 0)
+        for mask in (0, 0o777):
+            self.directory = self.root / f"capture-{mask:o}"
+            previous_umask = os.umask(mask)
+            try:
+                self.capture()
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(self.directory.stat().st_mode & 0o7777, 0o700)
+            self.assertTrue((self.directory / "manifest.json").is_file())
+            self.assertEqual(len(list(self.directory.iterdir())), 2)
+            for path in self.directory.iterdir():
+                self.assertEqual(path.stat().st_mode & 0o7777, 0o600)
 
 
 if __name__ == "__main__":
