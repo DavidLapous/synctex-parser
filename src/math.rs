@@ -2574,7 +2574,7 @@ pub(super) fn source_location_with_context_mode(
                                 false
                             };
                             match (
-                                source_edge.checked_add_signed(delta).and_then(&get_atom),
+                                source_edge.checked_add_signed(delta).and_then(get_atom),
                                 pdf_edge.checked_add_signed(delta).and_then(|i| pdf.get(i)),
                             ) {
                                 (Some(a), Some(b))
