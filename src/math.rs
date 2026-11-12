@@ -2949,8 +2949,8 @@ mod tests {
                 Some((1, source.find(needle).unwrap()))
             );
         }
-        let matrix = "\\begin{align*}\\dot f(t)&=\\begin{pmatrix}\\cos\\alpha_1(t)\\\\\\sin\\alpha_2(t)\\end{pmatrix}\\end{align*}";
-        let context = "f(t)=cosα1(t) sinα2(t)";
+        let matrix = "\\begin{align*}\\dot g(u)&=\\begin{pmatrix}\\cos\\beta_1(u)\\\\\\sin\\beta_2(u)\\end{pmatrix}\\end{align*}";
+        let context = "g(u)=cosβ1(u) sinβ2(u)";
         assert_eq!(
             loc(
                 matrix,
@@ -3016,15 +3016,15 @@ mod tests {
             loc("$A_\\custom$\n$x$", 2, 0..2, false, "x", 0),
             Some((2, 1))
         );
-        let shared_suffix = "\\emph{sample} $M$:\n\\item a local state $M_x = y$";
+        let shared_suffix = "\\emph{plover} $Q$:\n\\item a bramble kettle $Q_x = y$";
         assert_eq!(
             loc(
                 shared_suffix,
                 1,
                 0..2,
                 true,
-                "sample M: a local state",
-                "sample ".len()
+                "plover Q: a bramble kettle",
+                "plover ".len()
             ),
             Some((1, 15))
         );
@@ -3063,18 +3063,21 @@ mod tests {
     fn repeated_inline_math_across_soft_wraps_preserves_occurrence_ownership() {
         let source = "\
   \\begin{enumerate}
-    \\item if \\(u\\in\\mathcal M_k(a_0,a_1)\\) is regular and
-      \\(q_*\\) is its initial sample value, then \\(q_*\\) scales \\(\\Omega_k\\) on
-      \\(B_n^{\\le k}\\);
-    \\item similarly, if \\(q_*\\in B_n^{\\le k}\\) scales
-      \\(\\Omega_k\\), then the
-      combination of any local sample interval
+    \\item when \\(v\\in\\mathcal F_m(c_0,c_1)\\) wobbles and
+      \\(z_*\\) is its pebble kettle turnip, then \\(z_*\\) nudges \\(\\Lambda_m\\) near
+      \\(K_r^{\\le m}\\);
+    \\item likewise, when \\(z_*\\in K_r^{\\le m}\\) nudges
+      \\(\\Lambda_m\\), then the
+      barrow of each damp gravel plover
   \\end{enumerate}";
-        let context = "similarly, if q* ∈ Bn≤k scales Ωk,";
-        let offset = context.find("Ωk").unwrap();
+        let context = "likewise, when z* ∈ Kr≤m nudges Λm,";
+        let offset = context.find("Λm").unwrap();
         assert_eq!(
             loc(source, 6, 1..8, false, context, offset),
-            Some((6, source.lines().nth(5).unwrap().find("\\Omega_k").unwrap()))
+            Some((
+                6,
+                source.lines().nth(5).unwrap().find("\\Lambda_m").unwrap()
+            ))
         );
     }
 

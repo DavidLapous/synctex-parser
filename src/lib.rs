@@ -143,26 +143,41 @@ impl PdfRevision {
     }
 }
 
+#[cfg(not(test))]
 static BUILD_DIRECTORY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static BUILD_DIRECTORY: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Process-wide default build directory; resolved once at operation entry.
 pub fn set_build_directory(path: Option<PathBuf>) {
-    *BUILD_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = path;
+    #[cfg(not(test))]
+    {
+        *BUILD_DIRECTORY.write().unwrap_or_else(|e| e.into_inner()) = path;
+    }
+    #[cfg(test)]
+    BUILD_DIRECTORY.with(|slot| *slot.borrow_mut() = path);
 }
 
 /// An explicit build directory, else the process-wide default, else `SYNCTEX_BUILD_DIRECTORY`;
 /// resolved once at operation entry.
 pub(crate) fn resolve_build_directory(build_directory: Option<&Path>) -> Option<PathBuf> {
     build_directory.map(Path::to_path_buf).or_else(|| {
-        BUILD_DIRECTORY
+        #[cfg(not(test))]
+        let configured = BUILD_DIRECTORY
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .or_else(|| {
-                std::env::var_os("SYNCTEX_BUILD_DIRECTORY")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-            })
+            .clone();
+        #[cfg(test)]
+        let configured = BUILD_DIRECTORY.with(|slot| slot.borrow().clone());
+        configured.or_else(|| {
+            std::env::var_os("SYNCTEX_BUILD_DIRECTORY")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
     })
 }
 

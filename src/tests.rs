@@ -1194,29 +1194,29 @@ fn inverse_title_refinement_stays_native_supported() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("paper.tex");
     let pdf = directory.path().join("paper.pdf");
-    let context = "Computational Fluid Dynamics";
+    let context = "TurnipBarrows Plums Lanterns";
     for (preamble, body, anchor, expected) in [
         (
-            "\\title{Computational Fluid Dynamics}",
-            "\\begin{frame}{Computational Fluid Dynamics}\n\\end{frame}",
+            "\\title{TurnipBarrows Plums Lanterns}",
+            "\\begin{frame}{TurnipBarrows Plums Lanterns}\n\\end{frame}",
             4,
             (3, 28, true),
         ),
         (
-            "\\title{Computational Fluid Dynamics}",
+            "\\title{TurnipBarrows Plums Lanterns}",
             "\\maketitle",
             3,
             (3, 0, false),
         ),
         (
             "\\documentclass{beamer}",
-            "\\title[Computational Fluid Dynamics]{Computational Fluid Dynamics}\\maketitle",
+            "\\title[TurnipBarrows Plums Lanterns]{TurnipBarrows Plums Lanterns}\\maketitle",
             3,
             (3, 51, true),
         ),
         (
             "\\documentclass{beamer}",
-            "\\begin{frame}\n\\title[Computational Fluid Dynamics]{Computational Fluid Dynamics}\\maketitle\n\\end{frame}",
+            "\\begin{frame}\n\\title[TurnipBarrows Plums Lanterns]{TurnipBarrows Plums Lanterns}\\maketitle\n\\end{frame}",
             5,
             (4, 51, true),
         ),
@@ -1241,7 +1241,7 @@ fn inverse_title_refinement_stays_native_supported() {
             let result = resolve_inverse_output(
                 &pdf,
                 ipt(1, 72.0, y_from_top, 272.0),
-                Some((context, context.find("Fluid").unwrap())),
+                Some((context, context.find("Plums").unwrap())),
                 4,
                 &Operation::default(),
                 &format!("Input: paper.tex\nLine: {anchor}\n"),
@@ -1700,23 +1700,23 @@ fn inverse_word_matching_resolves_context_and_utf8_byte_columns() {
 
 #[test]
 fn inverse_frame_matching_reaches_prose_without_crossing_frames() {
-    let source = "\\begin{frame}\nSome samples display patterns.\n\\pause\n\
-                  \\includegraphics{samples/image.pdf}\n\n\n\n\n\
-                  \\only<2>{Other visible text.}\n\\end{frame}\n\
-                  \\begin{frame}\nSome samples display patterns.\n\\end{frame}";
+    let source = "\\begin{frame}\nDamp pebbles nudge turnips.\n\\pause\n\
+                  \\includegraphics{turnips/image.pdf}\n\n\n\n\n\
+                  \\only<2>{Brisk lantern glow.}\n\\end{frame}\n\
+                  \\begin{frame}\nDamp pebbles nudge turnips.\n\\end{frame}";
     assert_eq!(
-        source_word_location(source, 10, "Some samples display patterns.", 5, 4),
+        source_word_location(source, 10, "Damp pebbles nudge turnips.", 5, 4),
         Some((2, 5))
     );
     assert_eq!(
-        source_word_location(source, 13, "Some samples display patterns.", 5, 4),
+        source_word_location(source, 13, "Damp pebbles nudge turnips.", 5, 4),
         Some((12, 5))
     );
     assert_eq!(
-        source_word_location(source, 10, "samples", 1, 4),
+        source_word_location(source, 10, "pebbles", 1, 4),
         Some((2, 5))
     );
-    assert_eq!(source_word_location(source, 13, "Other", 1, 4), None);
+    assert_eq!(source_word_location(source, 13, "Brisk", 1, 4), None);
 }
 
 #[test]
@@ -1731,13 +1731,13 @@ fn inverse_frame_matching_keeps_duplicate_overlays_line_only() {
 
 #[test]
 fn inverse_title_word_survives_unrelated_opaque_math() {
-    let source = "\\begin{frame}[fragile]{Let's review this section}\n\
+    let source = "\\begin{frame}[fragile]{Let's inspect this barrow}\n\
                   Ordinary body words:\n\
                   \\begin{equation*}\n\
                   \\custom{x}\n\
                   \\end{equation*}\n\
                   \\end{frame}";
-    let context = "Let’s review this section\r\nOrdinary body words:";
+    let context = "Let’s inspect this barrow\r\nOrdinary body words:";
     assert_eq!(
         source_word_location(source, 6, context, 0, 4),
         Some((1, 23))
@@ -1774,13 +1774,13 @@ fn inverse_title_words_prefer_the_frame_header_when_body_repeats_them() {
 
 #[test]
 fn inverse_heading_matches_tex_accent_and_pdf_unicode() {
-    let source = "\\begin{frame}{A note on \\v Zora's method}\n\
+    let source = "\\begin{frame}{A kettle on \\v Zuma's barrow}\n\
                   $x$\n\
                   \\end{frame}";
-    let context = "A note on Žora’s method";
+    let context = "A kettle on Žuma’s barrow";
     assert_eq!(
         word_at(source, 3, context, "Ž", 4),
-        Some((1, source.lines().next().unwrap().find("Zora").unwrap()))
+        Some((1, source.lines().next().unwrap().find("Zuma").unwrap()))
     );
 }
 
@@ -1810,10 +1810,10 @@ fn inverse_prose_word_does_not_match_inside_longer_math_word() {
 #[test]
 fn inverse_caption_word_ignores_image_filename() {
     let source = "\\begin{frame}{Example}\n\
-                  \\includegraphics[width=\\textwidth]{assets/sample_red_blue_boxes.jpg}\n\
-                  \\caption{Sample red blue boxes.}\n\
+                  \\includegraphics[width=\\textwidth]{assets/bramble_red_blue_plover.jpg}\n\
+                  \\caption{Bramble red blue plover.}\n\
                   \\end{frame}";
-    let context = "Figure 1: Sample red blue boxes.";
+    let context = "Figure 1: Bramble red blue plover.";
     assert_eq!(
         word_at(source, 4, context, "red", 4),
         Some((3, source.lines().nth(2).unwrap().find("red").unwrap()))
@@ -2431,14 +2431,14 @@ fn inverse_note_arguments_do_not_claim_slide_words() {
 #[test]
 fn inverse_repeated_prose_uses_words_past_adjacent_math() {
     let source = "\\begin{frame}{Example}\n\
-                  \\item the \\blue{$A_i$}s are sample elements in $\\mathcal{A}$, a list of tokens,\n\
-                  \\item the \\blue{$B_i$}s are sample elements in $\\mathcal{B}$, a list of labels,\n\
+                  \\item the \\blue{$A_i$}s are pebble widgets in $\\mathcal{A}$, a crate of turnips,\n\
+                  \\item the \\blue{$B_i$}s are pebble widgets in $\\mathcal{B}$, a crate of lanterns,\n\
                   \\end{frame}";
-    let context = "the Ais are sample elements in A, a list of tokens,\r\n\
-                   the Bis are sample elements in B, a list of labels,";
-    for (needle, line) in [("tokens", 2), ("labels", 3)] {
+    let context = "the Ais are pebble widgets in A, a crate of turnips,\r\n\
+                   the Bis are pebble widgets in B, a crate of lanterns,";
+    for (needle, line) in [("turnips", 2), ("lanterns", 3)] {
         let at = context.find(needle).unwrap();
-        let selected = context[..at].rfind("elements").unwrap();
+        let selected = context[..at].rfind("widgets").unwrap();
         assert_eq!(
             source_word_location(source, 4, context, selected, 4),
             Some((
@@ -2447,7 +2447,7 @@ fn inverse_repeated_prose_uses_words_past_adjacent_math() {
                     .lines()
                     .nth(line as usize - 1)
                     .unwrap()
-                    .find("elements")
+                    .find("widgets")
                     .unwrap()
             ))
         );
@@ -2457,27 +2457,27 @@ fn inverse_repeated_prose_uses_words_past_adjacent_math() {
 #[test]
 fn inverse_prose_context_beats_unrelated_math_word() {
     let source = "\\begin{frame}{Example}\n\
-                  The list defines a \\emph{value} $(a_1, a_2)$ on a set.\n\
-                  \\begin{equation*}\\mathrm{value}(f)=\\mathrm{value}(g)\\end{equation*}\n\
+                  The crate holds a \\emph{kettle} $(a_1, a_2)$ on a shelf.\n\
+                  \\begin{equation*}\\mathrm{kettle}(f)=\\mathrm{kettle}(g)\\end{equation*}\n\
                   \\end{frame}";
-    let context = "The list defines a value (a1, a2) on a set.";
+    let context = "The crate holds a kettle (a1, a2) on a shelf.";
     assert_eq!(
-        word_at(source, 4, context, "value", 4),
-        Some((2, source.lines().nth(1).unwrap().find("value").unwrap()))
+        word_at(source, 4, context, "kettle", 4),
+        Some((2, source.lines().nth(1).unwrap().find("kettle").unwrap()))
     );
 }
 
 #[test]
 fn inverse_repeated_word_uses_short_context_across_math() {
     let source = "\\begin{frame}{Example}\n\
-                  It is valid on $\\mathrm{part}(f)$ as soon\n\
-                  as $\\mathrm{t}(g)$ is valid.\n\
+                  It is brisk on $\\mathrm{plum}(f)$ as soon\n\
+                  as $\\mathrm{t}(g)$ is brisk.\n\
                   \\end{frame}";
-    let context = "It is valid on part(f) as soon\r\nas t(g) is valid.";
-    let selected = context.rfind("valid").unwrap();
+    let context = "It is brisk on plum(f) as soon\r\nas t(g) is brisk.";
+    let selected = context.rfind("brisk").unwrap();
     assert_eq!(
         source_word_location(source, 4, context, selected, 4),
-        Some((3, source.lines().nth(2).unwrap().find("valid").unwrap()))
+        Some((3, source.lines().nth(2).unwrap().find("brisk").unwrap()))
     );
 }
 
@@ -2701,20 +2701,20 @@ fn inverse_metadata_preserves_crlf_and_unicode_byte_offsets() {
 fn inverse_frame_title_beats_same_words_in_document_title() {
     let directory = tempfile::tempdir().unwrap();
     let main_path = directory.path().join("original.tex");
-    let source = "\\title{Numerical Analysis and Applications in Computational Fluid Dynamics}\n\
+    let source = "\\title{Wobbling Plovers and Turnip Crates in Brambling Porridge Teakettle}\n\
                   \\begin{document}\n\
-                  \\begin{frame}{Computational Fluid Dynamics}{Grid refinement application}\n\
+                  \\begin{frame}{Brambling Porridge Teakettle}{Damp gravel barrow lantern}\n\
                   \\begin{figure}\\includegraphics{grid.png}\\end{figure}\n\
                   \\end{frame}\n";
     fs::write(&main_path, source).unwrap();
-    let title = "Computational Fluid Dynamics\nGrid refinement application\n\
-                 Numerical Analysis and Applications in Computational Fluid Dynamics";
-    let title_offset = title.find("Fluid").unwrap();
+    let title = "Brambling Porridge Teakettle\nDamp gravel barrow lantern\n\
+                 Wobbling Plovers and Turnip Crates in Brambling Porridge Teakettle";
+    let title_offset = title.find("Porridge").unwrap();
     let metadata_score = metadata_at(&main_path, title, title_offset).unwrap().4;
     assert!(metadata_score >= 6);
     assert_eq!(
         source_word_location(source, 5, title, title_offset, 4),
-        Some((3, source.lines().nth(2).unwrap().find("Fluid").unwrap()))
+        Some((3, source.lines().nth(2).unwrap().find("Porridge").unwrap()))
     );
     assert!(!metadata_beats_frame(
         &tex::SourceAnalysis::new(source, &[], &Operation::default()),
@@ -2724,9 +2724,9 @@ fn inverse_frame_title_beats_same_words_in_document_title() {
         272.0,
         metadata_score,
     ));
-    let footer = "Computational Fluid Dynamics\nGrid refinement application\n\
-                  Numerical Analysis and Applications in Computational Fluid Dynamics";
-    let footer_offset = footer.rfind("Fluid").unwrap();
+    let footer = "Brambling Porridge Teakettle\nDamp gravel barrow lantern\n\
+                  Wobbling Plovers and Turnip Crates in Brambling Porridge Teakettle";
+    let footer_offset = footer.rfind("Porridge").unwrap();
     let footer_score = metadata_at(&main_path, footer, footer_offset).unwrap().4;
     assert!(metadata_beats_frame(
         &tex::SourceAnalysis::new(source, &[], &Operation::default()),
@@ -2742,12 +2742,12 @@ fn inverse_frame_title_beats_same_words_in_document_title() {
 fn inverse_identical_running_title_uses_click_height_for_tie() {
     let directory = tempfile::tempdir().unwrap();
     let main_path = directory.path().join("original.tex");
-    let source = "\\title{Computational Fluid Dynamics}\n\
-                  \\begin{frame}{Computational Fluid Dynamics}\n\
+    let source = "\\title{Brambling Porridge Teakettle}\n\
+                  \\begin{frame}{Brambling Porridge Teakettle}\n\
                   \\end{frame}\n";
     fs::write(&main_path, source).unwrap();
-    let context = "Computational Fluid Dynamics";
-    let offset = context.find("Fluid").unwrap();
+    let context = "Brambling Porridge Teakettle";
+    let offset = context.find("Porridge").unwrap();
     let op = Operation::default();
     let metadata_score = metadata_at(&main_path, context, offset).unwrap().4;
     let analysis = tex::SourceAnalysis::new(source, &[], &op);
@@ -2798,15 +2798,15 @@ fn inverse_frame_matching_ignores_commented_and_escaped_boundaries() {
 
 #[test]
 fn inverse_caption_math_uses_literal_context_not_closing_line_proximity() {
-    let source = "\\caption{Selected views.\n\
-        sample points at measured offset at most \\(\\alpha_k\\) from the\n\
-        baseline marker.\n\n\n\n\n\
-        The vertical axis is in units of \\(\\alpha_k\\), hence rescaled.\n\
+    let source = "\\caption{Brambling kettles.\n\
+        turnip crates at lopsided barrow at most \\(\\alpha_k\\) from the\n\
+        lantern pebble.\n\n\n\n\n\
+        The copper widget is in crates of \\(\\alpha_k\\), hence tilted.\n\
         End of caption.}\n";
     let line = source.lines().count() as u32;
     for (context, row) in [
-        ("offset at most 𝛼𝑘 from the baseline marker.", 2),
-        ("axis is in units of 𝛼𝑘, hence rescaled.", 8),
+        ("barrow at most 𝛼𝑘 from the lantern pebble.", 2),
+        ("widget is in crates of 𝛼𝑘, hence tilted.", 8),
     ] {
         assert_eq!(
             word_at(source, line, context, "𝛼", 4),
@@ -4011,11 +4011,18 @@ fn separate_build_directory_sidecar_lookup_works_for_forward_inverse_and_cache()
     );
 
     // Configured default build directory via set_build_directory
+    struct ResetBuildDirectory;
+    impl Drop for ResetBuildDirectory {
+        fn drop(&mut self) {
+            set_build_directory(None);
+        }
+    }
     set_build_directory(Some(build_dir.clone()));
+    let _reset = ResetBuildDirectory;
     let forward_global = resolve_forward(&pdf, &tex, 3, 1).unwrap();
     assert_eq!(forward_global.page, 1);
     let inverse_global = inverse_at(&pdf, pt, None, 2, false).unwrap();
-    set_build_directory(None);
+    drop(_reset);
     assert_eq!(Path::new(&inverse_global.location.file), tex.as_path());
     assert_eq!(inverse_global.location.line, 3);
     assert_eq!(inverse_global.location.column, 5);
@@ -7575,7 +7582,14 @@ fn symlinked_build_directory_canonicalizes_sidecar_dir_for_relative_inputs() {
     .expect("cached inverse search through symlinked build_directory must resolve ../src/main.tex");
     assert_eq!(Path::new(&cached.location.file), main_tex);
 
+    struct ResetBuildDirectory;
+    impl Drop for ResetBuildDirectory {
+        fn drop(&mut self) {
+            set_build_directory(None);
+        }
+    }
     set_build_directory(Some(link_build.clone()));
+    let _reset = ResetBuildDirectory;
     let inv_cands = inverse_candidates(&pdf, point).unwrap();
     let fwd_cands = parser::forward_candidates_resolved(
         &pdf,
@@ -7585,7 +7599,7 @@ fn symlinked_build_directory_canonicalizes_sidecar_dir_for_relative_inputs() {
         resolve_build_directory(None).as_deref(),
     )
     .unwrap();
-    set_build_directory(None);
+    drop(_reset);
     assert_eq!(inv_cands.len(), 2);
     assert_eq!(inv_cands[0].compiler_column, Some(5));
     assert_eq!(compiler_columns("UniqueWordToken", 5), (4, 5, 5));
